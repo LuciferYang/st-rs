@@ -15,6 +15,7 @@
 //! | 4a    | Minimum-viable engine: WAL + DbImpl | `db::log_*`, `db::db_impl`                          |
 //! | 4b    | SST iterator, merging iter, DbIterator, compaction | `sst::block_based::sst_iterator`, `db::merging_iterator`, `db::db_iter`, `db::compaction` |
 //! | 4c    | Background flush, immutable memtable, atomic CURRENT, util::heap | `db::db_impl` (refactored), [`util::heap`]                |
+//! | 4d    | Internal-key SSTs (BE-inverted trailer) enabling MVCC in the SST format | `db::dbformat`, `db::db_impl` flush/get, `db::compaction` |
 //! | 4     | LSM engine                       | *deferred*                                          |
 //! | 5     | Optional features                | *deferred*                                          |
 //! | 6     | Tools & stress                   | *deferred*                                          |

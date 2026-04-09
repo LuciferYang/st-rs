@@ -33,8 +33,8 @@
 //!   layer.
 
 use crate::core::status::Result;
-use crate::db::db_iter::SstUserKeyIter;
-use crate::db::merging_iterator::{MergingIterator, UserKeyIter};
+use crate::core::types::ValueType;
+use crate::db::dbformat::ParsedInternalKey;
 use crate::env::file_system::FileSystem;
 use crate::file::writable_file_writer::WritableFileWriter;
 use crate::sst::block_based::table_builder::{
@@ -130,41 +130,38 @@ impl<'a> CompactionJob<'a> {
     /// duplicates collapsed (newer wins).
     ///
     /// Returns `Ok(num_output_records)` on success.
+    ///
+    /// # Layer 4d: internal-key compaction
+    ///
+    /// Input SSTs store internal keys (`user_key || BE-inverted(
+    /// (seq<<8)|type)`), and so does the output. The merge logic is:
+    ///
+    /// 1. Collect every `(internal_key, value)` pair from every
+    ///    input SST into a `Vec`.
+    /// 2. Sort bytewise — this yields `(user_key asc, seq desc,
+    ///    type desc)` order thanks to the BE-inverted encoding.
+    /// 3. Walk the sorted vec, emitting the **first** entry per
+    ///    unique user key. Subsequent entries for the same user
+    ///    key are older versions, dropped.
+    /// 4. Tombstones encountered as the newest version are
+    ///    dropped outright because Layer 4d compaction is always
+    ///    bottommost. Snapshot-aware retention lands in Layer 4e.
+    ///
+    /// O(N) memory, O(N log N) time. A streaming k-way merge
+    /// arrives in Layer 4e alongside multi-level compaction.
     pub fn run(self) -> Result<usize> {
-        // 1. Build the merging iterator over the input SSTs.
-        // We need to keep each `SstIter` alive for the duration
-        // of the merge — that means borrowing each table reader.
-        // The simplest correct shape is: hold the readers in a
-        // local Vec and build iterators that borrow from them.
-        let readers: Vec<Arc<BlockBasedTableReader>> = self.inputs;
-        let mut sources: Vec<Box<dyn UserKeyIter>> = Vec::with_capacity(readers.len());
-        // SAFETY-of-borrow: each `SstIter` borrows from the
-        // corresponding `BlockBasedTableReader`. We pin the
-        // readers in `readers` (they're `Arc`s, so cloning would
-        // be cheap, but we don't even need to — we hold them by
-        // value). The `SstIter` borrow lives no longer than the
-        // surrounding `for` loop's borrow + the duration of the
-        // merging iterator below, both of which end before
-        // `readers` is dropped.
-        //
-        // The Rust borrow checker doesn't see the lifetime
-        // relationship between `readers[i]` and the iterators we
-        // push into `sources`. The cleanest way to satisfy it is
-        // to keep `readers` alive in this scope and use a
-        // self-contained `'static`-free closure region. Here we
-        // build everything in one block:
-        for reader in &readers {
-            // Reborrow as a long-lived reference tied to `readers`.
-            let it = reader.iter();
-            // The boxed iterator's lifetime is bound by `&reader`,
-            // which itself is bound by `&readers`. Since `readers`
-            // outlives this entire scope, the box is valid for the
-            // life of `sources`.
-            sources.push(Box::new(SstUserKeyIter::new(it)));
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for reader in &self.inputs {
+            let mut it = reader.iter();
+            it.seek_to_first();
+            while it.valid() {
+                entries.push((it.key().to_vec(), it.value().to_vec()));
+                it.next();
+            }
+            it.status()?;
         }
-        let mut merging = MergingIterator::new(sources);
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // 2. Open the output writer.
         let writable = self
             .fs
             .new_writable_file(self.output_path, &Default::default())?;
@@ -173,26 +170,30 @@ impl<'a> CompactionJob<'a> {
             self.table_options,
         );
 
-        // 3. Stream the merged keys into the output, dropping
-        //    tombstones (this is the bottommost level — nothing
-        //    older to shadow).
-        merging.seek_to_first();
         let mut written = 0usize;
-        while merging.valid() {
-            if !merging.is_tombstone() {
-                tb.add(merging.key(), merging.value())?;
-                written += 1;
+        let mut last_user_key: Option<Vec<u8>> = None;
+        for (ikey, value) in &entries {
+            let parsed = ParsedInternalKey::parse(ikey)?;
+            if last_user_key.as_deref() == Some(parsed.user_key) {
+                // Older version of an already-emitted user key.
+                continue;
             }
-            merging.next();
+            last_user_key = Some(parsed.user_key.to_vec());
+            match parsed.value_type {
+                ValueType::Value | ValueType::Merge => {
+                    tb.add(ikey, value)?;
+                    written += 1;
+                }
+                _ => {
+                    // Tombstone at bottommost level — drop.
+                }
+            }
         }
-        // Surface any error captured by the merging iterator.
-        merging.status()?;
-
-        // 4. Finalise the output SST. Builder takes self.
         tb.finish()?;
         Ok(written)
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -211,23 +212,63 @@ mod tests {
         dir
     }
 
-    fn write_sst(
+    /// Write an **internal-key** SST for the tests. Each record is
+    /// `(user_key, seq, value_type, value)`; the test code
+    /// constructs the internal key via `InternalKey::new` before
+    /// passing it to the block builder. Records must be provided
+    /// in internal-key sorted order (typically user-key ascending
+    /// with at most one version per user key in each test SST,
+    /// which is already sorted).
+    fn write_internal_sst(
         fs: &dyn FileSystem,
         path: &Path,
-        records: &[(&[u8], &[u8])],
+        records: &[(&[u8], crate::core::types::SequenceNumber, ValueType, &[u8])],
     ) -> Arc<BlockBasedTableReader> {
+        use crate::db::dbformat::InternalKey;
         let writable = fs.new_writable_file(path, &Default::default()).unwrap();
         let mut tb = BlockBasedTableBuilder::new(
             WritableFileWriter::new(writable),
             BlockBasedTableOptions::default(),
         );
-        for (k, v) in records {
-            tb.add(k, v).unwrap();
+        // Build internal keys and collect into a Vec so we can
+        // sort them (the encoding guarantees bytewise sort =
+        // internal-key order).
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = records
+            .iter()
+            .map(|(k, seq, t, v)| {
+                let ikey = InternalKey::new(k, *seq, *t).into_bytes();
+                (ikey, v.to_vec())
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (ikey, value) in &entries {
+            tb.add(ikey, value).unwrap();
         }
         tb.finish().unwrap();
         let raw = fs.new_random_access_file(path, &Default::default()).unwrap();
         let reader = RandomAccessFileReader::new(raw, path.display().to_string()).unwrap();
         Arc::new(BlockBasedTableReader::open(Arc::new(reader)).unwrap())
+    }
+
+    /// Open an SST and collect its entries as `(user_key, value)`
+    /// pairs, decoding the stored internal keys. Used by tests
+    /// to assert the contents of a compaction output.
+    fn read_internal_sst_entries(
+        fs: &dyn FileSystem,
+        path: &Path,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let raw = fs.new_random_access_file(path, &Default::default()).unwrap();
+        let reader = RandomAccessFileReader::new(raw, path.display().to_string()).unwrap();
+        let table = BlockBasedTableReader::open(Arc::new(reader)).unwrap();
+        let mut out = Vec::new();
+        let mut it = table.iter();
+        it.seek_to_first();
+        while it.valid() {
+            let parsed = ParsedInternalKey::parse(it.key()).unwrap();
+            out.push((parsed.user_key.to_vec(), it.value().to_vec()));
+            it.next();
+        }
+        out
     }
 
     #[test]
@@ -270,15 +311,25 @@ mod tests {
         let p2 = dir.join("b.sst");
         let out = dir.join("out.sst");
 
-        let t1 = write_sst(
+        // Each SST has three entries. Sequence numbers are chosen
+        // so every entry has a unique (user_key, seq).
+        let t1 = write_internal_sst(
             &fs,
             &p1,
-            &[(b"a" as &[u8], b"1" as &[u8]), (b"c", b"3"), (b"e", b"5")],
+            &[
+                (b"a", 1, ValueType::Value, b"1"),
+                (b"c", 3, ValueType::Value, b"3"),
+                (b"e", 5, ValueType::Value, b"5"),
+            ],
         );
-        let t2 = write_sst(
+        let t2 = write_internal_sst(
             &fs,
             &p2,
-            &[(b"b" as &[u8], b"2" as &[u8]), (b"d", b"4"), (b"f", b"6")],
+            &[
+                (b"b", 2, ValueType::Value, b"2"),
+                (b"d", 4, ValueType::Value, b"4"),
+                (b"f", 6, ValueType::Value, b"6"),
+            ],
         );
 
         let job = CompactionJob::new(
@@ -290,22 +341,20 @@ mod tests {
         let n = job.run().unwrap();
         assert_eq!(n, 6);
 
-        // Re-open the output and verify it has all six entries in order.
-        let raw = fs
-            .new_random_access_file(&out, &Default::default())
-            .unwrap();
-        let reader = RandomAccessFileReader::new(raw, out.display().to_string()).unwrap();
-        let table = BlockBasedTableReader::open(Arc::new(reader)).unwrap();
-        let mut it = table.iter();
-        it.seek_to_first();
-        let expected: &[&[u8]] = &[b"a", b"b", b"c", b"d", b"e", b"f"];
-        let mut i = 0;
-        while it.valid() {
-            assert_eq!(it.key(), expected[i]);
-            i += 1;
-            it.next();
-        }
-        assert_eq!(i, 6);
+        let entries = read_internal_sst_entries(&fs, &out);
+        assert_eq!(entries.len(), 6);
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = [
+            ("a", "1"),
+            ("b", "2"),
+            ("c", "3"),
+            ("d", "4"),
+            ("e", "5"),
+            ("f", "6"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+        .collect();
+        assert_eq!(entries, expected);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -318,33 +367,31 @@ mod tests {
         let p_old = dir.join("old.sst");
         let out = dir.join("out.sst");
 
-        // Newer SST has the live value.
-        let t_new = write_sst(
+        // Newer SST has the live value at a higher sequence.
+        let t_new = write_internal_sst(
             &fs,
             &p_new,
-            &[(b"k1" as &[u8], b"new" as &[u8])],
+            &[(b"k1", 10, ValueType::Value, b"new")],
         );
-        let t_old = write_sst(
+        let t_old = write_internal_sst(
             &fs,
             &p_old,
-            &[(b"k1" as &[u8], b"old" as &[u8])],
+            &[(b"k1", 1, ValueType::Value, b"old")],
         );
 
         let job = CompactionJob::new(
             &fs,
-            vec![t_new, t_old], // newest first
+            vec![t_new, t_old],
             &out,
             BlockBasedTableOptions::default(),
         );
         let n = job.run().unwrap();
         assert_eq!(n, 1);
 
-        let raw = fs
-            .new_random_access_file(&out, &Default::default())
-            .unwrap();
-        let reader = RandomAccessFileReader::new(raw, "out").unwrap();
-        let table = BlockBasedTableReader::open(Arc::new(reader)).unwrap();
-        assert_eq!(table.get(b"k1").unwrap(), Some(b"new".to_vec()));
+        let entries = read_internal_sst_entries(&fs, &out);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, b"k1".to_vec());
+        assert_eq!(entries[0].1, b"new".to_vec());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -357,16 +404,19 @@ mod tests {
         let p_old = dir.join("old.sst");
         let out = dir.join("out.sst");
 
-        // Newer SST has a tombstone (empty value) shadowing an old one.
-        let t_new = write_sst(
+        // Newer SST has a Deletion tombstone for "a" + a live "b".
+        let t_new = write_internal_sst(
             &fs,
             &p_new,
-            &[(b"a" as &[u8], b"" as &[u8]), (b"b", b"keep")],
+            &[
+                (b"a", 10, ValueType::Deletion, b""),
+                (b"b", 11, ValueType::Value, b"keep"),
+            ],
         );
-        let t_old = write_sst(
+        let t_old = write_internal_sst(
             &fs,
             &p_old,
-            &[(b"a" as &[u8], b"old" as &[u8])],
+            &[(b"a", 1, ValueType::Value, b"old")],
         );
 
         let job = CompactionJob::new(
@@ -378,13 +428,10 @@ mod tests {
         let n = job.run().unwrap();
         assert_eq!(n, 1, "only b should survive");
 
-        let raw = fs
-            .new_random_access_file(&out, &Default::default())
-            .unwrap();
-        let reader = RandomAccessFileReader::new(raw, "out").unwrap();
-        let table = BlockBasedTableReader::open(Arc::new(reader)).unwrap();
-        assert_eq!(table.get(b"a").unwrap(), None);
-        assert_eq!(table.get(b"b").unwrap(), Some(b"keep".to_vec()));
+        let entries = read_internal_sst_entries(&fs, &out);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, b"b".to_vec());
+        assert_eq!(entries[0].1, b"keep".to_vec());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

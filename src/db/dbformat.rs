@@ -9,30 +9,55 @@
 //! # Internal key layout
 //!
 //! ```text
-//!   +-----------+-------+------+
-//!   |  user_key | seq   | type |
-//!   +-----------+-------+------+
-//!                  7      1    bytes  (LE)
+//!   +-----------+----------------------+
+//!   |  user_key | ~((seq<<8)|type) BE  |
+//!   +-----------+----------------------+
+//!                    8 bytes
 //! ```
 //!
-//! The trailing 8 bytes pack `(seq << 8) | type` as little-endian.
-//! Sequence numbers are 56 bits (`0..2^56`). The total internal key
-//! length is always `user_key.len() + 8`.
+//! The trailing 8 bytes are the bitwise **complement** of
+//! `(seq << 8) | type`, written in **big-endian** order. This is a
+//! deliberate divergence from upstream RocksDB's LE-packed trailer,
+//! chosen so that **bytewise lexicographic order** of the encoded
+//! internal key matches the desired MVCC order `(user_key asc,
+//! sequence desc, type desc)`.
 //!
-//! # Ordering
+//! ## Why the encoding matters
 //!
-//! The [`InternalKeyComparator`] orders keys by:
+//! The ordering trick lets every data-block-based container in the
+//! engine — `memtable::SkipList`, `sst::block_based::BlockBuilder`,
+//! `sst::block_based::Block`, and `sst::block_based::sst_iterator`
+//! — sort internal keys correctly **without being aware of the
+//! internal-key structure**. They just sort bytewise. That means:
 //!
-//! 1. User key, ascending, using the supplied user comparator
-//!    (typically [`crate::ext::comparator::BytewiseComparator`]).
-//! 2. **Sequence number, descending** — so newer versions of the same
-//!    user key sort *before* older ones.
-//! 3. Value type, descending — a tiebreaker that matters only for
-//!    synthetic test keys with identical sequence numbers.
+//! - The skiplist in the memtable uses a bytewise comparator and
+//!   gets MVCC order for free.
+//! - The SST data block builder and reader (which use lexicographic
+//!   order for prefix compression and seek) work unchanged when
+//!   fed internal keys.
+//! - `BlockBasedTableReader::iter().seek(lookup_key)` lands on the
+//!   correct MVCC entry with no custom comparator plumbing.
 //!
-//! This ordering is what makes the point read "get latest version of
-//! user key K at sequence S" work: seek to `(K, S, kValueTypeForSeek)`
-//! and the very first entry you find is the answer.
+//! The tradeoff: **non-bytewise user comparators are not supported**
+//! at this layer. Layer 4d's `InternalKeyComparator` documents this
+//! assumption and delegates to bytewise comparison. A follow-up
+//! layer can add a comparator-parameterised block format if needed.
+//!
+//! Sequence numbers are still 56 bits (`0..2^56`). Total internal
+//! key length is still always `user_key.len() + 8`.
+//!
+//! ## Why BE-inverted?
+//!
+//! - **Big-endian**: so that the most-significant byte comes first
+//!   in the trailer, making numeric comparison match lexicographic
+//!   comparison of the bytes.
+//! - **Inverted**: so that a *larger* sequence (numerically) becomes
+//!   a *smaller* byte string, which is what we want for "newer
+//!   first" ordering.
+//!
+//! Put together: larger seq → smaller inverted value → smaller BE
+//! bytes → sorts earlier. Newer-first order for MVCC reads "just
+//! works" with any bytewise container.
 
 use crate::core::status::{Result, Status};
 use crate::core::types::{SequenceNumber, ValueType};
@@ -132,7 +157,9 @@ impl<'a> ParsedInternalKey<'a> {
         let trailer_bytes: [u8; 8] = internal_key[split..]
             .try_into()
             .expect("slice of length 8");
-        let packed = u64::from_le_bytes(trailer_bytes);
+        // BE-inverted: read as big-endian and then invert to
+        // recover the original packed value.
+        let packed = !u64::from_be_bytes(trailer_bytes);
         let (sequence, value_type) = unpack_seq_and_type(packed).ok_or_else(|| {
             Status::corruption(format!("unknown value type byte {:#x}", packed & 0xff))
         })?;
@@ -156,11 +183,14 @@ pub struct InternalKey {
 }
 
 impl InternalKey {
-    /// Construct from the three logical components.
+    /// Construct from the three logical components. Trailer is
+    /// encoded as `~((seq<<8) | type)` in big-endian byte order —
+    /// see the module-level doc for why.
     pub fn new(user_key: &[u8], seq: SequenceNumber, value_type: ValueType) -> Self {
+        let packed = pack_seq_and_type(seq, value_type);
         let mut bytes = Vec::with_capacity(user_key.len() + 8);
         bytes.extend_from_slice(user_key);
-        bytes.extend_from_slice(&pack_seq_and_type(seq, value_type).to_le_bytes());
+        bytes.extend_from_slice(&(!packed).to_be_bytes());
         Self { bytes }
     }
 
@@ -198,7 +228,8 @@ impl InternalKey {
         let trailer: [u8; 8] = self.bytes[self.bytes.len() - 8..]
             .try_into()
             .expect("InternalKey is at least 8 bytes");
-        u64::from_le_bytes(trailer)
+        // BE-inverted: read BE and flip to recover original packed.
+        !u64::from_be_bytes(trailer)
     }
 }
 
@@ -234,8 +265,9 @@ impl LookupKey {
         crate::util::coding::put_varint32(&mut buf, internal_key_size as u32);
         let internal_key_offset = buf.len();
         buf.extend_from_slice(user_key);
-        let trailer = (seq << 8) | VALUE_TYPE_FOR_SEEK as u64;
-        buf.extend_from_slice(&trailer.to_le_bytes());
+        // BE-inverted trailer: same encoding as InternalKey.
+        let packed = (seq << 8) | VALUE_TYPE_FOR_SEEK as u64;
+        buf.extend_from_slice(&(!packed).to_be_bytes());
         Self {
             buf,
             internal_key_offset,
@@ -296,28 +328,20 @@ impl std::fmt::Debug for InternalKeyComparator {
 
 impl Comparator for InternalKeyComparator {
     fn name(&self) -> &'static str {
-        // Upstream uses "rocksdb.InternalKeyComparator:<user_name>"
-        // but we can only return a `&'static str` here. The user
-        // comparator's name is already embedded in the Debug impl
-        // above; we return a fixed name for the static slot.
         "rocksdb.InternalKeyComparator"
     }
 
     fn cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
+        // With the BE-inverted trailer encoding, bytewise lex order
+        // already matches (user_key asc, sequence desc, type desc).
+        // The `user_comparator` field is retained for API stability
+        // but must be `BytewiseComparator` at this layer — non-
+        // bytewise user comparators would break the ordering
+        // invariant and are not supported until a future layer
+        // threads an explicit comparator through the block format.
         debug_assert!(a.len() >= 8);
         debug_assert!(b.len() >= 8);
-        let user_a = &a[..a.len() - 8];
-        let user_b = &b[..b.len() - 8];
-        match self.user_comparator.cmp(user_a, user_b) {
-            Ordering::Equal => {
-                // Pack the trailer of each, compare **descending** so
-                // newer (larger) sequences sort first.
-                let pack_a = u64::from_le_bytes(a[a.len() - 8..].try_into().unwrap());
-                let pack_b = u64::from_le_bytes(b[b.len() - 8..].try_into().unwrap());
-                pack_b.cmp(&pack_a)
-            }
-            ord => ord,
-        }
+        a.cmp(b)
     }
 }
 

@@ -249,9 +249,34 @@ impl DbImpl {
         // Newest first (highest number).
         ssts.sort_by(|a, b| b.number.cmp(&a.number));
 
-        // 5. Replay WAL files into a fresh memtable.
-        let mut memtable = MemTable::new(Arc::clone(&user_comparator));
+        // 5a. Initialise `last_sequence` from the existing SSTs.
+        //     Each SST holds internal keys whose trailer encodes
+        //     the sequence, so we walk every entry and keep the
+        //     maximum. Without this step, reopening a DB that
+        //     was closed cleanly (empty WAL, all data in SSTs)
+        //     would reset `last_sequence` to 0 and subsequent
+        //     `LookupKey`s would sort *after* every real entry,
+        //     causing every `get()` to miss.
+        //
+        //     A follow-up layer can avoid the full scan by
+        //     persisting `last_sequence` to `CURRENT` or a real
+        //     `MANIFEST` record.
         let mut last_sequence = 0u64;
+        for entry in &ssts {
+            let mut it = entry.reader.iter();
+            it.seek_to_first();
+            while it.valid() {
+                let parsed = ParsedInternalKey::parse(it.key())?;
+                if parsed.sequence > last_sequence {
+                    last_sequence = parsed.sequence;
+                }
+                it.next();
+            }
+            it.status()?;
+        }
+
+        // 5b. Replay WAL files into a fresh memtable.
+        let mut memtable = MemTable::new(Arc::clone(&user_comparator));
         for &wal_num in &existing_wal_numbers {
             let wal_path = make_wal_file_name(path, wal_num);
             let raw = fs.new_sequential_file(&wal_path, &Default::default())?;
@@ -403,25 +428,43 @@ impl DbImpl {
         };
         let _ = immutable; // intentionally unused after the lock drop
 
-        // 3. Walk SSTs newest-first. The first hit wins.
-        for table in ssts {
-            // BlockBasedTableReader::get takes the *user* key
-            // because Layer 3b doesn't yet know about internal
-            // keys. We pass the user key directly here — that's
-            // safe at Layer 4a because the SSTs are flushed
-            // memtable contents that store user keys (no MVCC
-            // suffixes inside the SST yet).
-            if let Some(v) = table.get(key)? {
-                // Empty value means it was a deletion in the
-                // memtable that got flushed.
-                if v.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(v));
+        // 3. Walk SSTs newest-first. For each SST, open an
+        //    iterator, seek to the lookup key, and inspect what
+        //    we land on:
+        //    - same user_key, Value/Merge → return the value
+        //    - same user_key, Deletion/SingleDeletion → return None
+        //    - different user_key → the lookup key is not in
+        //      this SST (the SST's entries for `key` end before
+        //      where we landed, or there are no entries for
+        //      `key` at all)
+        //
+        //    Because each SST is sorted `(user_key asc, seq desc,
+        //    type desc)`, the first entry we land on for the
+        //    target user_key is the newest version visible at
+        //    the lookup sequence — exactly what we want.
+        for table in &ssts {
+            let mut it = table.iter();
+            it.seek(lookup.internal_key());
+            if !it.valid() {
+                continue;
             }
+            // Parse the internal key we landed on.
+            let parsed = match ParsedInternalKey::parse(it.key()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if parsed.user_key != key {
+                continue;
+            }
+            return Ok(match parsed.value_type {
+                ValueType::Value | ValueType::Merge => Some(it.value().to_vec()),
+                ValueType::Deletion | ValueType::SingleDeletion => None,
+                // Range deletions / blob indices / wide-column
+                // entries aren't visible as point-lookup values
+                // at this layer.
+                _ => None,
+            });
         }
-        // Avoid the unused-variable warning on `lookup`.
-        let _ = lookup;
         Ok(None)
     }
 
@@ -578,6 +621,17 @@ impl DbImpl {
     /// Second half of a flush: write the immutable memtable into
     /// an SST file. **No lock held here.** Returns the open
     /// reader on success, an error on failure.
+    ///
+    /// # Layer 4d: internal-key SSTs
+    ///
+    /// The flush path writes **internal keys** (`user_key ||
+    /// BE-inverted(seq<<8|type)`) directly into the SST rather
+    /// than deduping per user key. The BE-inverted encoding
+    /// guarantees that the bytewise ordering used by the block
+    /// builder matches `(user_key asc, seq desc, type desc)`, so
+    /// SSTs now retain every version just like the memtable does.
+    /// This is what will enable snapshots + snapshot-aware
+    /// compaction in a follow-up layer.
     fn write_immutable_to_sst(
         &self,
         setup: &FlushSetup,
@@ -591,21 +645,16 @@ impl DbImpl {
             BlockBasedTableOptions::default(),
         );
 
-        let mut last_user_key: Option<Vec<u8>> = None;
+        // Walk the memtable's skiplist in sorted order — already
+        // `(user_key asc, seq desc, type desc)` thanks to the
+        // encoding — and stream every entry (including tombstones
+        // and multiple versions of the same user key) into the
+        // SST. Deduplication now happens lazily at read time and
+        // during compaction, not at flush time.
         let mut it = setup.immutable.iter();
         it.seek_to_first();
         while it.valid() {
-            let parsed = ParsedInternalKey::parse(it.key())?;
-            let is_dup =
-                matches!(&last_user_key, Some(prev) if prev.as_slice() == parsed.user_key);
-            if !is_dup {
-                let value: &[u8] = match parsed.value_type {
-                    ValueType::Value | ValueType::Merge => it.value(),
-                    _ => &[],
-                };
-                tb.add(parsed.user_key, value)?;
-                last_user_key = Some(parsed.user_key.to_vec());
-            }
+            tb.add(it.key(), it.value())?;
             it.next();
         }
         tb.finish()?;
@@ -1311,6 +1360,83 @@ mod tests {
                 Some(b"new".to_vec())
             );
         }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sst_retains_multiple_versions_per_user_key() {
+        // Layer 4d: SSTs store internal keys, so multiple
+        // versions of the same user key can coexist in a single
+        // SST. This test writes three versions of the same key,
+        // flushes them all into one SST (by reducing the auto-
+        // flush churn with a larger buffer), and then inspects
+        // the SST directly to confirm all three versions are
+        // present.
+        use crate::db::dbformat::ParsedInternalKey;
+        use crate::file::random_access_file_reader::RandomAccessFileReader;
+        use crate::sst::block_based::table_reader::BlockBasedTableReader;
+        use std::sync::Arc;
+
+        let dir = temp_dir("sst-versions");
+        // Larger write_buffer_size so all three puts land in one
+        // memtable before the flush trigger fires.
+        let db_opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&db_opts, &dir).unwrap();
+        db.put(b"k", b"v1").unwrap();
+        db.put(b"k", b"v2").unwrap();
+        db.put(b"k", b"v3").unwrap();
+        db.flush().unwrap();
+        db.wait_for_pending_flush().unwrap();
+
+        // The current-value read should return v3.
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v3".to_vec()));
+
+        // Find the one live SST and inspect its raw contents.
+        // We go around the engine to read the on-disk file
+        // directly.
+        let fs = crate::env::posix::PosixFileSystem::new();
+        let mut sst_paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("sst"))
+            .collect();
+        sst_paths.sort();
+        assert_eq!(sst_paths.len(), 1, "expected exactly one SST");
+
+        let raw = fs
+            .new_random_access_file(&sst_paths[0], &Default::default())
+            .unwrap();
+        let reader = RandomAccessFileReader::new(raw, "t").unwrap();
+        let table = BlockBasedTableReader::open(Arc::new(reader)).unwrap();
+        let mut it = table.iter();
+        it.seek_to_first();
+        let mut versions = Vec::new();
+        while it.valid() {
+            let parsed = ParsedInternalKey::parse(it.key()).unwrap();
+            if parsed.user_key == b"k" {
+                versions.push((parsed.sequence, it.value().to_vec()));
+            }
+            it.next();
+        }
+        assert_eq!(
+            versions.len(),
+            3,
+            "SST should retain all three versions of `k`"
+        );
+        // Thanks to internal-key ordering, versions are in
+        // descending sequence order.
+        assert_eq!(versions[0].1, b"v3".to_vec());
+        assert_eq!(versions[1].1, b"v2".to_vec());
+        assert_eq!(versions[2].1, b"v1".to_vec());
+        assert!(versions[0].0 > versions[1].0);
+        assert!(versions[1].0 > versions[2].0);
+
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
