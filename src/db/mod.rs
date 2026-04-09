@@ -6,5 +6,9 @@
 //! `db_impl.cc`) is Layer 4 and is intentionally absent here. We only
 //! pull the types that `memtable/` and `sst/` cannot compile without.
 
+pub mod db_impl;
 pub mod dbformat;
+pub mod log_format;
+pub mod log_reader;
+pub mod log_writer;
 pub mod memtable;

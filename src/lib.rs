@@ -12,6 +12,7 @@
 //! | 2     | I/O, buffered files, block cache | [`file`], [`cache`], `env::posix`, `env::thread_pool` |
 //! | 3a    | InternalKey, memtable, SST format primitives | [`db`], [`memtable`], [`sst`]                       |
 //! | 3b    | SST builder/reader, bloom filter, CRC32C | `sst::block_based::table_*`, `util::crc32c`     |
+//! | 4a    | Minimum-viable engine: WAL + DbImpl | `db::log_*`, `db::db_impl`                          |
 //! | 4     | LSM engine                       | *deferred*                                          |
 //! | 5     | Optional features                | *deferred*                                          |
 //! | 6     | Tools & stress                   | *deferred*                                          |
@@ -144,3 +145,10 @@ pub use crate::sst::block_based::table_builder::{
     BlockBasedTableBuilder, BlockBasedTableOptions,
 };
 pub use crate::sst::block_based::table_reader::BlockBasedTableReader;
+
+// ---------- Layer 4a re-exports ----------
+
+pub use crate::db::db_impl::DbImpl;
+pub use crate::db::log_format::{RecordType, BLOCK_SIZE as WAL_BLOCK_SIZE, HEADER_SIZE as WAL_HEADER_SIZE};
+pub use crate::db::log_reader::LogReader;
+pub use crate::db::log_writer::LogWriter;
