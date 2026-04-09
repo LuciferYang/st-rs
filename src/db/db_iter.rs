@@ -160,38 +160,120 @@ impl<'a> UserKeyIter for MemtableUserKeyIter<'a> {
 // ---------------------------------------------------------------------------
 
 /// Wraps an [`SstIter`] so the merging iterator can consume it.
-/// SSTs already store user keys (the Layer 4a flush path collapses
-/// the memtable's internal-key view to one user-key entry per key
-/// before writing), so this is mostly a passthrough.
+///
+/// # Layer 4d: internal-key SSTs
+///
+/// Starting at Layer 4d, SSTs store **internal keys** in
+/// `(user_key asc, seq desc, type desc)` order. This wrapper
+/// parses each entry's internal key, decodes the user key + value
+/// type, and presents only the **newest** version per user key —
+/// mirroring what `MemtableUserKeyIter` does for the memtable.
+/// Tombstones (Deletion / SingleDeletion) are surfaced with an
+/// empty value, matching the engine convention.
 pub struct SstUserKeyIter<'a> {
     inner: SstIter<'a>,
+    /// Decoded current user key (parsed from the SST's internal key).
+    cur_key: Vec<u8>,
+    /// Decoded current value (empty for tombstones).
+    cur_value: Vec<u8>,
+    /// True iff `cur_key`/`cur_value` are populated.
+    valid: bool,
 }
 
 impl<'a> SstUserKeyIter<'a> {
     /// Wrap an existing SST iterator.
     pub fn new(inner: SstIter<'a>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            cur_key: Vec::new(),
+            cur_value: Vec::new(),
+            valid: false,
+        }
+    }
+
+    /// Decode whatever the inner iterator is positioned on into
+    /// `cur_key`/`cur_value`.
+    fn read_current(&mut self) {
+        if !self.inner.valid() {
+            self.valid = false;
+            self.cur_key.clear();
+            self.cur_value.clear();
+            return;
+        }
+        let parsed = match ParsedInternalKey::parse(self.inner.key()) {
+            Ok(p) => p,
+            Err(_) => {
+                self.valid = false;
+                return;
+            }
+        };
+        self.cur_key.clear();
+        self.cur_key.extend_from_slice(parsed.user_key);
+        self.cur_value.clear();
+        match parsed.value_type {
+            ValueType::Value | ValueType::Merge => {
+                self.cur_value.extend_from_slice(self.inner.value());
+            }
+            _ => {
+                // Deletion / SingleDeletion / RangeDeletion / blob /
+                // wide-column → empty value (tombstone).
+            }
+        }
+        self.valid = true;
+    }
+
+    /// Skip past every additional entry in the SST that shares
+    /// the current user key. The first one we landed on (newest,
+    /// thanks to internal-key ordering) is what we surface; the
+    /// rest are older versions that must be hidden from the
+    /// merging iterator.
+    fn skip_duplicates(&mut self) {
+        let cur_key = self.cur_key.clone();
+        loop {
+            self.inner.next();
+            if !self.inner.valid() {
+                break;
+            }
+            let parsed = match ParsedInternalKey::parse(self.inner.key()) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            if parsed.user_key != cur_key.as_slice() {
+                break;
+            }
+        }
     }
 }
 
 impl<'a> UserKeyIter for SstUserKeyIter<'a> {
     fn valid(&self) -> bool {
-        self.inner.valid()
+        self.valid
     }
     fn key(&self) -> &[u8] {
-        self.inner.key()
+        &self.cur_key
     }
     fn value(&self) -> &[u8] {
-        self.inner.value()
+        &self.cur_value
     }
     fn seek_to_first(&mut self) {
         self.inner.seek_to_first();
+        self.read_current();
     }
     fn seek(&mut self, target: &[u8]) {
-        self.inner.seek(target);
+        // Seek the underlying SST to the lookup key for the
+        // largest possible sequence at this user key — that's
+        // the newest version, which internal-key ordering
+        // places first.
+        let lookup = crate::db::dbformat::LookupKey::new(target, u64::MAX >> 8);
+        self.inner.seek(lookup.internal_key());
+        self.read_current();
     }
     fn next(&mut self) {
-        self.inner.next();
+        if !self.valid {
+            return;
+        }
+        self.skip_duplicates();
+        self.read_current();
     }
     fn status(&self) -> Result<()> {
         self.inner.status()
@@ -290,19 +372,24 @@ impl DbIterator {
             }
         }
 
-        // 3. SSTs in newest-first order.
+        // 3. SSTs in newest-first order. We go through
+        //    `SstUserKeyIter` rather than the raw `SstIter` so
+        //    that Layer 4d's internal-key SSTs are parsed and
+        //    deduplicated correctly — the adapter presents only
+        //    the newest version per user key and surfaces
+        //    tombstones as empty values.
         for table in ssts {
-            let mut it = table.iter();
+            let mut it = SstUserKeyIter::new(table.iter());
             it.seek_to_first();
             while it.valid() {
-                let key = it.key();
-                if !map.contains_key(key) {
-                    if it.value().is_empty() {
-                        map.insert(key.to_vec(), Vec::new());
+                let key = it.key().to_vec();
+                map.entry(key).or_insert_with(|| {
+                    if it.is_tombstone() {
+                        Vec::new()
                     } else {
-                        map.insert(key.to_vec(), it.value().to_vec());
+                        it.value().to_vec()
                     }
-                }
+                });
                 it.next();
             }
             it.status()?;
