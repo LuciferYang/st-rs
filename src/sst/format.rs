@@ -214,26 +214,45 @@ impl Footer {
     }
 }
 
-/// Compute the CRC32C-like checksum of a block for the block trailer.
-/// Layer 3a uses `crate::util::hash::hash` as a placeholder — **not**
-/// wire-compatible with upstream's `kCRC32c`. Layer 3b will swap in
-/// a real CRC32C once it lands in `util::hash`.
-#[allow(dead_code)]
-pub(crate) fn block_checksum_placeholder(data: &[u8], compression_byte: u8) -> u32 {
-    // Feed the data + compression byte through the Layer 1 hash.
-    // This isn't the right algorithm — it's just here so the
-    // trailer-writing path has *something* to write — but every
-    // caller will round-trip through the same function, so
-    // intra-crate round trips still work.
-    let seed = compression_byte as u32;
-    crate::util::hash::hash(data, seed)
+/// Compute the masked CRC-32C of `block_bytes || compression_byte`.
+///
+/// Matches upstream's `ComputeBuiltinChecksum` for `kCRC32c`: the
+/// CRC covers the block bytes *plus* the trailing compression-type
+/// byte, and the result goes through [`crate::util::crc32c::mask`]
+/// before being stored on disk.
+pub(crate) fn compute_block_checksum(block_bytes: &[u8], compression_byte: u8) -> u32 {
+    let mut crc = crate::util::crc32c::crc32c(block_bytes);
+    crc = crate::util::crc32c::crc32c_extend(crc, &[compression_byte]);
+    crate::util::crc32c::mask(crc)
+}
+
+/// Verify the trailer attached to `block_bytes`. `trailer` must be
+/// exactly 5 bytes: `[compression_type: u8][masked_crc: u32 LE]`.
+/// Returns the decoded compression-type byte on success, or a
+/// `Status::Corruption` if the checksum mismatches.
+pub fn verify_block_trailer(block_bytes: &[u8], trailer: &[u8]) -> Result<u8> {
+    if trailer.len() != BLOCK_TRAILER_SIZE {
+        return Err(Status::corruption(format!(
+            "block trailer must be {BLOCK_TRAILER_SIZE} bytes, got {}",
+            trailer.len()
+        )));
+    }
+    let compression_byte = trailer[0];
+    let stored_masked = decode_fixed32(&trailer[1..])?;
+    let expected_masked = compute_block_checksum(block_bytes, compression_byte);
+    if stored_masked != expected_masked {
+        return Err(Status::corruption(format!(
+            "block checksum mismatch: stored={stored_masked:#010x}, expected={expected_masked:#010x}"
+        )));
+    }
+    Ok(compression_byte)
 }
 
 /// Helper used by builders to emit a five-byte block trailer onto
-/// the output buffer. Writes `[compression: u8][checksum: u32 LE]`.
+/// the output buffer. Writes `[compression: u8][masked_crc: u32 LE]`.
 pub fn put_block_trailer(dst: &mut Vec<u8>, compression_type: u8, block_bytes: &[u8]) {
     dst.push(compression_type);
-    let checksum = block_checksum_placeholder(block_bytes, compression_type);
+    let checksum = compute_block_checksum(block_bytes, compression_type);
     put_fixed32(dst, checksum);
 }
 
@@ -310,5 +329,39 @@ mod tests {
         put_block_trailer(&mut dst, 0, b"hello block");
         assert_eq!(dst.len(), BLOCK_TRAILER_SIZE);
         assert_eq!(dst[0], 0); // compression type
+    }
+
+    #[test]
+    fn block_trailer_round_trip() {
+        let block = b"some arbitrary block bytes";
+        let mut trailer = Vec::new();
+        put_block_trailer(&mut trailer, 0, block);
+        let compression = verify_block_trailer(block, &trailer).unwrap();
+        assert_eq!(compression, 0);
+    }
+
+    #[test]
+    fn verify_block_trailer_detects_corruption() {
+        let block = b"some arbitrary block bytes";
+        let mut trailer = Vec::new();
+        put_block_trailer(&mut trailer, 0, block);
+        // Flip a bit in the stored CRC and expect a Corruption status.
+        trailer[2] ^= 0xff;
+        assert!(verify_block_trailer(block, &trailer).unwrap_err().is_corruption());
+    }
+
+    #[test]
+    fn verify_block_trailer_detects_body_tamper() {
+        let block = b"hello block";
+        let mut trailer = Vec::new();
+        put_block_trailer(&mut trailer, 0, block);
+        // Change the block contents; trailer should no longer verify.
+        let tampered = b"hello wurld";
+        assert!(verify_block_trailer(tampered, &trailer).unwrap_err().is_corruption());
+    }
+
+    #[test]
+    fn verify_rejects_wrong_length() {
+        assert!(verify_block_trailer(b"x", &[0u8; 3]).unwrap_err().is_corruption());
     }
 }

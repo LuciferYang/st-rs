@@ -13,6 +13,7 @@
 //! - `util/crc32c.h` — a follow-up module; `crc32fast` crate can replace it.
 
 pub mod coding;
+pub mod crc32c;
 pub mod hash;
 pub mod random;
 pub mod string_util;
