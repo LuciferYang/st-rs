@@ -1,0 +1,23 @@
+[package]
+name = "st-rs"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust port of ForSt Layer 0 — public API surface and platform abstraction traits (Status, Slice, FileSystem, DB, Iterator, Options, ...)"
+license = "Apache-2.0"
+repository = "https://github.com/yangjie01/st-rs"
+readme = "README.md"
+categories = ["database-implementations", "api-bindings"]
+keywords = ["rocksdb", "forst", "lsm", "kv", "flink"]
+
+[lib]
+name = "st_rs"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
