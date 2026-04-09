@@ -11,7 +11,7 @@
 //! | 1     | Foundation utilities             | [`util`], [`memory`], [`logging`], [`monitoring`]   |
 //! | 2     | I/O, buffered files, block cache | [`file`], [`cache`], `env::posix`, `env::thread_pool` |
 //! | 3a    | InternalKey, memtable, SST format primitives | [`db`], [`memtable`], [`sst`]                       |
-//! | 3b    | SST builder/reader, index, filter  | *deferred*                                          |
+//! | 3b    | SST builder/reader, bloom filter, CRC32C | `sst::block_based::table_*`, `util::crc32c`     |
 //! | 4     | LSM engine                       | *deferred*                                          |
 //! | 5     | Optional features                | *deferred*                                          |
 //! | 6     | Tools & stress                   | *deferred*                                          |
@@ -129,6 +129,18 @@ pub use crate::memtable::skip_list::{SkipList, SkipListIter, BRANCHING_FACTOR, M
 pub use crate::sst::block_based::block::{Block, BlockIter};
 pub use crate::sst::block_based::block_builder::{BlockBuilder, DEFAULT_BLOCK_RESTART_INTERVAL};
 pub use crate::sst::format::{
-    put_block_trailer, BlockHandle, Footer, BLOCK_BASED_TABLE_MAGIC_NUMBER, BLOCK_TRAILER_SIZE,
-    DEFAULT_FORMAT_VERSION, MAX_BLOCK_HANDLE_ENCODED_LENGTH,
+    put_block_trailer, verify_block_trailer, BlockHandle, Footer,
+    BLOCK_BASED_TABLE_MAGIC_NUMBER, BLOCK_TRAILER_SIZE, DEFAULT_FORMAT_VERSION,
+    MAX_BLOCK_HANDLE_ENCODED_LENGTH,
 };
+
+// ---------- Layer 3b re-exports ----------
+
+pub use crate::sst::block_based::filter_block::{
+    BloomFilterBuilder, BloomFilterPolicy, BloomFilterReader, DEFAULT_BITS_PER_KEY,
+    FILTER_METAINDEX_KEY,
+};
+pub use crate::sst::block_based::table_builder::{
+    BlockBasedTableBuilder, BlockBasedTableOptions,
+};
+pub use crate::sst::block_based::table_reader::BlockBasedTableReader;
