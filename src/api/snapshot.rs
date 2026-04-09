@@ -10,7 +10,7 @@
 //! `GetSequenceNumber()`. We follow the same minimal shape, plus a simple
 //! concrete implementation for tests.
 
-use crate::types::SequenceNumber;
+use crate::core::types::SequenceNumber;
 
 /// A point-in-time view of a DB. Borrowing a `&dyn Snapshot` from the DB
 /// prevents the sequence number it pins from being garbage-collected.

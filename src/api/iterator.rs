@@ -17,7 +17,7 @@
 //! borrow to `&self`, matching the upstream rule that "the returned slice is
 //! valid until the next mutation of the iterator."
 
-use crate::status::{Result, Status};
+use crate::core::status::{Result, Status};
 
 /// Seekable bidirectional cursor over a sorted (key, value) source.
 ///

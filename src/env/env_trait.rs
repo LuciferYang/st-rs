@@ -2,8 +2,8 @@
 //!
 //! In upstream RocksDB, `Env` is the legacy abstraction that bundles a
 //! filesystem, a thread pool, a clock, and a logger into one virtual class.
-//! The newer [`FileSystem`](crate::file_system::FileSystem) trait carves off
-//! the filesystem part; `Env` keeps the rest.
+//! The newer [`FileSystem`](crate::env::file_system::FileSystem) trait
+//! carves off the filesystem part; `Env` keeps the rest.
 //!
 //! ForSt's `FlinkEnv` (the Java side) constructs a `FlinkFileSystem` on the
 //! C++ side, wraps it into an `Env` via `NewCompositeEnv(flink_fs)`, and
@@ -11,8 +11,8 @@
 //! mirror the split: [`Env`] is a thin composition of a [`FileSystem`],
 //! a [`Clock`], and a background thread pool.
 
-use crate::file_system::FileSystem;
-use crate::status::Result;
+use crate::core::status::Result;
+use crate::env::file_system::FileSystem;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

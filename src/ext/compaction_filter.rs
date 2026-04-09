@@ -7,7 +7,7 @@
 //! `FlinkCompactionFilter` walks state and drops entries that have expired
 //! under the state TTL policy.
 
-use crate::types::EntryType;
+use crate::core::types::EntryType;
 
 /// Decision returned from [`CompactionFilter::filter`].
 #[derive(Debug)]

@@ -19,8 +19,8 @@
 //!   (memtable, another batch, a logging shim, …). This is the equivalent
 //!   of upstream `WriteBatch::Handler`.
 
-use crate::status::Result;
-use crate::types::ColumnFamilyId;
+use crate::core::status::Result;
+use crate::core::types::ColumnFamilyId;
 
 /// Default column family ID. Column family 0 is always the "default" CF
 /// which must exist for the lifetime of the DB.
@@ -266,7 +266,7 @@ mod tests {
             fn put_cf(&mut self, _cf: ColumnFamilyId, _k: &[u8], _v: &[u8]) -> Result<()> {
                 self.0 += 1;
                 if self.0 >= 2 {
-                    Err(crate::status::Status::io_error("boom"))
+                    Err(crate::core::status::Status::io_error("boom"))
                 } else {
                     Ok(())
                 }

@@ -21,9 +21,9 @@
 //! must be safe for *concurrent reads* so the block cache miss path can
 //! parallelise.
 
-use crate::options::FileOptions;
-use crate::status::{Result, Status};
-use crate::types::Temperature;
+use crate::api::options::FileOptions;
+use crate::core::status::{Result, Status};
+use crate::core::types::Temperature;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
