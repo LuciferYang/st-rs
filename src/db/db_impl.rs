@@ -55,6 +55,7 @@
 use crate::api::options::DbOptions;
 use crate::core::status::{Result, Status};
 use crate::core::types::{SequenceNumber, ValueType};
+use crate::db::compaction::{pick_compaction, CompactionJob};
 use crate::db::log_reader::LogReader;
 use crate::db::log_writer::LogWriter;
 use crate::db::memtable::{MemTable, MemTableGetResult};
@@ -354,6 +355,27 @@ impl DbImpl {
         Ok(None)
     }
 
+    /// Open a forward + backward iterator over the engine. Eagerly
+    /// materialises a snapshot of the memtable + every live SST
+    /// under the lock, so the returned iterator is detached from
+    /// the engine and survives concurrent writes.
+    pub fn iter(&self) -> Result<crate::db::db_iter::DbIterator> {
+        let state = self.state.lock().unwrap();
+        let ssts: Vec<Arc<BlockBasedTableReader>> =
+            state.ssts.iter().map(|e| Arc::clone(&e.reader)).collect();
+        // The MemTable is held by value inside the lock; we need
+        // to materialise its entries before dropping the guard.
+        // The eager DbIterator does that under the same borrow.
+        let it = crate::db::db_iter::DbIterator::from_snapshot(&state.memtable, &ssts)?;
+        drop(state);
+        Ok(it)
+    }
+
+    /// Trigger threshold for automatic compaction. When the live
+    /// SST count reaches this, [`Self::flush`] runs a compaction
+    /// after the new SST is added.
+    const COMPACTION_TRIGGER: usize = 4;
+
     /// Force-flush the active memtable to a fresh SST.
     pub fn flush(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
@@ -465,6 +487,92 @@ impl DbImpl {
         writer.flush(&io)?;
         writer.sync(&io)?;
         writer.close(&io)?;
+
+        // Decide whether to schedule a compaction. Snapshot the
+        // SST list under the lock, then drop the lock before
+        // running the merge — compaction is I/O-heavy and we
+        // don't want to block writers on it.
+        let to_compact = pick_compaction(state.ssts.len(), Self::COMPACTION_TRIGGER);
+        let compaction_plan: Option<(u64, Vec<Arc<BlockBasedTableReader>>, Vec<u64>)> =
+            to_compact.map(|indices| {
+                let inputs: Vec<Arc<BlockBasedTableReader>> = indices
+                    .iter()
+                    .map(|&i| Arc::clone(&state.ssts[i].reader))
+                    .collect();
+                let input_numbers: Vec<u64> =
+                    indices.iter().map(|&i| state.ssts[i].number).collect();
+                let out_number = state.next_file_number;
+                state.next_file_number += 1;
+                (out_number, inputs, input_numbers)
+            });
+        drop(state);
+
+        if let Some((out_num, inputs, input_numbers)) = compaction_plan {
+            self.run_compaction(out_num, inputs, input_numbers)?;
+        }
+        Ok(())
+    }
+
+    /// Run a compaction job and update engine state to swap the
+    /// inputs for the new output SST.
+    fn run_compaction(
+        &self,
+        out_number: u64,
+        inputs: Vec<Arc<BlockBasedTableReader>>,
+        input_numbers: Vec<u64>,
+    ) -> Result<()> {
+        let out_path = make_table_file_name(&self.path, out_number);
+
+        // Run the merge → output SST. CompactionJob borrows the
+        // file system; the inputs are owned via Arc.
+        let job = CompactionJob::new(
+            self.fs.as_ref(),
+            inputs,
+            &out_path,
+            BlockBasedTableOptions::default(),
+        );
+        let written = job.run()?;
+
+        // Swap inputs for the output under the lock.
+        let mut state = self.state.lock().unwrap();
+        state
+            .ssts
+            .retain(|e| !input_numbers.contains(&e.number));
+
+        if written > 0 {
+            // Open the new SST and add it. The compaction output
+            // is the *newest* surviving SST in the resulting set
+            // (it absorbed every input), so insert at the front.
+            let raw = self
+                .fs
+                .new_random_access_file(&out_path, &Default::default())?;
+            let reader = RandomAccessFileReader::new(raw, out_path.display().to_string())?;
+            let table = BlockBasedTableReader::open(Arc::new(reader))?;
+            state.ssts.insert(
+                0,
+                SstEntry {
+                    number: out_number,
+                    reader: Arc::new(table),
+                },
+            );
+        }
+        drop(state);
+
+        // Delete the input SST files. Best-effort: a leaked file
+        // is harmless because the next reopen ignores files not
+        // listed in CURRENT.
+        for n in &input_numbers {
+            let p = make_table_file_name(&self.path, *n);
+            if self.fs.file_exists(&p)? {
+                self.fs.delete_file(&p)?;
+            }
+        }
+
+        // If the compaction produced no output (everything was
+        // tombstones), remove the empty output file too.
+        if written == 0 && self.fs.file_exists(&out_path)? {
+            self.fs.delete_file(&out_path)?;
+        }
         Ok(())
     }
 
@@ -799,6 +907,150 @@ mod tests {
         // (lower file number? no — *higher* number, inserted at
         // the front of the list) wins.
         assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn iter_walks_memtable_only() {
+        let dir = temp_dir("iter-mem");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        for k in ["a", "b", "c", "d"] {
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+        let mut it = db.iter().unwrap();
+        it.seek_to_first();
+        let mut got = Vec::new();
+        while it.valid() {
+            got.push((it.key().to_vec(), it.value().to_vec()));
+            it.next();
+        }
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0].0, b"a");
+        assert_eq!(got[3].0, b"d");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn iter_merges_memtable_and_sst() {
+        let dir = temp_dir("iter-merge");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        // First batch goes into the memtable, then to an SST.
+        db.put(b"a", b"1").unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.flush().unwrap();
+        // Second batch stays in the memtable.
+        db.put(b"b", b"2").unwrap();
+        db.put(b"d", b"4").unwrap();
+
+        let mut it = db.iter().unwrap();
+        it.seek_to_first();
+        let collected: Vec<(Vec<u8>, Vec<u8>)> = std::iter::from_fn(|| {
+            if !it.valid() {
+                return None;
+            }
+            let r = (it.key().to_vec(), it.value().to_vec());
+            it.next();
+            Some(r)
+        })
+        .collect();
+        assert_eq!(collected.len(), 4);
+        assert_eq!(collected[0], (b"a".to_vec(), b"1".to_vec()));
+        assert_eq!(collected[1], (b"b".to_vec(), b"2".to_vec()));
+        assert_eq!(collected[2], (b"c".to_vec(), b"3".to_vec()));
+        assert_eq!(collected[3], (b"d".to_vec(), b"4".to_vec()));
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn iter_skips_deleted_keys() {
+        let dir = temp_dir("iter-del");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.flush().unwrap();
+        db.delete(b"a").unwrap();
+        let mut it = db.iter().unwrap();
+        it.seek_to_first();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"b"); // a was deleted
+        it.next();
+        assert!(!it.valid());
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_compaction_collapses_ssts() {
+        let dir = temp_dir("compact");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        // Issue 5 flushes — the 4th hits COMPACTION_TRIGGER and
+        // triggers an automatic compaction that merges all live
+        // SSTs into one.
+        for batch in 0..5u32 {
+            for i in 0..10u32 {
+                let k = format!("key{batch}-{i:02}");
+                db.put(k.as_bytes(), b"v").unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        // After all the flushes + auto compactions, every key
+        // should still be readable.
+        for batch in 0..5u32 {
+            for i in 0..10u32 {
+                let k = format!("key{batch}-{i:02}");
+                assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
+            }
+        }
+
+        // The SST list should have shrunk — there were 5 flushes
+        // but compaction merged the older ones.
+        let n = {
+            let state = db.state.lock().unwrap();
+            state.ssts.len()
+        };
+        assert!(n < 5, "expected fewer than 5 SSTs after compaction, got {n}");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn iter_after_compaction_returns_correct_data() {
+        let dir = temp_dir("iter-compact");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        // Populate enough data across 5 flushes to trip the
+        // compaction trigger.
+        for batch in 0..5u32 {
+            for i in 0..5u32 {
+                let k = format!("k{:03}", batch * 10 + i);
+                db.put(k.as_bytes(), batch.to_string().as_bytes()).unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        // Iterate after compaction and confirm sorted order +
+        // count.
+        let mut it = db.iter().unwrap();
+        it.seek_to_first();
+        let mut count = 0;
+        let mut last: Option<Vec<u8>> = None;
+        while it.valid() {
+            count += 1;
+            let k = it.key().to_vec();
+            if let Some(prev) = &last {
+                assert!(k > *prev, "iterator out of order");
+            }
+            last = Some(k);
+            it.next();
+        }
+        assert_eq!(count, 25);
+
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
