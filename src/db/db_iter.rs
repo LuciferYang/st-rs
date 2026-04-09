@@ -32,7 +32,7 @@
 //! `unsafe` (matching upstream).
 
 use crate::core::status::Result;
-use crate::core::types::ValueType;
+use crate::core::types::{SequenceNumber, ValueType};
 use crate::db::dbformat::ParsedInternalKey;
 use crate::db::memtable::MemTable;
 use crate::db::merging_iterator::{MergingIterator, UserKeyIter};
@@ -41,6 +41,11 @@ use crate::sst::block_based::sst_iterator::SstIter;
 use crate::sst::block_based::table_reader::BlockBasedTableReader;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// "Read at the latest possible sequence" — used by default when
+/// no explicit snapshot is passed. The 56-bit sequence field has
+/// plenty of headroom.
+pub const READ_AT_LATEST: SequenceNumber = u64::MAX >> 8;
 
 // ---------------------------------------------------------------------------
 // MemtableUserKeyIter — adapts the memtable's internal-key iterator
@@ -63,49 +68,80 @@ pub struct MemtableUserKeyIter<'a> {
     cur_key: Vec<u8>,
     cur_value: Vec<u8>,
     valid: bool,
+    /// Read-at sequence — only entries with `seq <= read_seq` are
+    /// visible. Defaults to [`READ_AT_LATEST`] when the caller
+    /// didn't pick a specific snapshot.
+    read_seq: SequenceNumber,
 }
 
 impl<'a> MemtableUserKeyIter<'a> {
-    /// Build a new wrapper. Caller must call `seek_to_first` or
-    /// `seek` before reading.
+    /// Build a new wrapper that reads at the latest sequence.
+    /// Caller must call `seek_to_first` or `seek` before reading.
     pub fn new(memtable: &'a MemTable) -> Self {
+        Self::new_at(memtable, READ_AT_LATEST)
+    }
+
+    /// Build a wrapper that reads at a specific snapshot sequence.
+    /// Entries with `seq > read_seq` are invisible — the iterator
+    /// skips past them when positioning.
+    pub fn new_at(memtable: &'a MemTable, read_seq: SequenceNumber) -> Self {
         Self {
             inner: memtable.iter(),
             cur_key: Vec::new(),
             cur_value: Vec::new(),
             valid: false,
+            read_seq,
         }
     }
 
+    /// Walk the inner iterator forward until we find an entry
+    /// whose sequence is `<= read_seq` (visible at our snapshot).
+    /// Thanks to internal-key ordering (newest-first per user
+    /// key), the first visible entry per user key is the newest
+    /// version at or below `read_seq` — exactly what a snapshot
+    /// read wants.
+    ///
+    /// If an entire user key's versions are all above `read_seq`,
+    /// this function's loop naturally advances to the next user
+    /// key without surfacing anything for the invisible one.
     fn read_current(&mut self) {
-        if !self.inner.valid() {
-            self.valid = false;
+        while self.inner.valid() {
+            let parsed = match ParsedInternalKey::parse(self.inner.key()) {
+                Ok(p) => p,
+                Err(_) => {
+                    self.valid = false;
+                    return;
+                }
+            };
+            if parsed.sequence > self.read_seq {
+                // Invisible — skip and keep scanning.
+                self.inner.next();
+                continue;
+            }
+            // First visible version for this user key. Surface it.
             self.cur_key.clear();
+            self.cur_key.extend_from_slice(parsed.user_key);
             self.cur_value.clear();
+            match parsed.value_type {
+                ValueType::Value | ValueType::Merge => {
+                    self.cur_value.extend_from_slice(self.inner.value());
+                }
+                _ => {
+                    // Deletion / SingleDeletion / RangeDeletion /
+                    // blob / wide-column → empty value (tombstone).
+                }
+            }
+            self.valid = true;
             return;
         }
-        let parsed = match ParsedInternalKey::parse(self.inner.key()) {
-            Ok(p) => p,
-            Err(_) => {
-                self.valid = false;
-                return;
-            }
-        };
+        self.valid = false;
         self.cur_key.clear();
-        self.cur_key.extend_from_slice(parsed.user_key);
         self.cur_value.clear();
-        match parsed.value_type {
-            ValueType::Value | ValueType::Merge => {
-                self.cur_value.extend_from_slice(self.inner.value());
-            }
-            _ => {
-                // Deletion / SingleDeletion / RangeDeletion / blob /
-                // wide-column → empty value (tombstone).
-            }
-        }
-        self.valid = true;
     }
 
+    /// Advance past every remaining entry that shares the current
+    /// user key — they're all older versions of a key we've
+    /// already surfaced.
     fn skip_duplicates(&mut self) {
         let cur_key = self.cur_key.clone();
         loop {
@@ -139,10 +175,13 @@ impl<'a> UserKeyIter for MemtableUserKeyIter<'a> {
         self.read_current();
     }
     fn seek(&mut self, target: &[u8]) {
-        // Seek to the largest possible sequence at this user key
-        // — that's the newest version, which the internal-key
-        // ordering places first.
-        let lookup = crate::db::dbformat::LookupKey::new(target, u64::MAX >> 8);
+        // Seek to `read_seq` — entries at higher seqs (not visible
+        // to this snapshot) sort *earlier* in the internal-key
+        // order, so seeking at `read_seq` lands us on or just
+        // before the first visible version at this user key.
+        // `read_current` then skips forward past any invisible
+        // versions.
+        let lookup = crate::db::dbformat::LookupKey::new(target, self.read_seq);
         self.inner.seek(lookup.internal_key());
         self.read_current();
     }
@@ -178,48 +217,62 @@ pub struct SstUserKeyIter<'a> {
     cur_value: Vec<u8>,
     /// True iff `cur_key`/`cur_value` are populated.
     valid: bool,
+    /// Snapshot sequence — see [`MemtableUserKeyIter::new_at`].
+    read_seq: SequenceNumber,
 }
 
 impl<'a> SstUserKeyIter<'a> {
-    /// Wrap an existing SST iterator.
+    /// Wrap an existing SST iterator at the latest sequence.
     pub fn new(inner: SstIter<'a>) -> Self {
+        Self::new_at(inner, READ_AT_LATEST)
+    }
+
+    /// Wrap an SST iterator that reads at a specific snapshot
+    /// sequence. Entries with `seq > read_seq` are skipped.
+    pub fn new_at(inner: SstIter<'a>, read_seq: SequenceNumber) -> Self {
         Self {
             inner,
             cur_key: Vec::new(),
             cur_value: Vec::new(),
             valid: false,
+            read_seq,
         }
     }
 
-    /// Decode whatever the inner iterator is positioned on into
-    /// `cur_key`/`cur_value`.
+    /// Skip invisible entries (seq > read_seq) and surface the
+    /// first visible one. Identical in shape to
+    /// [`MemtableUserKeyIter::read_current`].
     fn read_current(&mut self) {
-        if !self.inner.valid() {
-            self.valid = false;
+        while self.inner.valid() {
+            let parsed = match ParsedInternalKey::parse(self.inner.key()) {
+                Ok(p) => p,
+                Err(_) => {
+                    self.valid = false;
+                    return;
+                }
+            };
+            if parsed.sequence > self.read_seq {
+                self.inner.next();
+                continue;
+            }
             self.cur_key.clear();
+            self.cur_key.extend_from_slice(parsed.user_key);
             self.cur_value.clear();
+            match parsed.value_type {
+                ValueType::Value | ValueType::Merge => {
+                    self.cur_value.extend_from_slice(self.inner.value());
+                }
+                _ => {
+                    // Deletion / SingleDeletion / RangeDeletion / blob /
+                    // wide-column → empty value (tombstone).
+                }
+            }
+            self.valid = true;
             return;
         }
-        let parsed = match ParsedInternalKey::parse(self.inner.key()) {
-            Ok(p) => p,
-            Err(_) => {
-                self.valid = false;
-                return;
-            }
-        };
+        self.valid = false;
         self.cur_key.clear();
-        self.cur_key.extend_from_slice(parsed.user_key);
         self.cur_value.clear();
-        match parsed.value_type {
-            ValueType::Value | ValueType::Merge => {
-                self.cur_value.extend_from_slice(self.inner.value());
-            }
-            _ => {
-                // Deletion / SingleDeletion / RangeDeletion / blob /
-                // wide-column → empty value (tombstone).
-            }
-        }
-        self.valid = true;
     }
 
     /// Skip past every additional entry in the SST that shares
@@ -260,11 +313,8 @@ impl<'a> UserKeyIter for SstUserKeyIter<'a> {
         self.read_current();
     }
     fn seek(&mut self, target: &[u8]) {
-        // Seek the underlying SST to the lookup key for the
-        // largest possible sequence at this user key — that's
-        // the newest version, which internal-key ordering
-        // places first.
-        let lookup = crate::db::dbformat::LookupKey::new(target, u64::MAX >> 8);
+        // Seek at our snapshot sequence.
+        let lookup = crate::db::dbformat::LookupKey::new(target, self.read_seq);
         self.inner.seek(lookup.internal_key());
         self.read_current();
     }
@@ -324,7 +374,8 @@ impl DbIterator {
 
     /// Same as [`Self::from_snapshot`] but also includes an
     /// **immutable memtable** (a memtable that has been frozen
-    /// by a flush job but not yet turned into an SST).
+    /// by a flush job but not yet turned into an SST). Reads
+    /// at the latest sequence (`READ_AT_LATEST`).
     ///
     /// Priority order (first wins):
     ///
@@ -336,6 +387,20 @@ impl DbIterator {
         immutable: Option<&MemTable>,
         ssts: &[Arc<BlockBasedTableReader>],
     ) -> Result<Self> {
+        Self::from_snapshot_with_immutable_at(memtable, immutable, ssts, READ_AT_LATEST)
+    }
+
+    /// Same as [`Self::from_snapshot_with_immutable`] but reads
+    /// at a specific snapshot sequence. Entries with
+    /// `seq > read_seq` are filtered out by the adapters, so the
+    /// resulting iterator only sees user keys that existed at
+    /// the time the snapshot was taken.
+    pub fn from_snapshot_with_immutable_at(
+        memtable: &MemTable,
+        immutable: Option<&MemTable>,
+        ssts: &[Arc<BlockBasedTableReader>],
+        read_seq: SequenceNumber,
+    ) -> Result<Self> {
         // BTreeMap collapses duplicates by user key. We insert
         // the active memtable first; later sources only insert
         // if the key isn't already present, so the first source
@@ -343,7 +408,7 @@ impl DbIterator {
         let mut map: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
         // 1. Active memtable.
-        let mut mt = MemtableUserKeyIter::new(memtable);
+        let mut mt = MemtableUserKeyIter::new_at(memtable, read_seq);
         mt.seek_to_first();
         while mt.valid() {
             let key = mt.key().to_vec();
@@ -357,7 +422,7 @@ impl DbIterator {
 
         // 2. Immutable memtable (only inserts not already present).
         if let Some(imm) = immutable {
-            let mut it = MemtableUserKeyIter::new(imm);
+            let mut it = MemtableUserKeyIter::new_at(imm, read_seq);
             it.seek_to_first();
             while it.valid() {
                 let key = it.key().to_vec();
@@ -373,13 +438,11 @@ impl DbIterator {
         }
 
         // 3. SSTs in newest-first order. We go through
-        //    `SstUserKeyIter` rather than the raw `SstIter` so
-        //    that Layer 4d's internal-key SSTs are parsed and
-        //    deduplicated correctly — the adapter presents only
-        //    the newest version per user key and surfaces
-        //    tombstones as empty values.
+        //    `SstUserKeyIter::new_at` so internal-key SSTs are
+        //    filtered by the snapshot sequence, then parsed and
+        //    deduplicated per user key.
         for table in ssts {
-            let mut it = SstUserKeyIter::new(table.iter());
+            let mut it = SstUserKeyIter::new_at(table.iter(), read_seq);
             it.seek_to_first();
             while it.valid() {
                 let key = it.key().to_vec();
