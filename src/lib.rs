@@ -10,7 +10,8 @@
 //! | 0     | Public API + platform shim       | [`core`], [`env`], [`api`], [`ext`], [`port`]       |
 //! | 1     | Foundation utilities             | [`util`], [`memory`], [`logging`], [`monitoring`]   |
 //! | 2     | I/O, buffered files, block cache | [`file`], [`cache`], `env::posix`, `env::thread_pool` |
-//! | 3     | Memtable & SST format            | *deferred*                                          |
+//! | 3a    | InternalKey, memtable, SST format primitives | [`db`], [`memtable`], [`sst`]                       |
+//! | 3b    | SST builder/reader, index, filter  | *deferred*                                          |
 //! | 4     | LSM engine                       | *deferred*                                          |
 //! | 5     | Optional features                | *deferred*                                          |
 //! | 6     | Tools & stress                   | *deferred*                                          |
@@ -43,13 +44,16 @@
 pub mod api;
 pub mod cache;
 pub mod core;
+pub mod db;
 pub mod env;
 pub mod ext;
 pub mod file;
 pub mod logging;
 pub mod memory;
+pub mod memtable;
 pub mod monitoring;
 pub mod port;
+pub mod sst;
 pub mod util;
 
 // ---------- Layer 0 re-exports ----------
@@ -112,3 +116,19 @@ pub use crate::file::filename::{
 pub use crate::file::random_access_file_reader::RandomAccessFileReader;
 pub use crate::file::sequence_file_reader::SequentialFileReader;
 pub use crate::file::writable_file_writer::WritableFileWriter;
+
+// ---------- Layer 3a re-exports ----------
+
+pub use crate::db::dbformat::{
+    byte_to_value_type, pack_seq_and_type, unpack_seq_and_type, value_type_byte, InternalKey,
+    InternalKeyComparator, LookupKey, ParsedInternalKey, MAX_SEQUENCE_NUMBER, VALUE_TYPE_FOR_SEEK,
+};
+pub use crate::db::memtable::{MemTable, MemTableGetResult};
+pub use crate::memtable::memtable_rep::{MemTableRep, MemTableRepIterator};
+pub use crate::memtable::skip_list::{SkipList, SkipListIter, BRANCHING_FACTOR, MAX_HEIGHT};
+pub use crate::sst::block_based::block::{Block, BlockIter};
+pub use crate::sst::block_based::block_builder::{BlockBuilder, DEFAULT_BLOCK_RESTART_INTERVAL};
+pub use crate::sst::format::{
+    put_block_trailer, BlockHandle, Footer, BLOCK_BASED_TABLE_MAGIC_NUMBER, BLOCK_TRAILER_SIZE,
+    DEFAULT_FORMAT_VERSION, MAX_BLOCK_HANDLE_ENCODED_LENGTH,
+};
