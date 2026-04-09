@@ -44,20 +44,48 @@ use crate::sst::block_based::table_reader::BlockBasedTableReader;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Picker policy. Returns the indices into a "newest-first" SST
+/// Picker policy. Returns the indices into a **newest-first** SST
 /// list to compact, or `None` if the SST count is below the
 /// trigger.
 ///
-/// At Layer 4b the policy is dead simple: if there are at least
-/// `trigger` SSTs, compact **all** of them into one. A real engine
-/// would compact only the oldest few and respect overlap ranges,
-/// but a single compaction-of-everything is correct (just slow on
-/// large databases).
+/// At Layer 4c the policy is "compact the oldest `batch_size` SSTs
+/// when there are at least `trigger`". This is a meaningful
+/// improvement over Layer 4b's "compact everything" because:
+///
+/// - It bounds the per-compaction work (otherwise a 1000-SST DB
+///   would do a single 1000-input compaction).
+/// - It preserves recent writes' fast path — the newest SST is
+///   never touched until enough older ones accumulate, so a
+///   subsequent point lookup that hits the freshest SST stays
+///   fast.
+///
+/// The returned indices are **into the newest-first SST list** —
+/// since we're compacting the *oldest* SSTs, they're the indices
+/// at the end of the list. Concretely: for a list `[s_new, s,
+/// s, s_old]` and `batch_size = 2`, the picker returns `[2, 3]`.
+///
+/// A future Layer 4d will replace this with overlap-aware
+/// per-level picking.
 pub fn pick_compaction(num_ssts: usize, trigger: usize) -> Option<Vec<usize>> {
+    pick_compaction_batch(num_ssts, trigger, trigger)
+}
+
+/// Same as [`pick_compaction`] but with an explicit `batch_size`.
+/// `batch_size <= num_ssts` is required; the picker will use
+/// `min(batch_size, num_ssts)` if you pass too many. Returns the
+/// **last `batch_size` indices** of the newest-first list, which
+/// correspond to the oldest SSTs.
+pub fn pick_compaction_batch(
+    num_ssts: usize,
+    trigger: usize,
+    batch_size: usize,
+) -> Option<Vec<usize>> {
     if num_ssts < trigger {
         return None;
     }
-    Some((0..num_ssts).collect())
+    let batch = batch_size.min(num_ssts);
+    let start = num_ssts - batch;
+    Some((start..num_ssts).collect())
 }
 
 /// One compaction job: input SSTs → one output SST.
@@ -209,9 +237,28 @@ mod tests {
     }
 
     #[test]
-    fn pick_compaction_returns_all_at_trigger() {
+    fn pick_compaction_returns_oldest_batch_at_trigger() {
+        // 4 SSTs, trigger = 4, default batch = trigger.
+        // Returns the LAST 4 indices of a newest-first list = the
+        // 4 oldest SSTs.
         let r = pick_compaction(4, 4).unwrap();
         assert_eq!(r, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn pick_compaction_with_more_than_trigger_picks_oldest() {
+        // 7 SSTs, trigger = 4, batch = 4 (default).
+        // Should pick the 4 OLDEST = indices [3, 4, 5, 6] (the
+        // tail of the newest-first list).
+        let r = pick_compaction(7, 4).unwrap();
+        assert_eq!(r, vec![3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn pick_compaction_batch_explicit_size() {
+        // Custom batch size: pick only the 2 oldest.
+        let r = pick_compaction_batch(7, 4, 2).unwrap();
+        assert_eq!(r, vec![5, 6]);
     }
 
     #[test]

@@ -237,13 +237,30 @@ impl DbIterator {
         memtable: &MemTable,
         ssts: &[Arc<BlockBasedTableReader>],
     ) -> Result<Self> {
-        // BTreeMap collapses duplicates by user key. Memtable
-        // entries get inserted first; SST entries are only
-        // inserted if the key isn't already present, so the
-        // first source (memtable, then newest SST, …) wins.
+        Self::from_snapshot_with_immutable(memtable, None, ssts)
+    }
+
+    /// Same as [`Self::from_snapshot`] but also includes an
+    /// **immutable memtable** (a memtable that has been frozen
+    /// by a flush job but not yet turned into an SST).
+    ///
+    /// Priority order (first wins):
+    ///
+    /// 1. Active memtable (newest)
+    /// 2. Immutable memtable (in-progress flush)
+    /// 3. SSTs in the order passed (newest-first by convention)
+    pub fn from_snapshot_with_immutable(
+        memtable: &MemTable,
+        immutable: Option<&MemTable>,
+        ssts: &[Arc<BlockBasedTableReader>],
+    ) -> Result<Self> {
+        // BTreeMap collapses duplicates by user key. We insert
+        // the active memtable first; later sources only insert
+        // if the key isn't already present, so the first source
+        // wins on ties.
         let mut map: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
-        // 1. Memtable.
+        // 1. Active memtable.
         let mut mt = MemtableUserKeyIter::new(memtable);
         mt.seek_to_first();
         while mt.valid() {
@@ -256,7 +273,24 @@ impl DbIterator {
             mt.next();
         }
 
-        // 2. SSTs in newest-first order.
+        // 2. Immutable memtable (only inserts not already present).
+        if let Some(imm) = immutable {
+            let mut it = MemtableUserKeyIter::new(imm);
+            it.seek_to_first();
+            while it.valid() {
+                let key = it.key().to_vec();
+                map.entry(key).or_insert_with(|| {
+                    if it.is_tombstone() {
+                        Vec::new()
+                    } else {
+                        it.value().to_vec()
+                    }
+                });
+                it.next();
+            }
+        }
+
+        // 3. SSTs in newest-first order.
         for table in ssts {
             let mut it = table.iter();
             it.seek_to_first();
@@ -274,7 +308,7 @@ impl DbIterator {
             it.status()?;
         }
 
-        // 3. Filter tombstones (empty values).
+        // 4. Filter tombstones (empty values).
         let items: Vec<(Vec<u8>, Vec<u8>)> = map
             .into_iter()
             .filter(|(_, v)| !v.is_empty())
