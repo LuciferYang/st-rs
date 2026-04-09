@@ -11,9 +11,15 @@
 
 pub mod env_trait;
 pub mod file_system;
+#[cfg(unix)]
+pub mod posix;
+pub mod thread_pool;
 
 pub use env_trait::{Clock, CompositeEnv, Env, Priority, ScheduleHandle, SystemClockImpl, ThreadPool};
 pub use file_system::{
     AccessPattern, FileAttributes, FileLock, FileSystem, FsDirectory, FsRandomAccessFile,
     FsSequentialFile, FsWritableFile, IoOptions, IoPriority, IoType,
 };
+#[cfg(unix)]
+pub use posix::PosixFileSystem;
+pub use thread_pool::StdThreadPool;
