@@ -14,5 +14,6 @@
 pub mod block;
 pub mod block_builder;
 pub mod filter_block;
+pub mod sst_iterator;
 pub mod table_builder;
 pub mod table_reader;

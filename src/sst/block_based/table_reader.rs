@@ -156,6 +156,27 @@ impl BlockBasedTableReader {
     pub fn has_filter(&self) -> bool {
         self.filter.is_some()
     }
+
+    /// Open a forward iterator over every record in the SST. Used by
+    /// the engine's read path (`MergingIterator`) and by compaction.
+    pub fn iter(&self) -> crate::sst::block_based::sst_iterator::SstIter<'_> {
+        crate::sst::block_based::sst_iterator::SstIter::new(self)
+    }
+
+    // -- pub(crate) accessors used by SstIter --
+
+    /// Borrow the in-memory index block. Used by [`crate::sst::block_based::sst_iterator::SstIter`]
+    /// to walk data block handles.
+    pub(crate) fn index_block(&self) -> &Block {
+        &self.index_block
+    }
+
+    /// Read the data block at `handle` (verifying its trailer) and
+    /// return the payload bytes. Public-in-crate so the SST iterator
+    /// can fetch the next data block on demand.
+    pub(crate) fn read_block_bytes(&self, handle: BlockHandle) -> Result<Vec<u8>> {
+        read_block(&self.file, handle)
+    }
 }
 
 /// Read `block_handle.size` bytes plus the trailing

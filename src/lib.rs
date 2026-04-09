@@ -13,6 +13,7 @@
 //! | 3a    | InternalKey, memtable, SST format primitives | [`db`], [`memtable`], [`sst`]                       |
 //! | 3b    | SST builder/reader, bloom filter, CRC32C | `sst::block_based::table_*`, `util::crc32c`     |
 //! | 4a    | Minimum-viable engine: WAL + DbImpl | `db::log_*`, `db::db_impl`                          |
+//! | 4b    | SST iterator, merging iter, DbIterator, compaction | `sst::block_based::sst_iterator`, `db::merging_iterator`, `db::db_iter`, `db::compaction` |
 //! | 4     | LSM engine                       | *deferred*                                          |
 //! | 5     | Optional features                | *deferred*                                          |
 //! | 6     | Tools & stress                   | *deferred*                                          |
@@ -60,7 +61,11 @@ pub mod util;
 // ---------- Layer 0 re-exports ----------
 
 pub use crate::api::db::{ColumnFamilyDescriptor, ColumnFamilyHandle, Db, DbOpener, OpenCfResult};
-pub use crate::api::iterator::{DbIterator, EmptyIterator, ErrorIterator};
+// `DbIterator` (the Layer 0 abstract iterator trait) is reachable
+// via `st_rs::api::iterator::DbIterator`. The crate root re-exports
+// the **concrete** Layer 4b iterator struct under the same name —
+// see further down. Most users never need the trait directly.
+pub use crate::api::iterator::{EmptyIterator, ErrorIterator};
 pub use crate::api::options::{
     ColumnFamilyOptions, CompactionOptions, DbOptions, FileOptions, FlushOptions, InfoLogLevel,
     Options, ReadOptions, WriteOptions,
@@ -152,3 +157,10 @@ pub use crate::db::db_impl::DbImpl;
 pub use crate::db::log_format::{RecordType, BLOCK_SIZE as WAL_BLOCK_SIZE, HEADER_SIZE as WAL_HEADER_SIZE};
 pub use crate::db::log_reader::LogReader;
 pub use crate::db::log_writer::LogWriter;
+
+// ---------- Layer 4b re-exports ----------
+
+pub use crate::db::compaction::{pick_compaction, CompactionJob};
+pub use crate::db::db_iter::{DbIterator, MemtableUserKeyIter, SstUserKeyIter};
+pub use crate::db::merging_iterator::{MergingIterator, UserKeyIter};
+pub use crate::sst::block_based::sst_iterator::SstIter;
