@@ -9,7 +9,7 @@
 //! |------:|----------------------------------|-----------------------------------------------------|
 //! | 0     | Public API + platform shim       | [`core`], [`env`], [`api`], [`ext`], [`port`]       |
 //! | 1     | Foundation utilities             | [`util`], [`memory`], [`logging`], [`monitoring`]   |
-//! | 2     | I/O, buffered files, block cache | *deferred*                                          |
+//! | 2     | I/O, buffered files, block cache | [`file`], [`cache`], `env::posix`, `env::thread_pool` |
 //! | 3     | Memtable & SST format            | *deferred*                                          |
 //! | 4     | LSM engine                       | *deferred*                                          |
 //! | 5     | Optional features                | *deferred*                                          |
@@ -41,9 +41,11 @@
 #![deny(unsafe_code)]
 
 pub mod api;
+pub mod cache;
 pub mod core;
 pub mod env;
 pub mod ext;
+pub mod file;
 pub mod logging;
 pub mod memory;
 pub mod monitoring;
@@ -90,3 +92,23 @@ pub use crate::memory::arena::Arena;
 pub use crate::monitoring::histogram::{Histogram, HistogramSnapshot};
 pub use crate::monitoring::perf_context::PerfContext;
 pub use crate::monitoring::statistics::{Statistics, StatisticsImpl, Ticker};
+
+// ---------- Layer 2 re-exports ----------
+
+pub use crate::cache::lru::{LruCache, LruHandle};
+pub use crate::env::thread_pool::StdThreadPool;
+#[cfg(unix)]
+pub use crate::env::posix::{
+    PosixDirectory, PosixFileLock, PosixFileSystem, PosixRandomAccessFile, PosixSequentialFile,
+    PosixWritableFile,
+};
+pub use crate::file::file_util::{copy_file, delete_if_exists, sync_directory};
+pub use crate::file::filename::{
+    make_blob_file_name, make_current_file_name, make_descriptor_file_name,
+    make_identity_file_name, make_info_log_file_name, make_lock_file_name,
+    make_old_info_log_file_name, make_options_file_name, make_table_file_name,
+    make_temp_file_name, make_wal_file_name, parse_file_name,
+};
+pub use crate::file::random_access_file_reader::RandomAccessFileReader;
+pub use crate::file::sequence_file_reader::SequentialFileReader;
+pub use crate::file::writable_file_writer::WritableFileWriter;
