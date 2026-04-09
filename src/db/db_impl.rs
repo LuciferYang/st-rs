@@ -129,6 +129,11 @@ struct DbState {
     /// `u64::MAX` when the map is empty (no snapshots → nothing
     /// to preserve).
     snapshots: std::collections::BTreeMap<SequenceNumber, usize>,
+    /// File number of the compaction output currently being
+    /// produced by a background worker. `None` when no compaction
+    /// is in flight. Layer 4f only allows one compaction at a
+    /// time — the picker skips scheduling while this is `Some`.
+    pending_compaction: Option<u64>,
 }
 
 impl DbState {
@@ -318,9 +323,13 @@ impl DbImpl {
         let wal_file = fs.new_writable_file(&wal_path, &Default::default())?;
         let wal_writer = LogWriter::new(WritableFileWriter::new(wal_file));
 
-        // Background flush worker. One worker is plenty at this
-        // layer; Layer 4d's compaction can take additional slots.
-        let thread_pool = Arc::new(StdThreadPool::new(1, 0, 0, 0));
+        // Background worker pool:
+        // - 1 `Low` worker for flushes (Layer 4c)
+        // - 1 `Bottom` worker for compactions (Layer 4f)
+        //
+        // Separate priority slots mean flush and compaction can
+        // run in parallel without blocking each other.
+        let thread_pool = Arc::new(StdThreadPool::new(1, 0, 0, 1));
 
         let arc = Arc::new(Self {
             path: path.to_path_buf(),
@@ -337,6 +346,7 @@ impl DbImpl {
                 last_sequence,
                 closing: false,
                 snapshots: std::collections::BTreeMap::new(),
+                pending_compaction: None,
             }),
             flush_done: Condvar::new(),
             lock: Mutex::new(Some(lock)),
@@ -589,14 +599,26 @@ impl DbImpl {
         Ok(it)
     }
 
-    /// Block until any in-progress background flush completes.
-    /// Used by tests and by `close()` to drain pending work.
-    pub fn wait_for_pending_flush(&self) -> Result<()> {
+    /// Block until every in-progress background flush **and**
+    /// every in-progress background compaction has completed.
+    ///
+    /// `close()` calls this before releasing the file lock.
+    /// Tests use it to drain the pool to a known quiescent
+    /// state before asserting on the SST list.
+    pub fn wait_for_pending_work(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        while state.immutable.is_some() {
+        while state.immutable.is_some() || state.pending_compaction.is_some() {
             state = self.flush_done.wait(state).unwrap();
         }
         Ok(())
+    }
+
+    /// Alias for [`Self::wait_for_pending_work`] retained for
+    /// backwards compatibility — Layer 4c shipped it as
+    /// `wait_for_pending_flush` but at Layer 4f it also drains
+    /// compactions.
+    pub fn wait_for_pending_flush(&self) -> Result<()> {
+        self.wait_for_pending_work()
     }
 
     /// Trigger threshold for automatic compaction. When the live
@@ -807,7 +829,12 @@ impl DbImpl {
                 let cleanup = self.maybe_pick_compaction(&mut state);
                 drop(state);
                 if let Some(plan) = cleanup {
-                    let _ = self.run_compaction(plan.0, plan.1, plan.2);
+                    // Background compaction — returns immediately
+                    // after putting the plan on the pool. The
+                    // flush worker that called us can then finish
+                    // and pick up the next flush; the compaction
+                    // worker runs in parallel.
+                    self.schedule_compaction(plan);
                 }
                 r
             }
@@ -826,10 +853,14 @@ impl DbImpl {
     /// Helper called inside `complete_flush_locked` to decide
     /// whether to schedule a compaction. Returns the compaction
     /// plan if one is needed, or `None` otherwise.
-    fn maybe_pick_compaction(
-        &self,
-        state: &mut DbState,
-    ) -> Option<(u64, Vec<Arc<BlockBasedTableReader>>, Vec<u64>)> {
+    ///
+    /// Returns `None` if a compaction is already in progress —
+    /// Layer 4f allows only one background compaction at a time.
+    /// A future layer can queue multiple plans.
+    fn maybe_pick_compaction(&self, state: &mut DbState) -> Option<CompactionPlan> {
+        if state.pending_compaction.is_some() {
+            return None;
+        }
         let to_compact = pick_compaction(state.ssts.len(), Self::COMPACTION_TRIGGER)?;
         let inputs: Vec<Arc<BlockBasedTableReader>> = to_compact
             .iter()
@@ -838,7 +869,13 @@ impl DbImpl {
         let input_numbers: Vec<u64> = to_compact.iter().map(|&i| state.ssts[i].number).collect();
         let out_number = state.next_file_number;
         state.next_file_number += 1;
-        Some((out_number, inputs, input_numbers))
+        let min_snap_seq = state.min_snap_seq();
+        Some(CompactionPlan {
+            out_number,
+            inputs,
+            input_numbers,
+            min_snap_seq,
+        })
     }
 
     /// Atomically write `contents` to `<path>/CURRENT` via a tmp
@@ -867,6 +904,30 @@ struct FlushSetup {
     sst_number: u64,
     immutable: Arc<MemTable>,
     old_wal_number: u64,
+}
+
+/// Everything a background compaction worker needs. Captured
+/// inside the closure scheduled on `Priority::Bottom` by
+/// [`DbImpl::schedule_compaction`].
+struct CompactionPlan {
+    /// File number reserved for the compaction output.
+    out_number: u64,
+    /// Table readers for the input SSTs. The inputs stay in
+    /// `state.ssts` until the compaction completes so ongoing
+    /// reads can still find their data.
+    inputs: Vec<Arc<BlockBasedTableReader>>,
+    /// Numbers of the input SSTs — used to identify them for
+    /// removal from `state.ssts` and deletion from disk when
+    /// the merge completes.
+    input_numbers: Vec<u64>,
+    /// Oldest live snapshot sequence at the time the plan was
+    /// created. Captured under the state lock so it's consistent
+    /// with the chosen inputs. Snapshots taken *after* plan
+    /// creation but *before* the compaction runs don't affect
+    /// retention — that's a minor race-window that costs at
+    /// most one extra compaction cycle of retention, never
+    /// corruption.
+    min_snap_seq: SequenceNumber,
 }
 
 /// The engine's concrete snapshot type. Returned from
@@ -933,20 +994,65 @@ fn current_string(ssts: &[SstEntry]) -> String {
 }
 
 impl DbImpl {
+    /// Schedule a compaction on the background thread pool.
+    ///
+    /// Sets `state.pending_compaction` to the plan's output
+    /// number so [`Self::wait_for_pending_work`] can see that
+    /// work is in flight. The closure runs on the pool's
+    /// `Priority::Bottom` slot — separate from the `Low` slot
+    /// that handles flushes — so flush and compaction can run
+    /// in parallel without stepping on each other.
+    ///
+    /// If the engine is dropped mid-compaction, `Weak::upgrade`
+    /// fails and the task drops its work. The half-written
+    /// output SST (if any) is left on disk and will be picked
+    /// up by the next `open()` via the directory listing — the
+    /// same orphan-file pattern used for flush.
+    fn schedule_compaction(&self, plan: CompactionPlan) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.pending_compaction = Some(plan.out_number);
+        }
+        let weak = self.weak_self();
+        self.thread_pool.schedule(
+            Box::new(move || {
+                if let Some(db) = weak.upgrade() {
+                    let _ = db.run_compaction_task(plan);
+                }
+            }),
+            Priority::Bottom,
+        );
+    }
+
+    /// Background compaction entry point. Runs the merge, then
+    /// clears `pending_compaction` and notifies the condvar so
+    /// any `wait_for_pending_work` waiter wakes up.
+    ///
+    /// The outer closure in `schedule_compaction` ignores this
+    /// method's `Result` — errors during compaction leave the
+    /// inputs in place (they're never removed from
+    /// `state.ssts` if the merge fails), so the next picker
+    /// pass will try again.
+    fn run_compaction_task(&self, plan: CompactionPlan) -> Result<()> {
+        let result = self.run_compaction_inner(plan);
+        {
+            let mut state = self.state.lock().unwrap();
+            state.pending_compaction = None;
+        }
+        self.flush_done.notify_all();
+        result
+    }
+
     /// Run a compaction job and update engine state to swap the
-    /// inputs for the new output SST.
-    fn run_compaction(
-        &self,
-        out_number: u64,
-        inputs: Vec<Arc<BlockBasedTableReader>>,
-        input_numbers: Vec<u64>,
-    ) -> Result<()> {
-        // Snapshot the minimum live snapshot sequence so the
-        // compaction job knows how far back to preserve versions.
-        let min_snap_seq = {
-            let state = self.state.lock().unwrap();
-            state.min_snap_seq()
-        };
+    /// inputs for the new output SST. Shared by both the sync
+    /// path (which no longer exists at Layer 4f but is kept as
+    /// a private helper in case tests need it) and the
+    /// background task.
+    fn run_compaction_inner(&self, plan: CompactionPlan) -> Result<()> {
+        let out_number = plan.out_number;
+        let inputs = plan.inputs;
+        let input_numbers = plan.input_numbers;
+        let min_snap_seq = plan.min_snap_seq;
 
         let out_path = make_table_file_name(&self.path, out_number);
 
@@ -1517,6 +1623,131 @@ mod tests {
                 Some(b"new".to_vec())
             );
         }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Layer 4f: background compaction tests -----------------
+
+    #[test]
+    fn compaction_runs_on_background_worker() {
+        // Verify that schedule_compaction actually places work
+        // on the pool and that wait_for_pending_work drains it.
+        // We can't easily assert "didn't block the caller"
+        // without real timing, so we instead assert on the
+        // visible state transitions.
+        let dir = temp_dir("bg-compact");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        // Populate enough data across 4 flushes to trip the
+        // compaction trigger on the 4th flush.
+        for batch in 0..4u32 {
+            for i in 0..5u32 {
+                let k = format!("k{:03}", batch * 10 + i);
+                db.put(k.as_bytes(), batch.to_string().as_bytes())
+                    .unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        // At this point a compaction has been scheduled. Wait
+        // for it to drain.
+        db.wait_for_pending_work().unwrap();
+
+        // After the compaction, pending_compaction should be
+        // None and every key should still be readable.
+        {
+            let state = db.state.lock().unwrap();
+            assert!(
+                state.pending_compaction.is_none(),
+                "pending_compaction should have cleared after wait"
+            );
+        }
+        for batch in 0..4u32 {
+            for i in 0..5u32 {
+                let k = format!("k{:03}", batch * 10 + i);
+                assert_eq!(
+                    db.get(k.as_bytes()).unwrap(),
+                    Some(batch.to_string().as_bytes().to_vec())
+                );
+            }
+        }
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_for_pending_work_drains_flush_and_compaction() {
+        let dir = temp_dir("drain-all");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        // Schedule a flush (puts data into the background
+        // pipeline) and then wait_for_pending_work.
+        for i in 0..20u32 {
+            db.put(format!("k{i:02}").as_bytes(), b"v").unwrap();
+        }
+        db.schedule_flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        // State should be quiescent: no immutable, no pending
+        // compaction. (There might not have been a compaction
+        // if the trigger wasn't hit, but the wait must still
+        // return cleanly.)
+        {
+            let state = db.state.lock().unwrap();
+            assert!(state.immutable.is_none());
+            assert!(state.pending_compaction.is_none());
+        }
+
+        // Every key is still readable.
+        for i in 0..20u32 {
+            assert_eq!(
+                db.get(format!("k{i:02}").as_bytes()).unwrap(),
+                Some(b"v".to_vec())
+            );
+        }
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picker_skips_while_compaction_in_flight() {
+        // With a compaction in progress, the picker should
+        // return None even if the SST count exceeds the
+        // trigger. We test this by manually inserting a fake
+        // pending_compaction marker and calling
+        // maybe_pick_compaction.
+        let dir = temp_dir("skip-pick");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        // Force the SST count past the trigger.
+        for batch in 0..5u32 {
+            for i in 0..3u32 {
+                let k = format!("k{:02}", batch * 10 + i);
+                db.put(k.as_bytes(), b"v").unwrap();
+            }
+            db.flush().unwrap();
+        }
+        db.wait_for_pending_work().unwrap();
+
+        // Now claim a pending compaction and verify the picker
+        // returns None.
+        let pick = {
+            let mut state = db.state.lock().unwrap();
+            state.pending_compaction = Some(9999);
+            db.maybe_pick_compaction(&mut state)
+        };
+        assert!(
+            pick.is_none(),
+            "picker should return None while a compaction is already pending"
+        );
+        // Clean up the forced flag so close() doesn't hang.
+        {
+            let mut state = db.state.lock().unwrap();
+            state.pending_compaction = None;
+        }
+
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
