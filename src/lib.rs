@@ -14,6 +14,7 @@
 //! | 3b    | SST builder/reader, bloom filter, CRC32C | `sst::block_based::table_*`, `util::crc32c`     |
 //! | 4a    | Minimum-viable engine: WAL + DbImpl | `db::log_*`, `db::db_impl`                          |
 //! | 4b    | SST iterator, merging iter, DbIterator, compaction | `sst::block_based::sst_iterator`, `db::merging_iterator`, `db::db_iter`, `db::compaction` |
+//! | 4c    | Background flush, immutable memtable, atomic CURRENT, util::heap | `db::db_impl` (refactored), [`util::heap`]                |
 //! | 4     | LSM engine                       | *deferred*                                          |
 //! | 5     | Optional features                | *deferred*                                          |
 //! | 6     | Tools & stress                   | *deferred*                                          |
@@ -160,7 +161,11 @@ pub use crate::db::log_writer::LogWriter;
 
 // ---------- Layer 4b re-exports ----------
 
-pub use crate::db::compaction::{pick_compaction, CompactionJob};
+pub use crate::db::compaction::{pick_compaction, pick_compaction_batch, CompactionJob};
 pub use crate::db::db_iter::{DbIterator, MemtableUserKeyIter, SstUserKeyIter};
 pub use crate::db::merging_iterator::{MergingIterator, UserKeyIter};
 pub use crate::sst::block_based::sst_iterator::SstIter;
+
+// ---------- Layer 4c re-exports ----------
+
+pub use crate::util::heap::BinaryHeap;

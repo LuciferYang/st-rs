@@ -60,8 +60,10 @@ use crate::db::log_reader::LogReader;
 use crate::db::log_writer::LogWriter;
 use crate::db::memtable::{MemTable, MemTableGetResult};
 use crate::db::dbformat::{LookupKey, ParsedInternalKey};
+use crate::env::env_trait::{Priority, ThreadPool};
 use crate::env::file_system::{FileLock, FileSystem, IoOptions};
 use crate::env::posix::PosixFileSystem;
+use crate::env::thread_pool::StdThreadPool;
 use crate::ext::comparator::{BytewiseComparator, Comparator};
 use crate::file::filename::{
     make_current_file_name, make_lock_file_name, make_table_file_name, make_wal_file_name,
@@ -78,7 +80,7 @@ use crate::core::types::FileType;
 use crate::util::coding::{get_varint32, put_varint32};
 use crate::api::write_batch::{Record, WriteBatch, WriteBatchHandler};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 /// One open SST file: its assigned number and a cached reader.
 struct SstEntry {
@@ -90,6 +92,14 @@ struct SstEntry {
 struct DbState {
     /// Active (mutable) memtable.
     memtable: MemTable,
+    /// Memtable that has been frozen and handed to a flush task,
+    /// but not yet turned into an SST. `None` when no flush is
+    /// in progress.
+    ///
+    /// Held by `Arc` so the flush task can read it concurrently
+    /// with the engine's read path. Reads consult this *after*
+    /// the active memtable but *before* the SSTs.
+    immutable: Option<Arc<MemTable>>,
     /// Live SST files, newest-first. Layer 4b will replace this
     /// with a real `VersionSet`.
     ssts: Vec<SstEntry>,
@@ -97,34 +107,54 @@ struct DbState {
     wal: LogWriter,
     /// Number of the WAL file currently being written.
     wal_number: u64,
+    /// Number of the WAL whose records ended up in the immutable
+    /// memtable. Used to delete the obsolete WAL after the SST
+    /// write completes. `None` when no flush is pending.
+    immutable_wal_number: Option<u64>,
+    /// File number reserved for the in-progress flush's output
+    /// SST. `None` when no flush is pending.
+    pending_flush_sst_number: Option<u64>,
     /// Number to assign to the next file (WAL or SST). Monotonic.
     next_file_number: u64,
     /// Highest sequence number assigned so far.
     last_sequence: SequenceNumber,
+    /// Set when the engine is closing — background tasks check
+    /// this to skip work that no longer matters.
+    closing: bool,
 }
 
-/// The minimum-viable engine.
+/// The Layer 4c engine.
 ///
-/// All public methods take `&self` and acquire an internal mutex —
-/// the engine is safe for concurrent use from multiple threads,
-/// but every operation serialises on a single lock for now. The
-/// Layer 4b write thread will replace this with leader-follower
-/// group commit.
+/// All public methods take `&self` and acquire an internal mutex.
+/// The engine is safe for concurrent use from multiple threads:
+/// reads and writes run concurrently with **background flushes**
+/// thanks to the immutable-memtable + lock-releasing pattern. The
+/// big-mutex write thread (with leader-follower group commit) is
+/// still deferred to a future layer.
 pub struct DbImpl {
     /// On-disk path of the DB directory.
     path: PathBuf,
     /// File-system instance. We hold an `Arc` so the engine can
-    /// hand it to background tasks later.
+    /// hand it to background tasks.
     fs: Arc<dyn FileSystem>,
     /// Internal mutable state behind a single mutex.
     state: Mutex<DbState>,
-    /// Held LOCK file handle. Released on Drop / `close`.
-    /// `Option` so `close()` can take it without consuming `self`.
+    /// Notified whenever the in-progress flush completes — used
+    /// by [`Self::wait_for_pending_flush`] and `close()`.
+    flush_done: Condvar,
+    /// Held LOCK file handle. Released on `close`.
     lock: Mutex<Option<Box<dyn FileLock>>>,
     /// User comparator (always BytewiseComparator at Layer 4a).
     user_comparator: Arc<dyn Comparator>,
     /// Per-CF flush threshold (`write_buffer_size` from options).
     write_buffer_size: usize,
+    /// Background thread pool for flushes (and, eventually,
+    /// compactions). Held by `Arc` so closures can clone it.
+    thread_pool: Arc<StdThreadPool>,
+    /// Weak self-reference used by background tasks to call back
+    /// into the engine after their I/O is done. Populated once,
+    /// immediately after the `Arc<Self>` is constructed in `open`.
+    weak_self: OnceLock<Weak<Self>>,
 }
 
 impl DbImpl {
@@ -243,21 +273,45 @@ impl DbImpl {
         let wal_file = fs.new_writable_file(&wal_path, &Default::default())?;
         let wal_writer = LogWriter::new(WritableFileWriter::new(wal_file));
 
-        Ok(Arc::new(Self {
+        // Background flush worker. One worker is plenty at this
+        // layer; Layer 4d's compaction can take additional slots.
+        let thread_pool = Arc::new(StdThreadPool::new(1, 0, 0, 0));
+
+        let arc = Arc::new(Self {
             path: path.to_path_buf(),
             fs,
             state: Mutex::new(DbState {
                 memtable,
+                immutable: None,
                 ssts,
                 wal: wal_writer,
                 wal_number,
+                immutable_wal_number: None,
+                pending_flush_sst_number: None,
                 next_file_number,
                 last_sequence,
+                closing: false,
             }),
+            flush_done: Condvar::new(),
             lock: Mutex::new(Some(lock)),
             user_comparator,
             write_buffer_size: opts.db_write_buffer_size.max(1),
-        }))
+            thread_pool,
+            weak_self: OnceLock::new(),
+        });
+        // Self-reference for background callbacks. `set` only
+        // fails if it was already populated, which can't happen
+        // here since we just constructed the cell.
+        let _ = arc.weak_self.set(Arc::downgrade(&arc));
+        Ok(arc)
+    }
+
+    /// Convenience for background tasks: clone the weak self-ref.
+    fn weak_self(&self) -> Weak<Self> {
+        self.weak_self
+            .get()
+            .expect("weak_self not initialised")
+            .clone()
     }
 
     /// Insert or overwrite `key → value`.
@@ -305,7 +359,10 @@ impl DbImpl {
         let needs_flush = state.memtable.approximate_memory_usage() >= self.write_buffer_size;
         drop(state);
         if needs_flush {
-            self.flush()?;
+            // Background flush — put() returns as soon as the
+            // memtable freeze + WAL roll are done; the SST write
+            // happens on a worker thread.
+            self.schedule_flush()?;
         }
         Ok(())
     }
@@ -318,20 +375,33 @@ impl DbImpl {
         // Snapshot the engine state under the lock — but only the
         // pieces we need so we can drop the lock before doing I/O
         // on the SSTs.
-        let (lookup, ssts) = {
+        let (lookup, immutable, ssts) = {
             let state = self.state.lock().unwrap();
             let lookup = LookupKey::new(key, state.last_sequence);
-            // 1. Try the memtable first under the lock.
+            // 1. Try the active memtable first under the lock.
             match state.memtable.get(&lookup) {
                 MemTableGetResult::Found(v) => return Ok(Some(v)),
                 MemTableGetResult::Deleted => return Ok(None),
                 MemTableGetResult::NotFound => {}
             }
-            // 2. Snapshot the SST list (cheap — Arc clones).
+            // 2. Try the immutable memtable (a flush in progress).
+            //    The active memtable always shadows it, so we
+            //    only consult it on a miss.
+            if let Some(imm) = state.immutable.as_ref() {
+                match imm.get(&lookup) {
+                    MemTableGetResult::Found(v) => return Ok(Some(v)),
+                    MemTableGetResult::Deleted => return Ok(None),
+                    MemTableGetResult::NotFound => {}
+                }
+            }
+            // 3. Snapshot the SST list and the (still-Arc'd)
+            //    immutable so the lock can be dropped.
             let ssts: Vec<Arc<BlockBasedTableReader>> =
                 state.ssts.iter().map(|e| Arc::clone(&e.reader)).collect();
-            (lookup, ssts)
+            let immutable = state.immutable.as_ref().map(Arc::clone);
+            (lookup, immutable, ssts)
         };
+        let _ = immutable; // intentionally unused after the lock drop
 
         // 3. Walk SSTs newest-first. The first hit wins.
         for table in ssts {
@@ -356,19 +426,35 @@ impl DbImpl {
     }
 
     /// Open a forward + backward iterator over the engine. Eagerly
-    /// materialises a snapshot of the memtable + every live SST
-    /// under the lock, so the returned iterator is detached from
-    /// the engine and survives concurrent writes.
+    /// materialises a snapshot of (active memtable + immutable
+    /// memtable + every live SST) under the lock, so the returned
+    /// iterator is detached from the engine and survives
+    /// concurrent writes and background flushes.
     pub fn iter(&self) -> Result<crate::db::db_iter::DbIterator> {
         let state = self.state.lock().unwrap();
         let ssts: Vec<Arc<BlockBasedTableReader>> =
             state.ssts.iter().map(|e| Arc::clone(&e.reader)).collect();
-        // The MemTable is held by value inside the lock; we need
-        // to materialise its entries before dropping the guard.
-        // The eager DbIterator does that under the same borrow.
-        let it = crate::db::db_iter::DbIterator::from_snapshot(&state.memtable, &ssts)?;
+        // The active memtable is held by value inside the lock; we
+        // materialise its entries before dropping the guard. The
+        // immutable memtable, if any, is built into the snapshot
+        // *after* the active one so the active one wins ties.
+        let it = crate::db::db_iter::DbIterator::from_snapshot_with_immutable(
+            &state.memtable,
+            state.immutable.as_deref(),
+            &ssts,
+        )?;
         drop(state);
         Ok(it)
+    }
+
+    /// Block until any in-progress background flush completes.
+    /// Used by tests and by `close()` to drain pending work.
+    pub fn wait_for_pending_flush(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        while state.immutable.is_some() {
+            state = self.flush_done.wait(state).unwrap();
+        }
+        Ok(())
     }
 
     /// Trigger threshold for automatic compaction. When the live
@@ -376,25 +462,127 @@ impl DbImpl {
     /// after the new SST is added.
     const COMPACTION_TRIGGER: usize = 4;
 
-    /// Force-flush the active memtable to a fresh SST.
+    /// Force-flush the active memtable to a fresh SST. Synchronous
+    /// — blocks until the SST is on disk and the new state is
+    /// installed. Releases the engine lock during the actual SST
+    /// write so concurrent reads and writes are not blocked on
+    /// I/O.
+    ///
+    /// To trigger a flush without blocking, call
+    /// [`Self::schedule_flush`] instead.
     pub fn flush(&self) -> Result<()> {
+        // 1. Start the flush under the lock — swap memtable to
+        //    immutable, roll the WAL, reserve a SST number.
+        let setup = self.start_flush_locked()?;
+        let setup = match setup {
+            Some(s) => s,
+            None => return Ok(()), // memtable was empty
+        };
+
+        // 2. Slow part: write the SST. No lock held here.
+        let result = self.write_immutable_to_sst(&setup);
+
+        // 3. Re-acquire the lock to install the result.
+        self.complete_flush_locked(setup, result)?;
+        Ok(())
+    }
+
+    /// Schedule a flush on the background thread pool. Returns
+    /// immediately. To wait for the flush to complete, call
+    /// [`Self::wait_for_pending_flush`].
+    ///
+    /// If a flush is already in progress, the call is a no-op
+    /// (the existing flush will eventually drain the active
+    /// memtable's predecessor; the next flush trigger will pick
+    /// up the current active memtable).
+    pub fn schedule_flush(&self) -> Result<()> {
+        let setup_opt = self.start_flush_locked()?;
+        let setup = match setup_opt {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let weak = self.weak_self();
+        self.thread_pool.schedule(
+            Box::new(move || {
+                if let Some(db) = weak.upgrade() {
+                    let result = db.write_immutable_to_sst(&setup);
+                    let _ = db.complete_flush_locked(setup, result);
+                }
+                // If the engine is being dropped, the SST file
+                // (if any) is left on disk and will be picked up
+                // on the next open() via the directory listing.
+            }),
+            Priority::Low,
+        );
+        Ok(())
+    }
+
+    /// First half of a flush: under the lock, freeze the active
+    /// memtable into the `immutable` slot, roll the WAL, and
+    /// reserve a file number for the output SST. Returns `None`
+    /// if there's nothing to flush.
+    ///
+    /// **Blocks** if a flush is already in progress — the
+    /// immutable slot can hold at most one memtable at a time.
+    fn start_flush_locked(&self) -> Result<Option<FlushSetup>> {
         let mut state = self.state.lock().unwrap();
+        // Wait for any in-progress flush to complete first. This
+        // bounds the immutable slot to at most one memtable.
+        while state.immutable.is_some() {
+            state = self.flush_done.wait(state).unwrap();
+        }
         if state.memtable.num_entries() == 0 {
-            return Ok(());
+            return Ok(None);
         }
 
-        // Pick a file number for the new SST.
+        // Reserve a file number for the SST.
         let sst_number = state.next_file_number;
         state.next_file_number += 1;
-        let sst_path = make_table_file_name(&self.path, sst_number);
+        state.pending_flush_sst_number = Some(sst_number);
 
-        // Iterate the memtable in user-key sorted order. The
-        // memtable's iterator yields *internal* keys, so we need
-        // to dedup by user key, keeping only the newest entry per
-        // key (which the InternalKeyComparator already places first).
-        // Layer 4a's SST format stores user keys (not internal
-        // keys), so the value of a deletion is encoded as an
-        // empty payload — see `Db::get` above.
+        // Freeze the active memtable.
+        let frozen = std::mem::replace(
+            &mut state.memtable,
+            MemTable::new(Arc::clone(&self.user_comparator)),
+        );
+        let immutable = Arc::new(frozen);
+        state.immutable = Some(Arc::clone(&immutable));
+
+        // Remember which WAL holds the records that landed in the
+        // immutable memtable, so we can delete it after the flush.
+        state.immutable_wal_number = Some(state.wal_number);
+
+        // Roll the WAL: open a fresh log so the new active
+        // memtable has its own write-ahead trail.
+        let new_wal_number = state.next_file_number;
+        state.next_file_number += 1;
+        let new_wal_path = make_wal_file_name(&self.path, new_wal_number);
+        let new_wal_file = self
+            .fs
+            .new_writable_file(&new_wal_path, &Default::default())?;
+        let new_wal = LogWriter::new(WritableFileWriter::new(new_wal_file));
+        let old_wal = std::mem::replace(&mut state.wal, new_wal);
+        // Close the old WAL writer; the file stays on disk until
+        // the flush completes (so a crash mid-flush still leaves
+        // the old WAL behind for replay).
+        old_wal.close()?;
+        state.wal_number = new_wal_number;
+
+        Ok(Some(FlushSetup {
+            sst_number,
+            immutable,
+            old_wal_number: state.immutable_wal_number.unwrap(),
+        }))
+    }
+
+    /// Second half of a flush: write the immutable memtable into
+    /// an SST file. **No lock held here.** Returns the open
+    /// reader on success, an error on failure.
+    fn write_immutable_to_sst(
+        &self,
+        setup: &FlushSetup,
+    ) -> Result<Arc<BlockBasedTableReader>> {
+        let sst_path = make_table_file_name(&self.path, setup.sst_number);
         let writable = self
             .fs
             .new_writable_file(&sst_path, &Default::default())?;
@@ -404,19 +592,15 @@ impl DbImpl {
         );
 
         let mut last_user_key: Option<Vec<u8>> = None;
-        let mut it = state.memtable.iter();
+        let mut it = setup.immutable.iter();
         it.seek_to_first();
         while it.valid() {
             let parsed = ParsedInternalKey::parse(it.key())?;
-            // Skip older versions of the same user key — the first
-            // (newest) one already won.
-            let is_dup = matches!(&last_user_key, Some(prev) if prev.as_slice() == parsed.user_key);
+            let is_dup =
+                matches!(&last_user_key, Some(prev) if prev.as_slice() == parsed.user_key);
             if !is_dup {
                 let value: &[u8] = match parsed.value_type {
                     ValueType::Value | ValueType::Merge => it.value(),
-                    ValueType::Deletion | ValueType::SingleDeletion => &[],
-                    // Other types are unsupported at Layer 4a; treat
-                    // as deletions to keep the SST consistent.
                     _ => &[],
                 };
                 tb.add(parsed.user_key, value)?;
@@ -426,93 +610,131 @@ impl DbImpl {
         }
         tb.finish()?;
 
-        // Open the new SST for reads and add it to the list.
         let raw = self
             .fs
             .new_random_access_file(&sst_path, &Default::default())?;
         let reader = RandomAccessFileReader::new(raw, sst_path.display().to_string())?;
         let table = BlockBasedTableReader::open(Arc::new(reader))?;
-        // Newest goes to the front.
-        state.ssts.insert(
-            0,
-            SstEntry {
-                number: sst_number,
-                reader: Arc::new(table),
-            },
-        );
+        Ok(Arc::new(table))
+    }
 
-        // Swap in a fresh memtable. The old one is dropped.
-        state.memtable = MemTable::new(Arc::clone(&self.user_comparator));
+    /// Third half of a flush: install the new SST + clear the
+    /// immutable slot + delete the obsolete WAL. Holds the lock
+    /// briefly. Notifies any waiters.
+    fn complete_flush_locked(
+        &self,
+        setup: FlushSetup,
+        write_result: Result<Arc<BlockBasedTableReader>>,
+    ) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        // Always clear the immutable slot and pending fields,
+        // even on error — otherwise we deadlock on the next
+        // start_flush_locked.
+        state.immutable = None;
+        state.immutable_wal_number = None;
+        state.pending_flush_sst_number = None;
 
-        // Roll the WAL: open a fresh log so the new memtable has
-        // its own write-ahead trail. The old WAL stays on disk
-        // until the next open replays + deletes it; for Layer 4a
-        // simplicity we delete it here too.
-        let old_wal_number = state.wal_number;
-        let new_wal_number = state.next_file_number;
-        state.next_file_number += 1;
-
-        let new_wal_path = make_wal_file_name(&self.path, new_wal_number);
-        let new_wal_file = self
-            .fs
-            .new_writable_file(&new_wal_path, &Default::default())?;
-        let new_wal = LogWriter::new(WritableFileWriter::new(new_wal_file));
-
-        // Finalise the old WAL by closing the writer (drops the
-        // file handle) and removing the file.
-        let old_wal = std::mem::replace(&mut state.wal, new_wal);
-        old_wal.close()?;
-        let old_wal_path = make_wal_file_name(&self.path, old_wal_number);
-        if self.fs.file_exists(&old_wal_path)? {
-            self.fs.delete_file(&old_wal_path)?;
-        }
-        state.wal_number = new_wal_number;
-
-        // Persist the new SST list to CURRENT for the next open.
-        let mut current = String::new();
-        for entry in state.ssts.iter().rev() {
-            // Write oldest → newest in the file (just a convention).
-            if !current.is_empty() {
-                current.push(',');
+        let result = match write_result {
+            Ok(reader) => {
+                state.ssts.insert(
+                    0,
+                    SstEntry {
+                        number: setup.sst_number,
+                        reader,
+                    },
+                );
+                // Persist the new SST list to CURRENT.
+                let current = current_string(&state.ssts);
+                drop(state);
+                let r = self.write_current_atomic(&current);
+                // Reacquire to maybe schedule compaction.
+                let mut state = self.state.lock().unwrap();
+                if r.is_ok() {
+                    // Best-effort: delete the obsolete WAL now
+                    // that the SST + CURRENT are durable.
+                    let old_wal_path =
+                        make_wal_file_name(&self.path, setup.old_wal_number);
+                    let _ = self.fs.delete_file(&old_wal_path);
+                }
+                let cleanup = self.maybe_pick_compaction(&mut state);
+                drop(state);
+                if let Some(plan) = cleanup {
+                    let _ = self.run_compaction(plan.0, plan.1, plan.2);
+                }
+                r
             }
-            current.push_str(&entry.number.to_string());
-        }
+            Err(e) => {
+                // SST write failed. The obsolete WAL is preserved
+                // — on the next open(), its records will be
+                // replayed into a fresh memtable.
+                Err(e)
+            }
+        };
+
+        self.flush_done.notify_all();
+        result
+    }
+
+    /// Helper called inside `complete_flush_locked` to decide
+    /// whether to schedule a compaction. Returns the compaction
+    /// plan if one is needed, or `None` otherwise.
+    fn maybe_pick_compaction(
+        &self,
+        state: &mut DbState,
+    ) -> Option<(u64, Vec<Arc<BlockBasedTableReader>>, Vec<u64>)> {
+        let to_compact = pick_compaction(state.ssts.len(), Self::COMPACTION_TRIGGER)?;
+        let inputs: Vec<Arc<BlockBasedTableReader>> = to_compact
+            .iter()
+            .map(|&i| Arc::clone(&state.ssts[i].reader))
+            .collect();
+        let input_numbers: Vec<u64> = to_compact.iter().map(|&i| state.ssts[i].number).collect();
+        let out_number = state.next_file_number;
+        state.next_file_number += 1;
+        Some((out_number, inputs, input_numbers))
+    }
+
+    /// Atomically write `contents` to `<path>/CURRENT` via a tmp
+    /// file + rename. Crash-safe: a torn write produces an
+    /// orphaned tmp file, never a half-written CURRENT.
+    fn write_current_atomic(&self, contents: &str) -> Result<()> {
         let current_path = make_current_file_name(&self.path);
-        let current_file = self
+        let tmp_path = self.path.join("CURRENT.tmp");
+        let tmp_file = self
             .fs
-            .new_writable_file(&current_path, &Default::default())?;
-        let mut writer = WritableFileWriter::new(current_file);
+            .new_writable_file(&tmp_path, &Default::default())?;
+        let mut writer = WritableFileWriter::new(tmp_file);
         let io = IoOptions::default();
-        writer.append(current.as_bytes(), &io)?;
+        writer.append(contents.as_bytes(), &io)?;
         writer.flush(&io)?;
         writer.sync(&io)?;
         writer.close(&io)?;
-
-        // Decide whether to schedule a compaction. Snapshot the
-        // SST list under the lock, then drop the lock before
-        // running the merge — compaction is I/O-heavy and we
-        // don't want to block writers on it.
-        let to_compact = pick_compaction(state.ssts.len(), Self::COMPACTION_TRIGGER);
-        let compaction_plan: Option<(u64, Vec<Arc<BlockBasedTableReader>>, Vec<u64>)> =
-            to_compact.map(|indices| {
-                let inputs: Vec<Arc<BlockBasedTableReader>> = indices
-                    .iter()
-                    .map(|&i| Arc::clone(&state.ssts[i].reader))
-                    .collect();
-                let input_numbers: Vec<u64> =
-                    indices.iter().map(|&i| state.ssts[i].number).collect();
-                let out_number = state.next_file_number;
-                state.next_file_number += 1;
-                (out_number, inputs, input_numbers)
-            });
-        drop(state);
-
-        if let Some((out_num, inputs, input_numbers)) = compaction_plan {
-            self.run_compaction(out_num, inputs, input_numbers)?;
-        }
+        self.fs.rename_file(&tmp_path, &current_path)?;
         Ok(())
     }
+}
 
+/// Per-flush context handed from `start_flush_locked` to the
+/// background worker (or to the synchronous `flush()` path).
+struct FlushSetup {
+    sst_number: u64,
+    immutable: Arc<MemTable>,
+    old_wal_number: u64,
+}
+
+/// Helper used by `complete_flush_locked` to render the SST list
+/// into the CURRENT file format.
+fn current_string(ssts: &[SstEntry]) -> String {
+    let mut s = String::new();
+    for entry in ssts.iter().rev() {
+        if !s.is_empty() {
+            s.push(',');
+        }
+        s.push_str(&entry.number.to_string());
+    }
+    s
+}
+
+impl DbImpl {
     /// Run a compaction job and update engine state to swap the
     /// inputs for the new output SST.
     fn run_compaction(
@@ -576,11 +798,25 @@ impl DbImpl {
         Ok(())
     }
 
-    /// Close the DB. After this, all method calls return errors.
+    /// Close the DB. Drains any pending background flush, then
+    /// flushes the active memtable synchronously, then releases
+    /// the file lock.
     pub fn close(&self) -> Result<()> {
-        // Flush any unflushed memtable data.
+        // 1. Wait for any in-progress background flush.
+        self.wait_for_pending_flush()?;
+        // 2. Synchronously flush the active memtable.
         self.flush()?;
-        // Drop the lock so other processes can open the DB.
+        // 3. Mark closing so future background work bails out
+        //    quickly. Held under the lock so we don't race with
+        //    a worker that's about to call complete_flush.
+        {
+            let mut state = self.state.lock().unwrap();
+            state.closing = true;
+        }
+        // 4. Drain pool workers so no task is mid-flight when
+        //    we drop the engine.
+        self.thread_pool.wait_for_jobs_and_join_all();
+        // 5. Release the lock so other processes can open the DB.
         let lock = self.lock.lock().unwrap().take();
         if let Some(lock) = lock {
             self.fs.unlock_file(lock)?;
@@ -1015,6 +1251,80 @@ mod tests {
         };
         assert!(n < 5, "expected fewer than 5 SSTs after compaction, got {n}");
 
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schedule_flush_runs_in_background() {
+        let dir = temp_dir("bgflush");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        for i in 0..50u32 {
+            let k = format!("k{i:03}");
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+        // Schedule a flush; the call must return promptly without
+        // waiting for the SST write.
+        db.schedule_flush().unwrap();
+        // The data should still be visible — either in the
+        // immutable memtable (if the worker is mid-flush) or in
+        // the new SST (if it's already done).
+        for i in 0..50u32 {
+            let k = format!("k{i:03}");
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
+        }
+        // Drain the background work and verify everything still
+        // reads correctly.
+        db.wait_for_pending_flush().unwrap();
+        for i in 0..50u32 {
+            let k = format!("k{i:03}");
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writes_during_background_flush_go_to_new_memtable() {
+        let dir = temp_dir("concurrent");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        // Put some initial data and freeze it.
+        for i in 0..20u32 {
+            db.put(format!("old{i:02}").as_bytes(), b"old").unwrap();
+        }
+        db.schedule_flush().unwrap();
+        // Now write more data — it should land in the *new*
+        // active memtable, not the (possibly still mid-flush)
+        // immutable one.
+        for i in 0..20u32 {
+            db.put(format!("new{i:02}").as_bytes(), b"new").unwrap();
+        }
+        db.wait_for_pending_flush().unwrap();
+        // Both sets of data should be readable.
+        for i in 0..20u32 {
+            assert_eq!(
+                db.get(format!("old{i:02}").as_bytes()).unwrap(),
+                Some(b"old".to_vec())
+            );
+            assert_eq!(
+                db.get(format!("new{i:02}").as_bytes()).unwrap(),
+                Some(b"new".to_vec())
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_file_is_atomic_after_flush() {
+        let dir = temp_dir("atomic-current");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+        // CURRENT must exist; CURRENT.tmp must not (it gets
+        // renamed away during the atomic write).
+        assert!(dir.join("CURRENT").exists());
+        assert!(!dir.join("CURRENT.tmp").exists());
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
