@@ -100,8 +100,8 @@ struct DbState {
     /// with the engine's read path. Reads consult this *after*
     /// the active memtable but *before* the SSTs.
     immutable: Option<Arc<MemTable>>,
-    /// Live SST files, newest-first. Layer 4b will replace this
-    /// with a real `VersionSet`.
+    /// Live SST files, newest-first. A future layer will replace
+    /// this with a multi-level `VersionSet`.
     ssts: Vec<SstEntry>,
     /// Current WAL writer.
     wal: LogWriter,
@@ -121,6 +121,26 @@ struct DbState {
     /// Set when the engine is closing — background tasks check
     /// this to skip work that no longer matters.
     closing: bool,
+    /// Live snapshot multiset: `seq → refcount`. Used to compute
+    /// `min_snap_seq` for snapshot-aware compaction. An entry is
+    /// added on `DbImpl::snapshot()` and removed on
+    /// `DbSnapshot::drop`. The smallest key in the map is the
+    /// oldest live snapshot; `min_snap_seq()` returns
+    /// `u64::MAX` when the map is empty (no snapshots → nothing
+    /// to preserve).
+    snapshots: std::collections::BTreeMap<SequenceNumber, usize>,
+}
+
+impl DbState {
+    /// The oldest sequence pinned by any live snapshot, or
+    /// `u64::MAX` if there are no live snapshots.
+    fn min_snap_seq(&self) -> SequenceNumber {
+        self.snapshots
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(SequenceNumber::MAX)
+    }
 }
 
 /// The Layer 4c engine.
@@ -316,6 +336,7 @@ impl DbImpl {
                 next_file_number,
                 last_sequence,
                 closing: false,
+                snapshots: std::collections::BTreeMap::new(),
             }),
             flush_done: Condvar::new(),
             lock: Mutex::new(Some(lock)),
@@ -397,12 +418,41 @@ impl DbImpl {
     /// - `Ok(None)` on a miss (or the latest entry is a deletion)
     /// - `Err` for I/O / corruption errors
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // Snapshot the engine state under the lock — but only the
-        // pieces we need so we can drop the lock before doing I/O
-        // on the SSTs.
-        let (lookup, immutable, ssts) = {
+        let read_seq = {
             let state = self.state.lock().unwrap();
-            let lookup = LookupKey::new(key, state.last_sequence);
+            state.last_sequence
+        };
+        self.get_at_seq(key, read_seq)
+    }
+
+    /// Point-lookup at a specific snapshot. The snapshot pins a
+    /// sequence number at the time it was taken; subsequent
+    /// writes (with higher sequences) are invisible to reads
+    /// made through the snapshot.
+    ///
+    /// ```ignore
+    /// let snap = db.snapshot();
+    /// db.put(b"k", b"new")?;            // after snapshot
+    /// assert_eq!(db.get(b"k")?,
+    ///            Some(b"new".to_vec()));        // current read
+    /// assert_eq!(db.get_at(b"k", &*snap)?,
+    ///            Some(b"old".to_vec()));        // snapshot read
+    /// ```
+    pub fn get_at(
+        &self,
+        key: &[u8],
+        snapshot: &dyn crate::api::snapshot::Snapshot,
+    ) -> Result<Option<Vec<u8>>> {
+        self.get_at_seq(key, snapshot.sequence_number())
+    }
+
+    /// Shared point-lookup implementation parameterised by the
+    /// read sequence. `get()` calls it with `state.last_sequence`;
+    /// `get_at()` calls it with the snapshot's pinned sequence.
+    fn get_at_seq(&self, key: &[u8], read_seq: SequenceNumber) -> Result<Option<Vec<u8>>> {
+        let (lookup, ssts) = {
+            let state = self.state.lock().unwrap();
+            let lookup = LookupKey::new(key, read_seq);
             // 1. Try the active memtable first under the lock.
             match state.memtable.get(&lookup) {
                 MemTableGetResult::Found(v) => return Ok(Some(v)),
@@ -410,8 +460,6 @@ impl DbImpl {
                 MemTableGetResult::NotFound => {}
             }
             // 2. Try the immutable memtable (a flush in progress).
-            //    The active memtable always shadows it, so we
-            //    only consult it on a miss.
             if let Some(imm) = state.immutable.as_ref() {
                 match imm.get(&lookup) {
                     MemTableGetResult::Found(v) => return Ok(Some(v)),
@@ -419,36 +467,22 @@ impl DbImpl {
                     MemTableGetResult::NotFound => {}
                 }
             }
-            // 3. Snapshot the SST list and the (still-Arc'd)
-            //    immutable so the lock can be dropped.
+            // 3. Snapshot the SST list so we can drop the lock.
             let ssts: Vec<Arc<BlockBasedTableReader>> =
                 state.ssts.iter().map(|e| Arc::clone(&e.reader)).collect();
-            let immutable = state.immutable.as_ref().map(Arc::clone);
-            (lookup, immutable, ssts)
+            (lookup, ssts)
         };
-        let _ = immutable; // intentionally unused after the lock drop
 
-        // 3. Walk SSTs newest-first. For each SST, open an
-        //    iterator, seek to the lookup key, and inspect what
-        //    we land on:
-        //    - same user_key, Value/Merge → return the value
-        //    - same user_key, Deletion/SingleDeletion → return None
-        //    - different user_key → the lookup key is not in
-        //      this SST (the SST's entries for `key` end before
-        //      where we landed, or there are no entries for
-        //      `key` at all)
-        //
-        //    Because each SST is sorted `(user_key asc, seq desc,
-        //    type desc)`, the first entry we land on for the
-        //    target user_key is the newest version visible at
-        //    the lookup sequence — exactly what we want.
+        // 4. Walk SSTs newest-first. For each SST, open an
+        //    iterator, seek to the lookup key, inspect what we
+        //    land on, and return as soon as we find an entry
+        //    for this user key (or a tombstone shadowing it).
         for table in &ssts {
             let mut it = table.iter();
             it.seek(lookup.internal_key());
             if !it.valid() {
                 continue;
             }
-            // Parse the internal key we landed on.
             let parsed = match ParsedInternalKey::parse(it.key()) {
                 Ok(p) => p,
                 Err(_) => continue,
@@ -459,13 +493,78 @@ impl DbImpl {
             return Ok(match parsed.value_type {
                 ValueType::Value | ValueType::Merge => Some(it.value().to_vec()),
                 ValueType::Deletion | ValueType::SingleDeletion => None,
-                // Range deletions / blob indices / wide-column
-                // entries aren't visible as point-lookup values
-                // at this layer.
                 _ => None,
             });
         }
         Ok(None)
+    }
+
+    /// Take a snapshot at the current sequence. The returned
+    /// handle pins the sequence — subsequent `get_at` /
+    /// `iter_at` calls with this snapshot see only entries that
+    /// existed when it was taken. Compaction will also preserve
+    /// the newest version at or below each live snapshot until
+    /// the snapshot is dropped.
+    ///
+    /// Snapshots are refcounted and automatically released on
+    /// `Drop`. You should not leak them — long-lived snapshots
+    /// prevent compaction from dropping old versions and
+    /// tombstones, which grows the LSM over time.
+    pub fn snapshot(&self) -> Arc<DbSnapshot> {
+        let seq = {
+            let mut state = self.state.lock().unwrap();
+            let seq = state.last_sequence;
+            *state.snapshots.entry(seq).or_insert(0) += 1;
+            seq
+        };
+        Arc::new(DbSnapshot {
+            seq,
+            db: self.weak_self(),
+        })
+    }
+
+    /// Iterator at a specific snapshot. See [`Self::snapshot`].
+    pub fn iter_at(
+        &self,
+        snapshot: &dyn crate::api::snapshot::Snapshot,
+    ) -> Result<crate::db::db_iter::DbIterator> {
+        self.iter_at_seq(snapshot.sequence_number())
+    }
+
+    fn iter_at_seq(
+        &self,
+        read_seq: SequenceNumber,
+    ) -> Result<crate::db::db_iter::DbIterator> {
+        let state = self.state.lock().unwrap();
+        let ssts: Vec<Arc<BlockBasedTableReader>> =
+            state.ssts.iter().map(|e| Arc::clone(&e.reader)).collect();
+        let it = crate::db::db_iter::DbIterator::from_snapshot_with_immutable_at(
+            &state.memtable,
+            state.immutable.as_deref(),
+            &ssts,
+            read_seq,
+        )?;
+        drop(state);
+        Ok(it)
+    }
+
+    /// Internal: release a snapshot's hold on its pinned sequence.
+    /// Called by [`DbSnapshot::drop`] after the last Arc is dropped.
+    fn release_snapshot_internal(&self, seq: SequenceNumber) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(count) = state.snapshots.get_mut(&seq) {
+            *count -= 1;
+            if *count == 0 {
+                state.snapshots.remove(&seq);
+            }
+        }
+    }
+
+    /// For tests: return the number of distinct live snapshot
+    /// sequences currently tracked by the engine.
+    #[cfg(test)]
+    fn live_snapshot_count(&self) -> usize {
+        self.state.lock().unwrap().snapshots.len()
     }
 
     /// Open a forward + backward iterator over the engine. Eagerly
@@ -770,6 +869,56 @@ struct FlushSetup {
     old_wal_number: u64,
 }
 
+/// The engine's concrete snapshot type. Returned from
+/// [`DbImpl::snapshot`]. Implements [`crate::api::snapshot::Snapshot`]
+/// so callers can use it wherever the Layer 0 trait is expected.
+///
+/// The snapshot is refcounted: every `Arc::clone` holds the
+/// sequence. The engine tracks a `BTreeMap<sequence, refcount>`
+/// so it can compute `min_snap_seq` for snapshot-aware compaction.
+/// When the last `Arc<DbSnapshot>` is dropped, `Drop` decrements
+/// the refcount and removes the entry if it hits zero.
+///
+/// `Weak<DbImpl>` is used in `Drop` so that dropping the engine
+/// before the snapshot doesn't cause a use-after-free. If the
+/// engine has been dropped, the weak ref fails to upgrade and
+/// `Drop` becomes a no-op.
+pub struct DbSnapshot {
+    /// The pinned sequence number.
+    seq: SequenceNumber,
+    /// Back-reference to the engine. `Weak` to avoid a cycle
+    /// (engine → snapshots registry; snapshots → engine).
+    db: Weak<DbImpl>,
+}
+
+impl DbSnapshot {
+    /// The pinned sequence.
+    pub fn sequence(&self) -> SequenceNumber {
+        self.seq
+    }
+}
+
+impl std::fmt::Debug for DbSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DbSnapshot(seq={})", self.seq)
+    }
+}
+
+impl crate::api::snapshot::Snapshot for DbSnapshot {
+    fn sequence_number(&self) -> SequenceNumber {
+        self.seq
+    }
+}
+
+impl Drop for DbSnapshot {
+    fn drop(&mut self) {
+        if let Some(db) = self.db.upgrade() {
+            db.release_snapshot_internal(self.seq);
+        }
+        // Else: the engine has been dropped, nothing to release.
+    }
+}
+
 /// Helper used by `complete_flush_locked` to render the SST list
 /// into the CURRENT file format.
 fn current_string(ssts: &[SstEntry]) -> String {
@@ -792,6 +941,13 @@ impl DbImpl {
         inputs: Vec<Arc<BlockBasedTableReader>>,
         input_numbers: Vec<u64>,
     ) -> Result<()> {
+        // Snapshot the minimum live snapshot sequence so the
+        // compaction job knows how far back to preserve versions.
+        let min_snap_seq = {
+            let state = self.state.lock().unwrap();
+            state.min_snap_seq()
+        };
+
         let out_path = make_table_file_name(&self.path, out_number);
 
         // Run the merge → output SST. CompactionJob borrows the
@@ -801,7 +957,8 @@ impl DbImpl {
             inputs,
             &out_path,
             BlockBasedTableOptions::default(),
-        );
+        )
+        .with_min_snap_seq(min_snap_seq);
         let written = job.run()?;
 
         // Swap inputs for the output under the lock.
@@ -1360,6 +1517,188 @@ mod tests {
                 Some(b"new".to_vec())
             );
         }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Layer 4e: snapshot tests ------------------------------
+
+    #[test]
+    fn snapshot_sees_pre_overwrite_value_in_memtable() {
+        let dir = temp_dir("snap-memt");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.put(b"k", b"old").unwrap();
+        let snap = db.snapshot();
+        db.put(b"k", b"new").unwrap();
+
+        // Current read sees "new".
+        assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
+        // Snapshot read sees "old".
+        assert_eq!(
+            db.get_at(b"k", &*snap as &dyn crate::api::snapshot::Snapshot)
+                .unwrap(),
+            Some(b"old".to_vec())
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_sees_pre_overwrite_value_after_flush() {
+        let dir = temp_dir("snap-flush");
+        let opts_larger = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&opts_larger, &dir).unwrap();
+        db.put(b"k", b"old").unwrap();
+        let snap = db.snapshot();
+        db.put(b"k", b"new").unwrap();
+        db.flush().unwrap();
+        db.wait_for_pending_flush().unwrap();
+
+        // Both versions are now in the SST. The snapshot must
+        // still see "old".
+        assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
+        assert_eq!(
+            db.get_at(b"k", &*snap as &dyn crate::api::snapshot::Snapshot)
+                .unwrap(),
+            Some(b"old".to_vec())
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_sees_pre_delete_value() {
+        let dir = temp_dir("snap-del");
+        let opts_larger = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&opts_larger, &dir).unwrap();
+        db.put(b"k", b"live").unwrap();
+        let snap = db.snapshot();
+        db.delete(b"k").unwrap();
+
+        // Current read returns None (tombstone wins).
+        assert_eq!(db.get(b"k").unwrap(), None);
+        // Snapshot read still sees the pre-deletion value.
+        assert_eq!(
+            db.get_at(b"k", &*snap as &dyn crate::api::snapshot::Snapshot)
+                .unwrap(),
+            Some(b"live".to_vec())
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_survives_compaction() {
+        let dir = temp_dir("snap-compact");
+        let opts_larger = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&opts_larger, &dir).unwrap();
+
+        db.put(b"k", b"old").unwrap();
+        let snap = db.snapshot();
+        db.put(b"k", b"new").unwrap();
+
+        // Force multiple flushes + a compaction.
+        db.flush().unwrap();
+        db.wait_for_pending_flush().unwrap();
+        for i in 0..4u32 {
+            db.put(format!("filler{i}").as_bytes(), b"v").unwrap();
+            db.flush().unwrap();
+            db.wait_for_pending_flush().unwrap();
+        }
+
+        // A compaction has almost certainly run by now (trigger
+        // is 4). The snapshot must still see "old" because
+        // compaction should have respected min_snap_seq.
+        assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
+        assert_eq!(
+            db.get_at(b"k", &*snap as &dyn crate::api::snapshot::Snapshot)
+                .unwrap(),
+            Some(b"old".to_vec())
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropping_snapshot_releases_retention() {
+        let dir = temp_dir("snap-drop");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        assert_eq!(db.live_snapshot_count(), 0);
+        let snap = db.snapshot();
+        assert_eq!(db.live_snapshot_count(), 1);
+        drop(snap);
+        assert_eq!(db.live_snapshot_count(), 0);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn iter_at_snapshot_excludes_newer_writes() {
+        let dir = temp_dir("iter-snap");
+        let opts_larger = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&opts_larger, &dir).unwrap();
+
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        let snap = db.snapshot();
+        db.put(b"c", b"3").unwrap(); // after the snapshot
+        db.put(b"b", b"2b").unwrap(); // overwrite after snapshot
+
+        // Current iterator sees a, b (updated), c.
+        let mut it = db.iter().unwrap();
+        it.seek_to_first();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        while it.valid() {
+            got.push((it.key().to_vec(), it.value().to_vec()));
+            it.next();
+        }
+        assert_eq!(
+            got,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2b".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+            ]
+        );
+
+        // Snapshot iterator sees a, b (old value), and NO c.
+        let mut it = db
+            .iter_at(&*snap as &dyn crate::api::snapshot::Snapshot)
+            .unwrap();
+        it.seek_to_first();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        while it.valid() {
+            got.push((it.key().to_vec(), it.value().to_vec()));
+            it.next();
+        }
+        assert_eq!(
+            got,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+            ]
+        );
+
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

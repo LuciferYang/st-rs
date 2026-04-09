@@ -16,6 +16,7 @@
 //! | 4b    | SST iterator, merging iter, DbIterator, compaction | `sst::block_based::sst_iterator`, `db::merging_iterator`, `db::db_iter`, `db::compaction` |
 //! | 4c    | Background flush, immutable memtable, atomic CURRENT, util::heap | `db::db_impl` (refactored), [`util::heap`]                |
 //! | 4d    | Internal-key SSTs (BE-inverted trailer) enabling MVCC in the SST format | `db::dbformat`, `db::db_impl` flush/get, `db::compaction` |
+//! | 4e    | Explicit snapshots + snapshot-aware reads + retention in compaction | `db::db_impl` (`snapshot`, `get_at`, `iter_at`), `db::compaction` |
 //! | 4     | LSM engine                       | *deferred*                                          |
 //! | 5     | Optional features                | *deferred*                                          |
 //! | 6     | Tools & stress                   | *deferred*                                          |
@@ -170,3 +171,8 @@ pub use crate::sst::block_based::sst_iterator::SstIter;
 // ---------- Layer 4c re-exports ----------
 
 pub use crate::util::heap::BinaryHeap;
+
+// ---------- Layer 4e re-exports ----------
+
+pub use crate::db::db_impl::DbSnapshot;
+pub use crate::db::db_iter::READ_AT_LATEST;

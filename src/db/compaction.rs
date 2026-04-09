@@ -33,7 +33,7 @@
 //!   layer.
 
 use crate::core::status::Result;
-use crate::core::types::ValueType;
+use crate::core::types::{SequenceNumber, ValueType};
 use crate::db::dbformat::ParsedInternalKey;
 use crate::env::file_system::FileSystem;
 use crate::file::writable_file_writer::WritableFileWriter;
@@ -92,14 +92,26 @@ pub fn pick_compaction_batch(
 pub struct CompactionJob<'a> {
     fs: &'a dyn FileSystem,
     /// SSTs to merge. The engine passes them in **newest-first**
-    /// order; the merging iterator's first-source-wins tie-break
-    /// then ensures the newest version of any duplicated user key
-    /// survives.
+    /// order; with internal-key SSTs this only matters for the
+    /// collect-into-a-vec step's tie-breaking on exact internal
+    /// keys (which shouldn't happen anyway — each put gets a
+    /// unique sequence).
     inputs: Vec<Arc<BlockBasedTableReader>>,
     /// Path of the output SST file.
     output_path: &'a Path,
     /// Builder options for the output SST.
     table_options: BlockBasedTableOptions,
+    /// Oldest live snapshot sequence. Versions with
+    /// `seq > min_snap_seq` are preserved because some live
+    /// snapshot above may need them; the newest version with
+    /// `seq <= min_snap_seq` is also preserved because the
+    /// oldest snapshot needs it. Older versions below
+    /// `min_snap_seq` are dropped.
+    ///
+    /// Defaults to `u64::MAX` which means "no live snapshots" —
+    /// the retention rule then collapses to the Layer 4d
+    /// behaviour of keeping only the newest version per user key.
+    min_snap_seq: SequenceNumber,
 }
 
 impl<'a> CompactionJob<'a> {
@@ -116,7 +128,16 @@ impl<'a> CompactionJob<'a> {
             inputs,
             output_path,
             table_options,
+            min_snap_seq: SequenceNumber::MAX,
         }
+    }
+
+    /// Builder: set the oldest live snapshot sequence. See the
+    /// `min_snap_seq` field doc for how this affects retention.
+    #[must_use]
+    pub fn with_min_snap_seq(mut self, min_snap_seq: SequenceNumber) -> Self {
+        self.min_snap_seq = min_snap_seq;
+        self
     }
 
     /// Number of input keys (across all input SSTs, including
@@ -170,22 +191,84 @@ impl<'a> CompactionJob<'a> {
             self.table_options,
         );
 
+        // Snapshot-aware retention rule (Layer 4e):
+        //
+        //   For each user key, walk versions newest-first:
+        //   - Emit the first version unconditionally (it's the
+        //     newest, needed by any current read).
+        //   - Emit subsequent versions whose seq > min_snap_seq
+        //     (they're above the oldest live snapshot and some
+        //     snapshot above may need them).
+        //   - Emit the first version with seq <= min_snap_seq
+        //     that we encounter (needed by the min_snap_seq
+        //     snapshot for this user key).
+        //   - Drop everything older than that.
+        //
+        //   When `min_snap_seq == u64::MAX` (no live snapshots),
+        //   this collapses to "emit only the first version per
+        //   user key" — the Layer 4d behaviour.
+        //
+        // Tombstones are dropped only when they *would* be the
+        // sole entry for a user key AND there's no live snapshot
+        // needing the shadowed version. At this layer we keep
+        // tombstones whenever the retention rule says "emit" —
+        // that includes the "newest version is a tombstone"
+        // case, because a future layer with multi-level
+        // compaction will want the tombstone to shadow older
+        // versions at lower levels. The exception is the
+        // `min_snap_seq == MAX` case where we have no lower
+        // level and no live snapshot, which is the Layer 4d
+        // bottommost rule: drop tombstones outright.
         let mut written = 0usize;
         let mut last_user_key: Option<Vec<u8>> = None;
+        let mut emitted_below_min = false;
+        let drop_tombstones = self.min_snap_seq == SequenceNumber::MAX;
         for (ikey, value) in &entries {
             let parsed = ParsedInternalKey::parse(ikey)?;
-            if last_user_key.as_deref() == Some(parsed.user_key) {
-                // Older version of an already-emitted user key.
+            let new_user_key = last_user_key.as_deref() != Some(parsed.user_key);
+
+            // Decide whether to emit this entry.
+            let emit = if new_user_key {
+                last_user_key = Some(parsed.user_key.to_vec());
+                emitted_below_min = parsed.sequence <= self.min_snap_seq;
+                true
+            } else if parsed.sequence > self.min_snap_seq {
+                // Still above the oldest live snapshot — preserve.
+                true
+            } else if !emitted_below_min {
+                // First version at or below min_snap_seq for
+                // this user key — preserve (snapshots need it).
+                emitted_below_min = true;
+                true
+            } else {
+                // Older version below min_snap_seq already
+                // shadowed for every live snapshot.
+                false
+            };
+
+            if !emit {
                 continue;
             }
-            last_user_key = Some(parsed.user_key.to_vec());
+
             match parsed.value_type {
                 ValueType::Value | ValueType::Merge => {
                     tb.add(ikey, value)?;
                     written += 1;
                 }
+                ValueType::Deletion | ValueType::SingleDeletion => {
+                    if !drop_tombstones {
+                        tb.add(ikey, value)?;
+                        written += 1;
+                    }
+                    // Else: no snapshot needs the version below
+                    // this tombstone, so the tombstone can be
+                    // dropped outright (bottommost behaviour).
+                }
                 _ => {
-                    // Tombstone at bottommost level — drop.
+                    // Range deletions / blob indices / wide-column
+                    // aren't supported in point-lookup/iter at
+                    // this layer; drop them rather than writing
+                    // an unrecognised value into the output.
                 }
             }
         }
