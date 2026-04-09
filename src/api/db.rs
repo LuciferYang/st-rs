@@ -9,12 +9,14 @@
 //! operations. Internal features (backup, ingest, replication, trace,
 //! blob-db-specific calls, …) will be added in follow-up layers.
 
-use crate::iterator::DbIterator;
-use crate::options::{ColumnFamilyOptions, DbOptions, FlushOptions, ReadOptions, WriteOptions};
-use crate::snapshot::Snapshot;
-use crate::status::Result;
-use crate::types::ColumnFamilyId;
-use crate::write_batch::WriteBatch;
+use crate::api::iterator::DbIterator;
+use crate::api::options::{
+    ColumnFamilyOptions, DbOptions, FlushOptions, ReadOptions, WriteOptions,
+};
+use crate::api::snapshot::Snapshot;
+use crate::api::write_batch::WriteBatch;
+use crate::core::status::Result;
+use crate::core::types::ColumnFamilyId;
 use std::path::Path;
 use std::sync::Arc;
 

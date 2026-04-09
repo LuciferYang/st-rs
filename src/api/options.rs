@@ -18,7 +18,7 @@
 //! All structs derive [`Clone`] and provide a `Default` impl whose values
 //! mirror upstream's `OldDefaults()` — safe, conservative starting points.
 
-use crate::types::{ChecksumType, CompressionType};
+use crate::core::types::{ChecksumType, CompressionType};
 
 // ============================================================================
 // DBOptions

@@ -9,7 +9,7 @@
 //! "associative" and "partial-merge" flavors; those are convenience
 //! optimisations that don't belong at the trait-definition layer.
 
-use crate::status::Result;
+use crate::core::status::Result;
 
 /// User-defined combiner over a sequence of operands.
 ///

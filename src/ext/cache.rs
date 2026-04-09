@@ -8,7 +8,7 @@
 //! Layer 0 only defines the trait. Real implementations (`LruCache`,
 //! `ClockCache`, `HyperClockCache`) belong in Layer 2 under a `cache` crate.
 
-use crate::status::Result;
+use crate::core::status::Result;
 use std::sync::Arc;
 
 /// Opaque type used by [`Cache`] to identify cached entries. Upstream uses
