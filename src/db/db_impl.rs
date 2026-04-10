@@ -55,7 +55,7 @@
 use crate::api::options::DbOptions;
 use crate::core::status::{Result, Status};
 use crate::core::types::{SequenceNumber, ValueType};
-use crate::db::compaction::{pick_compaction, CompactionJob};
+use crate::db::compaction::CompactionJob;
 use crate::db::log_reader::LogReader;
 use crate::db::log_writer::LogWriter;
 use crate::db::memtable::{MemTable, MemTableGetResult};
@@ -82,10 +82,50 @@ use crate::api::write_batch::{Record, WriteBatch, WriteBatchHandler};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
-/// One open SST file: its assigned number and a cached reader.
+/// One open SST file: its assigned number, a cached reader, and
+/// the user-key range covered by the file.
 struct SstEntry {
     number: u64,
     reader: Arc<BlockBasedTableReader>,
+    /// Smallest user key in this SST. Empty for an empty SST.
+    smallest_key: Vec<u8>,
+    /// Largest user key in this SST. Empty for an empty SST.
+    largest_key: Vec<u8>,
+    /// Level this SST belongs to. 0 = overlapping L0 from flushes;
+    /// 1 = non-overlapping L1 from compaction.
+    level: u32,
+}
+
+/// Maximum number of levels. Layer 4g uses exactly 2 (L0 + L1);
+/// higher levels are reserved for a future multi-level layer.
+/// Maximum number of levels. Layer 4g uses exactly 2 (L0 + L1).
+#[allow(dead_code)]
+const NUM_LEVELS: usize = 2;
+
+/// Compute the user-key range of an SST by scanning its entries.
+/// O(file) — called once per SST at open time. A future layer
+/// can persist this in table properties or a manifest to skip the
+/// scan.
+fn compute_sst_range(reader: &BlockBasedTableReader) -> (Vec<u8>, Vec<u8>) {
+    let mut it = reader.iter();
+    it.seek_to_first();
+    if !it.valid() {
+        return (Vec::new(), Vec::new());
+    }
+    let first = match ParsedInternalKey::parse(it.key()) {
+        Ok(p) => p.user_key.to_vec(),
+        Err(_) => return (Vec::new(), Vec::new()),
+    };
+    let mut last = first.clone();
+    while it.valid() {
+        if let Ok(p) = ParsedInternalKey::parse(it.key()) {
+            if p.user_key > last.as_slice() {
+                last = p.user_key.to_vec();
+            }
+        }
+        it.next();
+    }
+    (first, last)
 }
 
 /// Internal state behind the DB's big lock.
@@ -100,9 +140,13 @@ struct DbState {
     /// with the engine's read path. Reads consult this *after*
     /// the active memtable but *before* the SSTs.
     immutable: Option<Arc<MemTable>>,
-    /// Live SST files, newest-first. A future layer will replace
-    /// this with a multi-level `VersionSet`.
-    ssts: Vec<SstEntry>,
+    /// Level 0 SST files, **newest-first** (overlapping ranges
+    /// allowed). Flushed memtables land here.
+    l0: Vec<SstEntry>,
+    /// Level 1 SST files, sorted by `smallest_key` (non-
+    /// overlapping ranges guaranteed by the compaction output).
+    /// L0→L1 compaction moves data here.
+    l1: Vec<SstEntry>,
     /// Current WAL writer.
     wal: LogWriter,
     /// Number of the WAL file currently being written.
@@ -259,35 +303,33 @@ impl DbImpl {
         existing_sst_numbers.sort();
         existing_wal_numbers.sort();
 
-        // 4. Open existing SSTs into the read path.
-        let mut ssts = Vec::with_capacity(existing_sst_numbers.len());
+        // 4. Open existing SSTs into the read path. On reopen we
+        //    don't read the CURRENT file for level assignments
+        //    (Layer 4g doesn't yet parse that format); instead
+        //    all discovered SSTs are placed in L0 and will be
+        //    moved to L1 by the next compaction.
+        let mut l0: Vec<SstEntry> = Vec::with_capacity(existing_sst_numbers.len());
+        let l1: Vec<SstEntry> = Vec::new();
         for &num in &existing_sst_numbers {
             let p = make_table_file_name(path, num);
             let raw = fs.new_random_access_file(&p, &Default::default())?;
             let reader = RandomAccessFileReader::new(raw, p.display().to_string())?;
             let table = BlockBasedTableReader::open(Arc::new(reader))?;
-            ssts.push(SstEntry {
+            let (smallest, largest) = compute_sst_range(&table);
+            l0.push(SstEntry {
                 number: num,
                 reader: Arc::new(table),
+                smallest_key: smallest,
+                largest_key: largest,
+                level: 0,
             });
         }
-        // Newest first (highest number).
-        ssts.sort_by(|a, b| b.number.cmp(&a.number));
+        // Newest first (highest number) for L0.
+        l0.sort_by(|a, b| b.number.cmp(&a.number));
 
         // 5a. Initialise `last_sequence` from the existing SSTs.
-        //     Each SST holds internal keys whose trailer encodes
-        //     the sequence, so we walk every entry and keep the
-        //     maximum. Without this step, reopening a DB that
-        //     was closed cleanly (empty WAL, all data in SSTs)
-        //     would reset `last_sequence` to 0 and subsequent
-        //     `LookupKey`s would sort *after* every real entry,
-        //     causing every `get()` to miss.
-        //
-        //     A follow-up layer can avoid the full scan by
-        //     persisting `last_sequence` to `CURRENT` or a real
-        //     `MANIFEST` record.
         let mut last_sequence = 0u64;
-        for entry in &ssts {
+        for entry in l0.iter().chain(l1.iter()) {
             let mut it = entry.reader.iter();
             it.seek_to_first();
             while it.valid() {
@@ -337,7 +379,8 @@ impl DbImpl {
             state: Mutex::new(DbState {
                 memtable,
                 immutable: None,
-                ssts,
+                l0,
+                l1,
                 wal: wal_writer,
                 wal_number,
                 immutable_wal_number: None,
@@ -460,7 +503,7 @@ impl DbImpl {
     /// read sequence. `get()` calls it with `state.last_sequence`;
     /// `get_at()` calls it with the snapshot's pinned sequence.
     fn get_at_seq(&self, key: &[u8], read_seq: SequenceNumber) -> Result<Option<Vec<u8>>> {
-        let (lookup, ssts) = {
+        let (lookup, l0_ssts, l1_ssts) = {
             let state = self.state.lock().unwrap();
             let lookup = LookupKey::new(key, read_seq);
             // 1. Try the active memtable first under the lock.
@@ -477,36 +520,69 @@ impl DbImpl {
                     MemTableGetResult::NotFound => {}
                 }
             }
-            // 3. Snapshot the SST list so we can drop the lock.
-            let ssts: Vec<Arc<BlockBasedTableReader>> =
-                state.ssts.iter().map(|e| Arc::clone(&e.reader)).collect();
-            (lookup, ssts)
+            // 3. Snapshot the SST lists so we can drop the lock.
+            //    L0 is newest-first; L1 is sorted by key range.
+            let l0_ssts: Vec<Arc<BlockBasedTableReader>> =
+                state.l0.iter().map(|e| Arc::clone(&e.reader)).collect();
+            let l1_ssts: Vec<(Vec<u8>, Vec<u8>, Arc<BlockBasedTableReader>)> = state
+                .l1
+                .iter()
+                .map(|e| {
+                    (
+                        e.smallest_key.clone(),
+                        e.largest_key.clone(),
+                        Arc::clone(&e.reader),
+                    )
+                })
+                .collect();
+            (lookup, l0_ssts, l1_ssts)
         };
 
-        // 4. Walk SSTs newest-first. For each SST, open an
-        //    iterator, seek to the lookup key, inspect what we
-        //    land on, and return as soon as we find an entry
-        //    for this user key (or a tombstone shadowing it).
-        for table in &ssts {
-            let mut it = table.iter();
-            it.seek(lookup.internal_key());
-            if !it.valid() {
-                continue;
+        // 4a. Walk L0 SSTs newest-first (overlapping ranges).
+        for table in &l0_ssts {
+            if let Some(result) = Self::seek_in_sst(table, key, &lookup)? {
+                return Ok(result);
             }
-            let parsed = match ParsedInternalKey::parse(it.key()) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if parsed.user_key != key {
-                continue;
+        }
+        // 4b. Walk L1 via binary search (non-overlapping ranges).
+        //     Find the file whose range might contain `key`.
+        let idx = l1_ssts.partition_point(|(smallest, _, _): &(Vec<u8>, Vec<u8>, Arc<BlockBasedTableReader>)| smallest.as_slice() <= key);
+        if idx > 0 {
+            let (_, largest, table) = &l1_ssts[idx - 1];
+            if key <= largest.as_slice() {
+                if let Some(result) = Self::seek_in_sst(table, key, &lookup)? {
+                    return Ok(result);
+                }
             }
-            return Ok(match parsed.value_type {
-                ValueType::Value | ValueType::Merge => Some(it.value().to_vec()),
-                ValueType::Deletion | ValueType::SingleDeletion => None,
-                _ => None,
-            });
         }
         Ok(None)
+    }
+
+    /// Shared: seek in one SST for a user key at the given lookup
+    /// sequence. Returns `Some(Some(value))` for a hit,
+    /// `Some(None)` for a tombstone, or `None` for a miss.
+    fn seek_in_sst(
+        table: &BlockBasedTableReader,
+        user_key: &[u8],
+        lookup: &LookupKey,
+    ) -> Result<Option<Option<Vec<u8>>>> {
+        let mut it = table.iter();
+        it.seek(lookup.internal_key());
+        if !it.valid() {
+            return Ok(None);
+        }
+        let parsed = match ParsedInternalKey::parse(it.key()) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        if parsed.user_key != user_key {
+            return Ok(None);
+        }
+        Ok(Some(match parsed.value_type {
+            ValueType::Value | ValueType::Merge => Some(it.value().to_vec()),
+            ValueType::Deletion | ValueType::SingleDeletion => None,
+            _ => None,
+        }))
     }
 
     /// Take a snapshot at the current sequence. The returned
@@ -546,8 +622,7 @@ impl DbImpl {
         read_seq: SequenceNumber,
     ) -> Result<crate::db::db_iter::DbIterator> {
         let state = self.state.lock().unwrap();
-        let ssts: Vec<Arc<BlockBasedTableReader>> =
-            state.ssts.iter().map(|e| Arc::clone(&e.reader)).collect();
+        let ssts = Self::collect_all_ssts(&state);
         let it = crate::db::db_iter::DbIterator::from_snapshot_with_immutable_at(
             &state.memtable,
             state.immutable.as_deref(),
@@ -556,6 +631,23 @@ impl DbImpl {
         )?;
         drop(state);
         Ok(it)
+    }
+
+    /// Collect all SST readers into a single vec for the eager
+    /// `DbIterator` materialisation. L0 first (newest-first),
+    /// then L1 (sorted by key range). The iterator path doesn't
+    /// need binary-search — it walks every file — so a flat vec
+    /// is fine.
+    fn collect_all_ssts(state: &DbState) -> Vec<Arc<BlockBasedTableReader>> {
+        let mut ssts: Vec<Arc<BlockBasedTableReader>> =
+            Vec::with_capacity(state.l0.len() + state.l1.len());
+        for e in &state.l0 {
+            ssts.push(Arc::clone(&e.reader));
+        }
+        for e in &state.l1 {
+            ssts.push(Arc::clone(&e.reader));
+        }
+        ssts
     }
 
     /// Internal: release a snapshot's hold on its pinned sequence.
@@ -584,12 +676,7 @@ impl DbImpl {
     /// concurrent writes and background flushes.
     pub fn iter(&self) -> Result<crate::db::db_iter::DbIterator> {
         let state = self.state.lock().unwrap();
-        let ssts: Vec<Arc<BlockBasedTableReader>> =
-            state.ssts.iter().map(|e| Arc::clone(&e.reader)).collect();
-        // The active memtable is held by value inside the lock; we
-        // materialise its entries before dropping the guard. The
-        // immutable memtable, if any, is built into the snapshot
-        // *after* the active one so the active one wins ties.
+        let ssts = Self::collect_all_ssts(&state);
         let it = crate::db::db_iter::DbIterator::from_snapshot_with_immutable(
             &state.memtable,
             state.immutable.as_deref(),
@@ -806,15 +893,19 @@ impl DbImpl {
 
         let result = match write_result {
             Ok(reader) => {
-                state.ssts.insert(
+                let (smallest, largest) = compute_sst_range(&reader);
+                state.l0.insert(
                     0,
                     SstEntry {
                         number: setup.sst_number,
                         reader,
+                        smallest_key: smallest,
+                        largest_key: largest,
+                        level: 0,
                     },
                 );
                 // Persist the new SST list to CURRENT.
-                let current = current_string(&state.ssts);
+                let current = current_string(&state.l0, &state.l1);
                 drop(state);
                 let r = self.write_current_atomic(&current);
                 // Reacquire to maybe schedule compaction.
@@ -861,12 +952,33 @@ impl DbImpl {
         if state.pending_compaction.is_some() {
             return None;
         }
-        let to_compact = pick_compaction(state.ssts.len(), Self::COMPACTION_TRIGGER)?;
-        let inputs: Vec<Arc<BlockBasedTableReader>> = to_compact
-            .iter()
-            .map(|&i| Arc::clone(&state.ssts[i].reader))
-            .collect();
-        let input_numbers: Vec<u64> = to_compact.iter().map(|&i| state.ssts[i].number).collect();
+        if state.l0.len() < Self::COMPACTION_TRIGGER {
+            return None;
+        }
+        // All L0 files participate.
+        let mut inputs: Vec<Arc<BlockBasedTableReader>> = Vec::new();
+        let mut input_numbers: Vec<u64> = Vec::new();
+        let mut union_smallest: Vec<u8> = Vec::new();
+        let mut union_largest: Vec<u8> = Vec::new();
+        for entry in &state.l0 {
+            inputs.push(Arc::clone(&entry.reader));
+            input_numbers.push(entry.number);
+            if union_smallest.is_empty() || entry.smallest_key < union_smallest {
+                union_smallest.clone_from(&entry.smallest_key);
+            }
+            if union_largest.is_empty() || entry.largest_key > union_largest {
+                union_largest.clone_from(&entry.largest_key);
+            }
+        }
+        // Include overlapping L1 files.
+        for entry in &state.l1 {
+            if entry.smallest_key <= union_largest
+                && entry.largest_key >= union_smallest
+            {
+                inputs.push(Arc::clone(&entry.reader));
+                input_numbers.push(entry.number);
+            }
+        }
         let out_number = state.next_file_number;
         state.next_file_number += 1;
         let min_snap_seq = state.min_snap_seq();
@@ -980,15 +1092,25 @@ impl Drop for DbSnapshot {
     }
 }
 
-/// Helper used by `complete_flush_locked` to render the SST list
-/// into the CURRENT file format.
-fn current_string(ssts: &[SstEntry]) -> String {
+/// Helper: render the SST level layout into the CURRENT file
+/// format. Layer 4g format: `level:number` pairs separated by
+/// commas, e.g. `"0:5,0:7,1:3,1:8"`. L0 entries are written
+/// newest-first; L1 entries are written sorted by key range.
+fn current_string(l0: &[SstEntry], l1: &[SstEntry]) -> String {
     let mut s = String::new();
-    for entry in ssts.iter().rev() {
+    // L0 in reverse (oldest → newest in the file; but order
+    // within a level doesn't matter for the format).
+    for entry in l0.iter().rev() {
         if !s.is_empty() {
             s.push(',');
         }
-        s.push_str(&entry.number.to_string());
+        s.push_str(&format!("{}:{}", entry.level, entry.number));
+    }
+    for entry in l1 {
+        if !s.is_empty() {
+            s.push(',');
+        }
+        s.push_str(&format!("{}:{}", entry.level, entry.number));
     }
     s
 }
@@ -1070,27 +1192,38 @@ impl DbImpl {
         // Swap inputs for the output under the lock.
         let mut state = self.state.lock().unwrap();
         state
-            .ssts
+            .l0
+            .retain(|e| !input_numbers.contains(&e.number));
+        state
+            .l1
             .retain(|e| !input_numbers.contains(&e.number));
 
         if written > 0 {
-            // Open the new SST and add it. The compaction output
-            // is the *newest* surviving SST in the resulting set
-            // (it absorbed every input), so insert at the front.
+            // Open the new SST and add it to **L1** (compaction
+            // output). L1 is sorted by smallest_key, so we
+            // insert at the right position.
             let raw = self
                 .fs
                 .new_random_access_file(&out_path, &Default::default())?;
             let reader = RandomAccessFileReader::new(raw, out_path.display().to_string())?;
             let table = BlockBasedTableReader::open(Arc::new(reader))?;
-            state.ssts.insert(
-                0,
-                SstEntry {
-                    number: out_number,
-                    reader: Arc::new(table),
-                },
-            );
+            let (smallest, largest) = compute_sst_range(&table);
+            let new_entry = SstEntry {
+                number: out_number,
+                reader: Arc::new(table),
+                smallest_key: smallest.clone(),
+                largest_key: largest,
+                level: 1,
+            };
+            let pos = state
+                .l1
+                .partition_point(|e| e.smallest_key < smallest);
+            state.l1.insert(pos, new_entry);
         }
+        // Persist the updated level layout to CURRENT.
+        let current = current_string(&state.l0, &state.l1);
         drop(state);
+        self.write_current_atomic(&current)?;
 
         // Delete the input SST files. Best-effort: a leaked file
         // is harmless because the next reopen ignores files not
@@ -1555,13 +1688,20 @@ mod tests {
             }
         }
 
-        // The SST list should have shrunk — there were 5 flushes
-        // but compaction merged the older ones.
-        let n = {
+        // Wait for any in-flight background work to finish
+        // before asserting on the SST layout.
+        db.wait_for_pending_work().unwrap();
+
+        // Compaction should have moved data from L0 to L1.
+        // We don't assert an exact count (it depends on timing
+        // and key-range overlap), just that (a) L1 has files
+        // and (b) every key is still readable (already checked
+        // above).
+        let (l0, l1) = {
             let state = db.state.lock().unwrap();
-            state.ssts.len()
+            (state.l0.len(), state.l1.len())
         };
-        assert!(n < 5, "expected fewer than 5 SSTs after compaction, got {n}");
+        assert!(l1 > 0, "expected some L1 files after compaction, got L0={l0} L1={l1}");
 
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1623,6 +1763,134 @@ mod tests {
                 Some(b"new".to_vec())
             );
         }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Layer 4g: multi-level layout tests --------------------
+
+    #[test]
+    fn compaction_moves_l0_to_l1() {
+        let dir = temp_dir("l0-to-l1");
+        let db_opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&db_opts, &dir).unwrap();
+
+        // Write 20 keys, flush after each batch of 5, to create
+        // 4 L0 files (the compaction trigger).
+        for batch in 0..4u32 {
+            for i in 0..5u32 {
+                let k = format!("k{:03}", batch * 5 + i);
+                db.put(k.as_bytes(), b"v").unwrap();
+            }
+            db.flush().unwrap();
+        }
+        db.wait_for_pending_work().unwrap();
+
+        // After 4 flushes + compaction, L0 should be empty (all
+        // moved to L1) and L1 should have at least 1 file.
+        let (l0, l1) = {
+            let state = db.state.lock().unwrap();
+            (state.l0.len(), state.l1.len())
+        };
+        assert_eq!(l0, 0, "L0 should be empty after compaction");
+        assert!(l1 > 0, "L1 should have at least 1 file after compaction");
+
+        // Every key must still be readable (from L1 now).
+        for batch in 0..4u32 {
+            for i in 0..5u32 {
+                let k = format!("k{:03}", batch * 5 + i);
+                assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
+            }
+        }
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn l1_binary_search_finds_correct_file() {
+        // Write two non-overlapping key ranges into L1 via
+        // separate flush+compact cycles, then point-lookup
+        // keys from each range. The L1 binary search in
+        // get_at_seq should find the correct file.
+        let dir = temp_dir("l1-bsearch");
+        let db_opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&db_opts, &dir).unwrap();
+
+        // Range 1: keys "aaa" through "aae".
+        for k in ["aaa", "aab", "aac", "aad", "aae"] {
+            db.put(k.as_bytes(), b"range1").unwrap();
+        }
+        db.flush().unwrap();
+        // Range 2: keys "bba" through "bbe".
+        for k in ["bba", "bbb", "bbc", "bbd", "bbe"] {
+            db.put(k.as_bytes(), b"range2").unwrap();
+        }
+        db.flush().unwrap();
+        // Range 3 + 4: two more flushes to hit trigger (4).
+        for k in ["cca", "ccb"] {
+            db.put(k.as_bytes(), b"range3").unwrap();
+        }
+        db.flush().unwrap();
+        for k in ["dda", "ddb"] {
+            db.put(k.as_bytes(), b"range4").unwrap();
+        }
+        db.flush().unwrap();
+
+        db.wait_for_pending_work().unwrap();
+
+        // All ranges should be readable.
+        assert_eq!(db.get(b"aac").unwrap(), Some(b"range1".to_vec()));
+        assert_eq!(db.get(b"bbc").unwrap(), Some(b"range2".to_vec()));
+        assert_eq!(db.get(b"cca").unwrap(), Some(b"range3".to_vec()));
+        assert_eq!(db.get(b"ddb").unwrap(), Some(b"range4".to_vec()));
+        // Non-existent keys return None.
+        assert_eq!(db.get(b"zzz").unwrap(), None);
+        assert_eq!(db.get(b"aaf").unwrap(), None);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlapping_l0_and_l1_merge_correctly() {
+        // Write overlapping keys across L0 and L1. Verify that
+        // the newest version wins after compaction.
+        let dir = temp_dir("overlap");
+        let db_opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&db_opts, &dir).unwrap();
+
+        // First cycle: put "k"="old" and flush 4 times to trigger
+        // compaction → data lands in L1.
+        db.put(b"k", b"old").unwrap();
+        for _ in 0..4 {
+            db.flush().unwrap();
+        }
+        db.wait_for_pending_work().unwrap();
+
+        // Now overwrite "k"="new" and flush 4 more times to
+        // trigger another compaction. This compaction should
+        // merge the new L0 with the old L1 file.
+        db.put(b"k", b"new").unwrap();
+        for _ in 0..4 {
+            db.flush().unwrap();
+        }
+        db.wait_for_pending_work().unwrap();
+
+        assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
+
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
