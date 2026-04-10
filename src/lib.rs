@@ -18,6 +18,7 @@
 //! | 4d    | Internal-key SSTs (BE-inverted trailer) enabling MVCC in the SST format | `db::dbformat`, `db::db_impl` flush/get, `db::compaction` |
 //! | 4e    | Explicit snapshots + snapshot-aware reads + retention in compaction | `db::db_impl` (`snapshot`, `get_at`, `iter_at`), `db::compaction` |
 //! | 4f    | Background compaction via a second thread-pool worker | `db::db_impl` (`schedule_compaction`, `wait_for_pending_work`) |
+//! | 4g    | Multi-level layout (L0 overlapping, L1 non-overlapping) | `db::db_impl` (l0/l1 fields, binary-search read, overlap picker) |
 //! | 4     | LSM engine                       | *deferred*                                          |
 //! | 5     | Optional features                | *deferred*                                          |
 //! | 6     | Tools & stress                   | *deferred*                                          |
