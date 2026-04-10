@@ -20,6 +20,7 @@
 //! | 4f    | Background compaction via a second thread-pool worker | `db::db_impl` (`schedule_compaction`, `wait_for_pending_work`) |
 //! | 4g    | Multi-level layout (L0 overlapping, L1 non-overlapping) | `db::db_impl` (l0/l1 fields, binary-search read, overlap picker) |
 //! | 5     | Optional features (checkpoint)   | [`utilities::checkpoint`]                            |
+//! | 7     | ForSt Flink bridge              | [`flink`] (`FlinkFileSystem` + `FlinkFsBackend` + `InMemoryFsBackend`) |
 //! | 6     | Tools & stress                   | *deferred*                                          |
 //! | 7     | ForSt-specific Flink bridge      | *deferred*                                          |
 //!
@@ -54,6 +55,7 @@ pub mod db;
 pub mod env;
 pub mod ext;
 pub mod file;
+pub mod flink;
 pub mod logging;
 pub mod memory;
 pub mod memtable;
@@ -182,3 +184,9 @@ pub use crate::db::db_iter::READ_AT_LATEST;
 // ---------- Layer 5 re-exports ----------
 
 pub use crate::utilities::checkpoint::create_checkpoint;
+
+// ---------- Layer 7 re-exports ----------
+
+pub use crate::flink::backend::{FlinkFileStatus, FlinkFsBackend};
+pub use crate::flink::flink_file_system::FlinkFileSystem;
+pub use crate::flink::mock_backend::InMemoryFsBackend;
