@@ -413,6 +413,32 @@ impl DbImpl {
             .clone()
     }
 
+    /// The filesystem backing this DB. Used by utilities (e.g.
+    /// checkpoint) that need to link or copy files.
+    pub fn file_system(&self) -> &Arc<dyn FileSystem> {
+        &self.fs
+    }
+
+    /// The on-disk path of this DB directory.
+    pub fn db_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Return the DB path and the list of live SST file numbers
+    /// across all levels. Used by checkpoint to know which files
+    /// to hard-link.
+    pub fn snapshot_live_files(&self) -> (PathBuf, Vec<u64>) {
+        let state = self.state.lock().unwrap();
+        let mut numbers: Vec<u64> = Vec::with_capacity(state.l0.len() + state.l1.len());
+        for e in &state.l0 {
+            numbers.push(e.number);
+        }
+        for e in &state.l1 {
+            numbers.push(e.number);
+        }
+        (self.path.clone(), numbers)
+    }
+
     /// Insert or overwrite `key → value`.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let mut batch = WriteBatch::new();
