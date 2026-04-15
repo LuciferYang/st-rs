@@ -236,6 +236,10 @@ impl<'a> CompactionJob<'a> {
         let mut last_user_key: Option<Vec<u8>> = None;
         let mut emitted_below_min = false;
         let drop_tombstones = self.min_snap_seq == SequenceNumber::MAX;
+        // When a compaction filter removes the newest version of a key,
+        // all older versions of the same key must also be suppressed
+        // to prevent the key from reverting to an older value.
+        let mut filter_suppressed_key: Option<Vec<u8>> = None;
         for (ikey, value) in &entries {
             let parsed = ParsedInternalKey::parse(ikey)?;
             let new_user_key = last_user_key.as_deref() != Some(parsed.user_key);
@@ -244,6 +248,7 @@ impl<'a> CompactionJob<'a> {
             let emit = if new_user_key {
                 last_user_key = Some(parsed.user_key.to_vec());
                 emitted_below_min = parsed.sequence <= self.min_snap_seq;
+                filter_suppressed_key = None; // reset for new user key
                 true
             } else if parsed.sequence > self.min_snap_seq {
                 // Still above the oldest live snapshot — preserve.
@@ -261,6 +266,14 @@ impl<'a> CompactionJob<'a> {
 
             if !emit {
                 continue;
+            }
+
+            // If the compaction filter removed the newest version of
+            // this user key, suppress all older versions too.
+            if let Some(ref suppressed) = filter_suppressed_key {
+                if suppressed.as_slice() == parsed.user_key {
+                    continue;
+                }
             }
 
             match parsed.value_type {
@@ -284,7 +297,10 @@ impl<'a> CompactionJob<'a> {
                                 written += 1;
                             }
                             CompactionDecision::Remove => {
-                                // Filtered out — don't write to output.
+                                // Filtered out — suppress all older
+                                // versions of this key too.
+                                filter_suppressed_key =
+                                    Some(parsed.user_key.to_vec());
                             }
                             CompactionDecision::ChangeValue(new_val) => {
                                 tb.add(ikey, &new_val)?;

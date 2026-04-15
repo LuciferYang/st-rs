@@ -1469,6 +1469,9 @@ impl DbImpl {
     /// stall / back-pressure mechanism that prevents unbounded L0
     /// growth.
     pub fn write(&self, batch: &WriteBatch) -> Result<()> {
+        if batch.count() == 0 {
+            return Ok(()); // nothing to do
+        }
         let mut state = self.state.lock().unwrap();
 
         // Write stall: block while L0 count is at the stop threshold.
