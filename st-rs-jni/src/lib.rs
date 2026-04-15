@@ -119,9 +119,9 @@ pub extern "system" fn Java_org_forstdb_RocksDB_closeDatabase(
     }
 }
 
-/// `RocksDB.disposeInternal(long handle)` — release the Rust object.
+/// `RocksDB.disposeInternalNative(long handle)` — release the Rust object.
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_RocksDB_disposeInternal(
+pub extern "system" fn Java_org_forstdb_RocksDB_disposeInternalNative(
     _env: JNIEnv,
     _this: JObject,
     handle: jlong,
@@ -156,14 +156,14 @@ pub extern "system" fn Java_org_forstdb_RocksDB_get__JJ_3B(
     let result = if cf_handle == 0 {
         db.get(&key_bytes)
     } else {
-        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+        let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
             Some(cf) => cf,
             None => {
                 throw_rocks_exception(&mut env, "null column family handle");
                 return std::ptr::null_mut();
             }
         };
-        db.get_cf(cf, &key_bytes)
+        db.get_cf(&**cf_arc, &key_bytes)
     };
 
     match result {
@@ -218,14 +218,14 @@ pub extern "system" fn Java_org_forstdb_RocksDB_put__JJJ_3B_3B(
     let result = if cf_handle == 0 {
         db.put(&key_bytes, &val_bytes)
     } else {
-        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+        let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
             Some(cf) => cf,
             None => {
                 throw_rocks_exception(&mut env, "null column family handle");
                 return;
             }
         };
-        db.put_cf(cf, &key_bytes, &val_bytes)
+        db.put_cf(&**cf_arc, &key_bytes, &val_bytes)
     };
 
     if let Err(e) = result {
@@ -261,14 +261,14 @@ pub extern "system" fn Java_org_forstdb_RocksDB_delete__JJJ_3B(
     let result = if cf_handle == 0 {
         db.delete(&key_bytes)
     } else {
-        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+        let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
             Some(cf) => cf,
             None => {
                 throw_rocks_exception(&mut env, "null column family handle");
                 return;
             }
         };
-        db.delete_cf(cf, &key_bytes)
+        db.delete_cf(&**cf_arc, &key_bytes)
     };
 
     if let Err(e) = result {
@@ -313,7 +313,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_merge__JJJ_3B_3B(
     if cf_handle == 0 {
         batch.merge(key_bytes, val_bytes);
     } else {
-        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+        let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
             Some(cf) => cf,
             None => {
                 throw_rocks_exception(&mut env, "null column family handle");
@@ -321,7 +321,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_merge__JJJ_3B_3B(
             }
         };
         use st_rs::api::db::ColumnFamilyHandle;
-        batch.merge_cf(cf.id(), key_bytes, val_bytes);
+        batch.merge_cf(cf_arc.id(), key_bytes, val_bytes);
     }
 
     if let Err(e) = db.write(&batch) {
@@ -537,7 +537,7 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_put__JJ_3B_3B(
     if cf_handle == 0 {
         batch.put(k, v);
     } else {
-        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+        let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
             Some(cf) => cf,
             None => {
                 throw_rocks_exception(&mut env, "null column family handle");
@@ -545,7 +545,7 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_put__JJ_3B_3B(
             }
         };
         use st_rs::api::db::ColumnFamilyHandle;
-        batch.put_cf(cf.id(), k, v);
+        batch.put_cf(cf_arc.id(), k, v);
     }
 }
 
@@ -573,7 +573,7 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_delete__JJ_3B(
     if cf_handle == 0 {
         batch.delete(k);
     } else {
-        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+        let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
             Some(cf) => cf,
             None => {
                 throw_rocks_exception(&mut env, "null column family handle");
@@ -581,7 +581,7 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_delete__JJ_3B(
             }
         };
         use st_rs::api::db::ColumnFamilyHandle;
-        batch.delete_cf(cf.id(), k);
+        batch.delete_cf(cf_arc.id(), k);
     }
 }
 
@@ -617,7 +617,7 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_merge__JJ_3B_3B(
     if cf_handle == 0 {
         batch.merge(k, v);
     } else {
-        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+        let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
             Some(cf) => cf,
             None => {
                 throw_rocks_exception(&mut env, "null column family handle");
@@ -625,7 +625,7 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_merge__JJ_3B_3B(
             }
         };
         use st_rs::api::db::ColumnFamilyHandle;
-        batch.merge_cf(cf.id(), k, v);
+        batch.merge_cf(cf_arc.id(), k, v);
     }
 }
 

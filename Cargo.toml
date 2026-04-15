@@ -6,7 +6,7 @@ name = "st-rs"
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.75"
-description = "Rust port of ForSt Layer 0 — public API surface and platform abstraction traits (Status, Slice, FileSystem, DB, Iterator, Options, ...)"
+description = "Rust port of ForSt — a RocksDB-compatible LSM engine with WAL, memtable, SST, compaction, snapshots, column families, and Flink state-backend integration"
 license = "Apache-2.0"
 repository = "https://github.com/yangjie01/st-rs"
 readme = "README.md"
@@ -31,3 +31,11 @@ lz4 = ["lz4_flex"]
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Ensure panics don't unwind across the JNI boundary in st-rs-jni
+# (which is undefined behavior). With `panic = "abort"`, the process
+# exits cleanly instead of unwinding into the JVM's stack frames.
+panic = "abort"
+
+# Note: [profile.dev] does NOT set panic = "abort" because
+# the test harness needs unwinding to catch #[should_panic] tests
+# and report failures. JNI callers should use release builds.

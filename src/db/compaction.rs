@@ -12,39 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Port of `db/compaction/compaction_job.{h,cc}` simplified for
-//! Layer 4b.
+//! Port of `db/compaction/compaction_job.{h,cc}`.
 //!
-//! At Layer 4a, the engine flushes memtables into SST files but
-//! never deletes them — a long-running DB ends up with hundreds
-//! of L0 files and reads get linearly slower. Layer 4b adds
-//! compaction: when the live SST count crosses a threshold, the
-//! engine merges the oldest N SSTs into a single output SST and
-//! drops the inputs.
+//! When the live SST count crosses a threshold, the engine merges
+//! the oldest N SSTs into a single output SST and drops the inputs.
 //!
 //! # What's included
 //!
 //! - [`CompactionJob`] — runs a single compaction: open the input
-//!   SSTs as iterators, k-way merge them via the
-//!   [`MergingIterator`](crate::db::merging_iterator::MergingIterator),
-//!   write a single output SST, drop tombstones (since this is the
-//!   bottommost level — there's nothing older to shadow).
+//!   SSTs, sort by internal key, deduplicate (newest version wins),
+//!   apply snapshot-aware retention, run compaction filters, and
+//!   write a single output SST.
 //! - [`pick_compaction`] — picker policy: returns the indices of
-//!   the SSTs to compact, or `None` if no compaction is needed.
-//!
-//! # What's deferred to Layer 4c
-//!
-//! - **Multi-level layout (L0/L1/L2…)** — Layer 4b treats every
-//!   SST as if it lived at the same level. Compaction merges N
-//!   into 1 unconditionally. Picking by level + by overlap range
-//!   is a Layer 4c refinement.
-//! - **Background scheduling** — `CompactionJob::run` is called
-//!   synchronously by `DbImpl`. Layer 4c will spawn it on the
-//!   `StdThreadPool` from Layer 2.
-//! - **Snapshot retention** — without snapshots, every compaction
-//!   is "bottommost" and can drop tombstones outright.
-//! - **Range delete handling** — no range delete block at this
-//!   layer.
+//!   the SSTs to compact (oldest batch), or `None` if the SST
+//!   count is below the trigger.
+//! - Snapshot-aware retention: preserves versions needed by live
+//!   snapshots (`min_snap_seq`).
+//! - Compaction filter support: `Keep`, `Remove`, `ChangeValue`,
+//!   and `RemoveAndSkipUntil` decisions.
+//! - Tombstone handling: tombstones are dropped only when no live
+//!   snapshot needs them (bottommost compaction rule).
 
 use crate::core::status::Result;
 use crate::core::types::{EntryType, SequenceNumber, ValueType};

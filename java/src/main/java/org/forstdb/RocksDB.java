@@ -24,16 +24,14 @@ package org.forstdb;
  * <p>Use {@link #open(DBOptions, String)} to create a database, then call
  * {@link #close()} when finished to release native resources.</p>
  */
-public class RocksDB implements AutoCloseable {
+public class RocksDB extends RocksObject {
 
     static {
         NativeLibraryLoader.load();
     }
 
-    private long nativeHandle_;
-
     private RocksDB(final long nativeHandle) {
-        this.nativeHandle_ = nativeHandle;
+        super(nativeHandle);
     }
 
     /**
@@ -139,21 +137,19 @@ public class RocksDB implements AutoCloseable {
         return new ColumnFamilyHandle(cfHandle);
     }
 
-    // --- Handle ---
-
-    public long getNativeHandle() {
-        return nativeHandle_;
-    }
-
     // --- Close ---
 
     @Override
-    public void close() {
+    public synchronized void close() {
         if (nativeHandle_ != 0) {
             closeDatabase(nativeHandle_);
-            disposeInternal(nativeHandle_);
-            nativeHandle_ = 0;
         }
+        super.close();
+    }
+
+    @Override
+    protected void disposeInternal(final long handle) {
+        disposeInternalNative(handle);
     }
 
     // ---- Native methods ----
@@ -200,5 +196,5 @@ public class RocksDB implements AutoCloseable {
 
     private static native void closeDatabase(long dbHandle);
 
-    private static native void disposeInternal(long dbHandle);
+    private static native void disposeInternalNative(long dbHandle);
 }

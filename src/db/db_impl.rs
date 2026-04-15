@@ -12,45 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Port of `db/db_impl/db_impl.{h,cc}` — **minimum viable engine**.
+//! Port of `db/db_impl/db_impl.{h,cc}` — the st-rs LSM engine.
 //!
-//! This is the Layer 4a `Db`. It composes everything from Layers
-//! 0–3 into a working key-value store:
+//! This module composes everything from Layers 0–4g into a working
+//! key-value store:
 //!
 //! ```text
 //!   Put → write_lock acquire → WAL append → memtable insert → release
-//!   Get → memtable check → walk SSTs in newest-first order
+//!   Get → memtable check → immutable memtable → L0 (newest-first)
+//!       → L1 (binary search) → merge operand resolution
 //!   Flush → freeze memtable → write SST → swap in fresh memtable
-//!         → drop frozen memtable → fsync directory
-//!   Open → mkdir/lock → load CURRENT manifest → replay WAL into memtable
+//!         → update MANIFEST → fsync directory
+//!   Compaction → pick oldest L0 SSTs → merge into L1
+//!   Open → mkdir/lock → recover MANIFEST → replay WAL into memtable
 //! ```
 //!
 //! # What's included
 //!
 //! - DB lifecycle: `open`, `close`, reopen-with-WAL-replay
-//! - Single column family (the `default`)
-//! - `put`, `delete`, `single_delete`, `merge` (merge is treated as
-//!   value), `get`
-//! - Atomic `write` of a [`WriteBatch`]
-//! - Manual `flush` that turns the active memtable into an SST
-//! - Multi-SST point lookup (newest first)
+//! - Multiple column families with create/drop
+//! - `put`, `delete`, `single_delete`, `delete_range`, `merge`, `get`
+//! - Atomic `write` of a [`WriteBatch`] (including cross-CF batches)
+//! - Background flush via thread pool (immutable memtable pipeline)
+//! - Background compaction (L0 → L1, snapshot-aware retention,
+//!   compaction filters)
+//! - Multi-level layout: L0 (overlapping) + L1 (sorted, non-overlapping)
+//! - Explicit snapshots and snapshot-aware reads (`get_at`, `iter_at`)
+//! - Full merge operator support (merge operands across memtable + SSTs)
+//! - VersionEdit + MANIFEST persistence
+//! - SST ingestion (`ingest_external_file`)
+//! - Checkpoint support
+//! - Iterator API (`DbIterator` with merging iterator)
 //! - Crash-safe WAL: every write goes through the WAL before the
 //!   memtable, and reopens replay the WAL into a fresh memtable
-//!
-//! # What's deferred to Layer 4b
-//!
-//! - Background flush thread (today's `flush()` is synchronous)
-//! - Compaction (SSTs accumulate forever; in real use a layer 4b
-//!   compaction job will merge them)
-//! - True `Db` trait method shape: `new_iterator`, `snapshot`,
-//!   column families beyond default, multi-CF transactions
-//! - Group commit / write thread (today's writes hold a single big
-//!   mutex)
-//! - VersionEdit + Manifest (today's "manifest" is a flat list of
-//!   SST file numbers persisted in CURRENT as a single line)
-//! - Range deletion handling
-//! - Snapshots beyond the implicit "now" view
-//! - Iterator API (we expose `iter` over the memtable only for tests)
 //!
 //! # File layout on disk
 //!
@@ -1401,6 +1395,12 @@ impl DbImpl {
         // 5. Check range tombstones. A range tombstone at seq S
         //    covering [start, end) shadows any read of a key in
         //    that range if S <= read_seq.
+        //
+        //    INVARIANT: In-memory range tombstones are cleared on flush.
+        //    Any Put with seq > tombstone_seq is either (a) in the memtable
+        //    (found before this check via the fast path) or (b) flushed to
+        //    an SST, in which case the tombstone was also cleared. So this
+        //    check only applies to SST values with seq < tombstone_seq.
         for (start, end, tomb_seq) in &range_tombstones {
             if *tomb_seq <= read_seq
                 && key >= start.as_slice()
@@ -5491,7 +5491,12 @@ mod tests {
     #[test]
     fn delete_range_basic() {
         let dir = temp_dir("delete-range-basic");
-        let db = DbImpl::open(&opts(), &dir).unwrap();
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
         db.put(b"a", b"va").unwrap();
         db.put(b"b", b"vb").unwrap();
         db.put(b"c", b"vc").unwrap();
@@ -5593,7 +5598,12 @@ mod tests {
     #[test]
     fn delete_range_with_snapshot() {
         let dir = temp_dir("delete-range-snapshot");
-        let db = DbImpl::open(&opts(), &dir).unwrap();
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
 
         db.put(b"a", b"va").unwrap();
         db.put(b"b", b"vb").unwrap();

@@ -36,7 +36,6 @@
 //! | 5     | Optional features (checkpoint)   | [`utilities::checkpoint`]                            |
 //! | 7     | ForSt Flink bridge              | [`flink`] (`FlinkFileSystem` + `FlinkFsBackend` + `InMemoryFsBackend`) |
 //! | 6     | Tools & stress                   | *deferred*                                          |
-//! | 7     | ForSt-specific Flink bridge      | *deferred*                                          |
 //!
 //! ## Module organisation
 //!

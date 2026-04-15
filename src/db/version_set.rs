@@ -324,11 +324,14 @@ impl VersionSet {
         let writer_file = WritableFileWriter::new(wf);
         let mut writer = LogWriter::new(writer_file);
 
-        // Write a snapshot edit containing all current state.
-        let snapshot = self.build_snapshot_edit();
-        let mut buf = Vec::new();
-        snapshot.encode_to(&mut buf);
-        writer.add_record(&buf)?;
+        // Write snapshot edits containing all current state (one for
+        // default CF + counters, then one per non-default CF).
+        let snapshots = self.build_snapshot_edits();
+        for snapshot in &snapshots {
+            let mut buf = Vec::new();
+            snapshot.encode_to(&mut buf);
+            writer.add_record(&buf)?;
+        }
         writer.sync()?;
 
         self.manifest_writer = Some(writer);
@@ -336,24 +339,54 @@ impl VersionSet {
         Ok(())
     }
 
-    /// Build a `VersionEdit` that captures the entire current state.
-    fn build_snapshot_edit(&self) -> VersionEdit {
-        let mut edit = VersionEdit::new();
-        edit.next_file_number = Some(self.next_file_number);
-        edit.last_sequence = Some(self.last_sequence);
-        edit.log_number = Some(self.log_number);
+    /// Build a list of `VersionEdit`s that capture the entire current
+    /// state. The first edit contains counters and default CF files.
+    /// Subsequent edits each create a non-default CF and add its files.
+    fn build_snapshot_edits(&self) -> Vec<VersionEdit> {
+        let mut edits = Vec::new();
 
-        // Emit all files for the default CF.
+        // First edit: counters + default CF files.
+        let mut base_edit = VersionEdit::new();
+        base_edit.next_file_number = Some(self.next_file_number);
+        base_edit.last_sequence = Some(self.last_sequence);
+        base_edit.log_number = Some(self.log_number);
+
         if let Some(cf_state) = self.cf_files.get(&DEFAULT_CF_ID) {
             for meta in &cf_state.l0 {
-                edit.new_files.push((0, meta.clone()));
+                base_edit.new_files.push((0, meta.clone()));
             }
             for meta in &cf_state.l1 {
-                edit.new_files.push((1, meta.clone()));
+                base_edit.new_files.push((1, meta.clone()));
             }
         }
+        edits.push(base_edit);
 
-        edit
+        // One edit per non-default CF: create the CF + add its files.
+        let mut cf_ids: Vec<ColumnFamilyId> = self
+            .cf_files
+            .keys()
+            .copied()
+            .filter(|id| *id != DEFAULT_CF_ID)
+            .collect();
+        cf_ids.sort();
+        for cf_id in cf_ids {
+            let mut cf_edit = VersionEdit::new();
+            if let Some(cf_name) = self.cf_names.get(&cf_id) {
+                cf_edit.is_column_family_add = Some(cf_name.clone());
+            }
+            cf_edit.column_family_id = Some(cf_id);
+            if let Some(cf_state) = self.cf_files.get(&cf_id) {
+                for meta in &cf_state.l0 {
+                    cf_edit.new_files.push((0, meta.clone()));
+                }
+                for meta in &cf_state.l1 {
+                    cf_edit.new_files.push((1, meta.clone()));
+                }
+            }
+            edits.push(cf_edit);
+        }
+
+        edits
     }
 
     /// Read an entire small file into a `String`.
