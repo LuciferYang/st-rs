@@ -105,6 +105,11 @@ pub struct DbOptions {
 
     /// Comparator name to sanity-check at open time. Empty means "any".
     pub expected_comparator_name: String,
+
+    /// Size in bytes of the shared block cache for SST data blocks.
+    /// 0 means no cache. When > 0, an `LruCache` of this capacity
+    /// is created and shared across all table readers.
+    pub block_cache_size: usize,
 }
 
 impl Default for DbOptions {
@@ -132,6 +137,7 @@ impl Default for DbOptions {
             use_direct_io_for_flush_and_compaction: false,
             db_write_buffer_size: 0,
             expected_comparator_name: String::new(),
+            block_cache_size: 0,
         }
     }
 }

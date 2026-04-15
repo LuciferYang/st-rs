@@ -39,5 +39,7 @@
 //! | `java/flinktestmock/` | [`mock_backend`] |
 
 pub mod backend;
+pub mod compaction_filter;
 pub mod flink_file_system;
 pub mod mock_backend;
+pub mod state_backend;

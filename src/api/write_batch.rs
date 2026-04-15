@@ -134,8 +134,18 @@ impl WriteBatch {
 
     /// Delete every key in `[begin, end)` in the default column family.
     pub fn delete_range(&mut self, begin: impl Into<Vec<u8>>, end: impl Into<Vec<u8>>) {
+        self.delete_range_cf(DEFAULT_CF, begin, end);
+    }
+
+    /// Delete every key in `[begin, end)` in the given column family.
+    pub fn delete_range_cf(
+        &mut self,
+        cf: ColumnFamilyId,
+        begin: impl Into<Vec<u8>>,
+        end: impl Into<Vec<u8>>,
+    ) {
         self.records.push(Record::DeleteRange {
-            cf: DEFAULT_CF,
+            cf,
             begin: begin.into(),
             end: end.into(),
         });
@@ -145,6 +155,20 @@ impl WriteBatch {
     pub fn merge(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
         self.records.push(Record::Merge {
             cf: DEFAULT_CF,
+            key: key.into(),
+            value: value.into(),
+        });
+    }
+
+    /// Append a merge operand to `key` in a specific column family.
+    pub fn merge_cf(
+        &mut self,
+        cf: ColumnFamilyId,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) {
+        self.records.push(Record::Merge {
+            cf,
             key: key.into(),
             value: value.into(),
         });

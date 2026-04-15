@@ -81,6 +81,9 @@ pub struct BlockBasedTableOptions {
     /// Bloom filter tuning. `None` disables filters entirely (the
     /// SST then has no filter block and no metaindex entry for one).
     pub bloom_filter_bits_per_key: Option<u32>,
+    /// Compression type for data blocks. 0=None, 1=Snappy, 4=LZ4.
+    /// Default 0 (no compression) for backward compatibility.
+    pub compression_type: u8,
 }
 
 impl Default for BlockBasedTableOptions {
@@ -89,6 +92,7 @@ impl Default for BlockBasedTableOptions {
             block_size: 4 * 1024,
             block_restart_interval: DEFAULT_BLOCK_RESTART_INTERVAL,
             bloom_filter_bits_per_key: Some(10),
+            compression_type: 0,
         }
     }
 }
@@ -208,13 +212,27 @@ impl BlockBasedTableBuilder {
     /// and return the handle that points at it (offset + raw size,
     /// **not** including the trailer).
     fn write_block(&mut self, data: &[u8]) -> Result<BlockHandle> {
-        let handle = BlockHandle::new(self.offset, data.len() as u64);
+        // Compress if requested. If compression is disabled (type 0),
+        // skip the compress call entirely to avoid a needless copy.
+        let (block_bytes_owned, actual_type) = if self.opts.compression_type != 0 {
+            match crate::sst::format::compress_block(data, self.opts.compression_type) {
+                Ok(compressed) if compressed.len() < data.len() => {
+                    (compressed, self.opts.compression_type)
+                }
+                _ => (data.to_vec(), 0u8), // fallback to uncompressed
+            }
+        } else {
+            (data.to_vec(), 0u8)
+        };
+        let block_bytes = block_bytes_owned.as_slice();
+
+        let handle = BlockHandle::new(self.offset, block_bytes.len() as u64);
         let io = IoOptions::default();
-        self.writer.append(data, &io)?;
+        self.writer.append(block_bytes, &io)?;
         let mut trailer = Vec::with_capacity(BLOCK_TRAILER_SIZE);
-        put_block_trailer(&mut trailer, 0, data); // 0 = no compression
+        put_block_trailer(&mut trailer, actual_type, block_bytes);
         self.writer.append(&trailer, &io)?;
-        self.offset += data.len() as u64 + BLOCK_TRAILER_SIZE as u64;
+        self.offset += block_bytes.len() as u64 + BLOCK_TRAILER_SIZE as u64;
         Ok(handle)
     }
 

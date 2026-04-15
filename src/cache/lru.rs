@@ -191,6 +191,16 @@ impl LruCache {
             name,
         }
     }
+
+    /// Configured capacity in bytes.
+    pub fn capacity(&self) -> usize {
+        self.inner.lock().unwrap().capacity
+    }
+
+    /// Current usage in bytes (sum of charges of all cached entries).
+    pub fn usage(&self) -> usize {
+        self.inner.lock().unwrap().usage
+    }
 }
 
 /// Handle returned to users from [`Cache::insert`] / [`Cache::lookup`].

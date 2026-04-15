@@ -72,10 +72,14 @@ pub struct MemTable {
 /// Result of a successful memtable point lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemTableGetResult {
-    /// Latest entry for this user key is a live value.
+    /// Latest entry for this user key is a live value (Put).
     Found(Vec<u8>),
     /// Latest entry is a tombstone — the key is explicitly deleted.
     Deleted,
+    /// Latest entry is a Merge operand. The value is the operand.
+    /// The caller must collect subsequent merge operands and apply
+    /// the merge operator.
+    MergeOperand(Vec<u8>),
     /// No entry for this user key at or below the lookup sequence.
     NotFound,
 }
@@ -168,9 +172,11 @@ impl MemTable {
         }
 
         match parsed.value_type {
-            ValueType::Value | ValueType::Merge => {
-                // Simplification: treat Merge as Value for now.
+            ValueType::Value => {
                 MemTableGetResult::Found(it.value().to_vec())
+            }
+            ValueType::Merge => {
+                MemTableGetResult::MergeOperand(it.value().to_vec())
             }
             ValueType::Deletion | ValueType::SingleDeletion => MemTableGetResult::Deleted,
             // Range deletions are handled by a separate aggregator
@@ -180,6 +186,54 @@ impl MemTable {
             // support; treat as not-found for now.
             ValueType::BlobIndex | ValueType::WideColumnEntity => MemTableGetResult::NotFound,
         }
+    }
+
+    /// Collect all merge operands (newest-first) for `key` at the
+    /// given lookup sequence, plus any base value (Put). Used by
+    /// the engine to assemble operands for `MergeOperator::full_merge`.
+    ///
+    /// Returns `(base_value, operands_oldest_first)` where
+    /// `base_value` is the underlying Put value (if any) and
+    /// `operands` are the Merge operand values in oldest-first order.
+    pub fn collect_merge_operands(
+        &self,
+        lookup: &LookupKey,
+    ) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut it = self.list.iter();
+        it.seek(lookup.internal_key());
+
+        let user_cmp = self.comparator.user_comparator();
+        let mut operands = Vec::new();
+        let mut base_value = None;
+
+        while it.valid() {
+            let parsed = match ParsedInternalKey::parse(it.key()) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            // Stop at a different user key.
+            if user_cmp.cmp(parsed.user_key, lookup.user_key()) != std::cmp::Ordering::Equal {
+                break;
+            }
+            match parsed.value_type {
+                ValueType::Merge => {
+                    operands.push(it.value().to_vec());
+                }
+                ValueType::Value => {
+                    base_value = Some(it.value().to_vec());
+                    break; // Put stops the chain.
+                }
+                ValueType::Deletion | ValueType::SingleDeletion => {
+                    break; // Tombstone stops the chain — no base value.
+                }
+                _ => break,
+            }
+            it.next();
+        }
+        // Operands are collected newest-first (skip list order is
+        // user_key asc, seq desc). full_merge expects oldest-first.
+        operands.reverse();
+        (base_value, operands)
     }
 
     /// Iterate over every entry in sorted internal-key order. The

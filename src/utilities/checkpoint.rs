@@ -59,7 +59,7 @@ use crate::core::status::{Result, Status};
 use crate::db::db_impl::DbImpl;
 use crate::env::file_system::FileSystem;
 use crate::file::filename::{
-    make_current_file_name, make_lock_file_name, make_table_file_name,
+    make_current_file_name, make_descriptor_file_name, make_lock_file_name, make_table_file_name,
 };
 use std::path::Path;
 
@@ -101,7 +101,10 @@ pub fn create_checkpoint(db: &DbImpl, checkpoint_dir: &Path) -> Result<()> {
     // 3. Create the target directory.
     fs.create_dir_if_missing(checkpoint_dir)?;
 
-    // 4. Hard-link (or copy) each SST.
+    // 4. Snapshot the MANIFEST file number so cleanup knows about it.
+    let manifest_number = db.manifest_file_number();
+
+    // 5. Hard-link (or copy) each SST.
     for &num in &sst_numbers {
         let src = make_table_file_name(&db_path, num);
         let dst = make_table_file_name(checkpoint_dir, num);
@@ -114,13 +117,23 @@ pub fn create_checkpoint(db: &DbImpl, checkpoint_dir: &Path) -> Result<()> {
             }
             Err(e) => {
                 // Unexpected error — clean up and propagate.
-                let _ = cleanup(fs.as_ref(), checkpoint_dir, &sst_numbers);
+                let _ = cleanup(fs.as_ref(), checkpoint_dir, &sst_numbers, manifest_number);
                 return Err(e);
             }
         }
     }
 
-    // 5. Copy the CURRENT file. We copy rather than link
+    // 5. Copy the MANIFEST file (if one exists). The MANIFEST
+    //    is append-only during the DB's lifetime; we copy rather
+    //    than hard-link to get a consistent snapshot of it.
+    let manifest_number = db.manifest_file_number();
+    if manifest_number > 0 {
+        let src_manifest = make_descriptor_file_name(&db_path, manifest_number);
+        let dst_manifest = make_descriptor_file_name(checkpoint_dir, manifest_number);
+        crate::file::file_util::copy_file(fs.as_ref(), &src_manifest, &dst_manifest)?;
+    }
+
+    // 6. Copy the CURRENT file. We copy rather than link
     //    because the source DB may rewrite CURRENT at any time
     //    (it's atomically replaced via tmp+rename on every
     //    flush/compaction).
@@ -132,11 +145,17 @@ pub fn create_checkpoint(db: &DbImpl, checkpoint_dir: &Path) -> Result<()> {
 }
 
 /// Best-effort cleanup of a partially-created checkpoint.
-fn cleanup(fs: &dyn FileSystem, dir: &Path, sst_numbers: &[u64]) -> Result<()> {
+fn cleanup(fs: &dyn FileSystem, dir: &Path, sst_numbers: &[u64], manifest_number: u64) -> Result<()> {
     for &num in sst_numbers {
         let p = make_table_file_name(dir, num);
         if fs.file_exists(&p)? {
             fs.delete_file(&p)?;
+        }
+    }
+    if manifest_number > 0 {
+        let manifest = make_descriptor_file_name(dir, manifest_number);
+        if fs.file_exists(&manifest)? {
+            fs.delete_file(&manifest)?;
         }
     }
     let current = make_current_file_name(dir);

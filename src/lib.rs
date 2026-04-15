@@ -98,7 +98,7 @@ pub use crate::ext::compaction_filter::{
 };
 pub use crate::ext::comparator::{BytewiseComparator, Comparator, ReverseBytewiseComparator};
 pub use crate::ext::filter_policy::{FilterBitsBuilder, FilterBitsReader, FilterPolicy};
-pub use crate::ext::merge_operator::MergeOperator;
+pub use crate::ext::merge_operator::{MergeOperator, StringAppendOperator};
 pub use crate::ext::table::{IndexType, TableFactory, TableFormatVersion};
 
 // ---------- Layer 1 re-exports ----------
@@ -142,7 +142,7 @@ pub use crate::memtable::skip_list::{SkipList, SkipListIter, BRANCHING_FACTOR, M
 pub use crate::sst::block_based::block::{Block, BlockIter};
 pub use crate::sst::block_based::block_builder::{BlockBuilder, DEFAULT_BLOCK_RESTART_INTERVAL};
 pub use crate::sst::format::{
-    put_block_trailer, verify_block_trailer, BlockHandle, Footer,
+    compress_block, decompress_block, put_block_trailer, verify_block_trailer, BlockHandle, Footer,
     BLOCK_BASED_TABLE_MAGIC_NUMBER, BLOCK_TRAILER_SIZE, DEFAULT_FORMAT_VERSION,
     MAX_BLOCK_HANDLE_ENCODED_LENGTH,
 };
@@ -156,11 +156,11 @@ pub use crate::sst::block_based::filter_block::{
 pub use crate::sst::block_based::table_builder::{
     BlockBasedTableBuilder, BlockBasedTableOptions,
 };
-pub use crate::sst::block_based::table_reader::BlockBasedTableReader;
+pub use crate::sst::block_based::table_reader::{BlockBasedTableReader, BlockCache};
 
 // ---------- Layer 4a re-exports ----------
 
-pub use crate::db::db_impl::DbImpl;
+pub use crate::db::db_impl::{ColumnFamilyHandleImpl, DbImpl, LiveFileMetaData};
 pub use crate::db::log_format::{RecordType, BLOCK_SIZE as WAL_BLOCK_SIZE, HEADER_SIZE as WAL_HEADER_SIZE};
 pub use crate::db::log_reader::LogReader;
 pub use crate::db::log_writer::LogWriter;
@@ -181,6 +181,10 @@ pub use crate::util::heap::BinaryHeap;
 pub use crate::db::db_impl::DbSnapshot;
 pub use crate::db::db_iter::READ_AT_LATEST;
 
+// ---------- SST ingestion re-exports ----------
+
+pub use crate::db::ingest_external_file::{IngestExternalFileOptions, validate_sst};
+
 // ---------- Layer 5 re-exports ----------
 
 pub use crate::utilities::checkpoint::create_checkpoint;
@@ -188,5 +192,7 @@ pub use crate::utilities::checkpoint::create_checkpoint;
 // ---------- Layer 7 re-exports ----------
 
 pub use crate::flink::backend::{FlinkFileStatus, FlinkFsBackend};
+pub use crate::flink::compaction_filter::{TtlCompactionFilter, TtlCompactionFilterFactory};
 pub use crate::flink::flink_file_system::FlinkFileSystem;
 pub use crate::flink::mock_backend::InMemoryFsBackend;
+pub use crate::flink::state_backend::FlinkStateBackend;

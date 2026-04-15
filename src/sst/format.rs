@@ -256,6 +256,60 @@ pub fn put_block_trailer(dst: &mut Vec<u8>, compression_type: u8, block_bytes: &
     put_fixed32(dst, checksum);
 }
 
+/// Compress `data` according to `compression_type`. Returns
+/// `Ok(compressed_bytes)` or `Err` if the compression type is
+/// unsupported or the compressor fails.
+///
+/// CompressionType byte values: 0=None, 1=Snappy, 4=LZ4.
+pub fn compress_block(data: &[u8], compression_type: u8) -> Result<Vec<u8>> {
+    match compression_type {
+        0 => Ok(data.to_vec()),
+        #[cfg(feature = "snappy")]
+        1 => snap::raw::Encoder::new()
+            .compress_vec(data)
+            .map_err(|e| Status::corruption(format!("snappy compression failed: {e}"))),
+        #[cfg(not(feature = "snappy"))]
+        1 => Err(Status::not_supported(
+            "snappy compression requested but 'snappy' feature is not enabled",
+        )),
+        #[cfg(feature = "lz4")]
+        4 => Ok(lz4_flex::compress_prepend_size(data)),
+        #[cfg(not(feature = "lz4"))]
+        4 => Err(Status::not_supported(
+            "lz4 compression requested but 'lz4' feature is not enabled",
+        )),
+        _ => Err(Status::not_supported(format!(
+            "unknown compression type {compression_type}"
+        ))),
+    }
+}
+
+/// Decompress a block read from disk. `compression_type` comes from
+/// the trailer byte.
+pub fn decompress_block(data: &[u8], compression_type: u8) -> Result<Vec<u8>> {
+    match compression_type {
+        0 => Ok(data.to_vec()),
+        #[cfg(feature = "snappy")]
+        1 => snap::raw::Decoder::new()
+            .decompress_vec(data)
+            .map_err(|e| Status::corruption(format!("snappy decompression failed: {e}"))),
+        #[cfg(not(feature = "snappy"))]
+        1 => Err(Status::not_supported(
+            "snappy decompression requested but 'snappy' feature is not enabled",
+        )),
+        #[cfg(feature = "lz4")]
+        4 => lz4_flex::decompress_size_prepended(data)
+            .map_err(|e| Status::corruption(format!("lz4 decompression failed: {e}"))),
+        #[cfg(not(feature = "lz4"))]
+        4 => Err(Status::not_supported(
+            "lz4 decompression requested but 'lz4' feature is not enabled",
+        )),
+        _ => Err(Status::not_supported(format!(
+            "unknown compression type {compression_type}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

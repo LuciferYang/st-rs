@@ -33,9 +33,10 @@
 //!   layer.
 
 use crate::core::status::Result;
-use crate::core::types::{SequenceNumber, ValueType};
+use crate::core::types::{EntryType, SequenceNumber, ValueType};
 use crate::db::dbformat::ParsedInternalKey;
 use crate::env::file_system::FileSystem;
+use crate::ext::compaction_filter::{CompactionDecision, CompactionFilter};
 use crate::file::writable_file_writer::WritableFileWriter;
 use crate::sst::block_based::table_builder::{
     BlockBasedTableBuilder, BlockBasedTableOptions,
@@ -112,6 +113,9 @@ pub struct CompactionJob<'a> {
     /// the retention rule then collapses to the Layer 4d
     /// behaviour of keeping only the newest version per user key.
     min_snap_seq: SequenceNumber,
+    /// Optional compaction filter. Applied to each entry the
+    /// retention rule would emit. Can drop, keep, or rewrite entries.
+    compaction_filter: Option<Box<dyn CompactionFilter>>,
 }
 
 impl<'a> CompactionJob<'a> {
@@ -129,6 +133,7 @@ impl<'a> CompactionJob<'a> {
             output_path,
             table_options,
             min_snap_seq: SequenceNumber::MAX,
+            compaction_filter: None,
         }
     }
 
@@ -137,6 +142,13 @@ impl<'a> CompactionJob<'a> {
     #[must_use]
     pub fn with_min_snap_seq(mut self, min_snap_seq: SequenceNumber) -> Self {
         self.min_snap_seq = min_snap_seq;
+        self
+    }
+
+    /// Builder: set a compaction filter.
+    #[must_use]
+    pub fn with_compaction_filter(mut self, filter: Box<dyn CompactionFilter>) -> Self {
+        self.compaction_filter = Some(filter);
         self
     }
 
@@ -252,24 +264,52 @@ impl<'a> CompactionJob<'a> {
 
             match parsed.value_type {
                 ValueType::Value | ValueType::Merge => {
-                    tb.add(ikey, value)?;
-                    written += 1;
+                    // Apply compaction filter if present. Merge entries
+                    // are only filtered if allow_merge() returns true.
+                    let should_filter = self.compaction_filter.as_ref().is_some_and(|f| {
+                        parsed.value_type != ValueType::Merge || f.allow_merge()
+                    });
+                    if should_filter {
+                        let filter = self.compaction_filter.as_ref().unwrap();
+                        let entry_type = match parsed.value_type {
+                            ValueType::Value => EntryType::Put,
+                            ValueType::Merge => EntryType::Merge,
+                            _ => EntryType::Other,
+                        };
+                        // Output level is always 1 (L0→L1 compaction).
+                        match filter.filter(1, parsed.user_key, entry_type, value) {
+                            CompactionDecision::Keep => {
+                                tb.add(ikey, value)?;
+                                written += 1;
+                            }
+                            CompactionDecision::Remove => {
+                                // Filtered out — don't write to output.
+                            }
+                            CompactionDecision::ChangeValue(new_val) => {
+                                tb.add(ikey, &new_val)?;
+                                written += 1;
+                            }
+                            CompactionDecision::RemoveAndSkipUntil(_skip_key) => {
+                                // TODO: implement skip-until semantics.
+                                // For now, treat as Remove (drops only this
+                                // entry, does NOT skip ahead). Flink's
+                                // FlinkCompactionFilter does not use this
+                                // variant, so the simplification is safe
+                                // for the Flink integration path.
+                            }
+                        }
+                    } else {
+                        tb.add(ikey, value)?;
+                        written += 1;
+                    }
                 }
                 ValueType::Deletion | ValueType::SingleDeletion => {
                     if !drop_tombstones {
                         tb.add(ikey, value)?;
                         written += 1;
                     }
-                    // Else: no snapshot needs the version below
-                    // this tombstone, so the tombstone can be
-                    // dropped outright (bottommost behaviour).
                 }
-                _ => {
-                    // Range deletions / blob indices / wide-column
-                    // aren't supported in point-lookup/iter at
-                    // this layer; drop them rather than writing
-                    // an unrecognised value into the output.
-                }
+                _ => {}
             }
         }
         tb.finish()?;

@@ -34,14 +34,21 @@
 //!   blocks** at open. Layer 3b's `read_block` *does* verify the
 //!   checksum on every read, so corruption surfaces lazily.
 
+use crate::cache::lru::LruCache;
 use crate::core::status::{Result, Status};
 use crate::env::file_system::IoOptions;
+use crate::ext::cache::{Cache, CachePriority};
 use crate::ext::filter_policy::FilterBitsReader;
 use crate::file::random_access_file_reader::RandomAccessFileReader;
 use crate::sst::block_based::block::Block;
 use crate::sst::block_based::filter_block::{BloomFilterReader, FILTER_METAINDEX_KEY};
-use crate::sst::format::{verify_block_trailer, BlockHandle, Footer, BLOCK_TRAILER_SIZE};
+use crate::sst::format::{
+    decompress_block, verify_block_trailer, BlockHandle, Footer, BLOCK_TRAILER_SIZE,
+};
 use std::sync::Arc;
+
+/// Thread-safe block cache shared across all table readers.
+pub type BlockCache = Arc<LruCache>;
 
 /// SST reader. Cheap to clone via `Arc` once constructed.
 pub struct BlockBasedTableReader {
@@ -53,6 +60,10 @@ pub struct BlockBasedTableReader {
     filter: Option<BloomFilterReader>,
     /// Cached file size (== `file.file_size()`).
     file_size: u64,
+    /// Optional shared block cache.
+    block_cache: Option<BlockCache>,
+    /// Unique ID for cache key construction (file number or path hash).
+    cache_id: u64,
 }
 
 impl BlockBasedTableReader {
@@ -60,6 +71,18 @@ impl BlockBasedTableReader {
     /// cloned cheaply between threads — `RandomAccessFileReader` is
     /// `Sync` (Layer 2 guaranteed it).
     pub fn open(file: Arc<RandomAccessFileReader>) -> Result<Self> {
+        Self::open_with_cache(file, None, 0)
+    }
+
+    /// Open an SST file with an optional shared block cache.
+    ///
+    /// `cache_id` should be unique per SST (e.g. the file number).
+    /// It is combined with the block offset to form the cache key.
+    pub fn open_with_cache(
+        file: Arc<RandomAccessFileReader>,
+        cache: Option<BlockCache>,
+        cache_id: u64,
+    ) -> Result<Self> {
         let file_size = file.file_size();
         if file_size < Footer::ENCODED_LENGTH as u64 {
             return Err(Status::corruption(format!(
@@ -100,6 +123,8 @@ impl BlockBasedTableReader {
             index_block,
             filter,
             file_size,
+            block_cache: cache,
+            cache_id,
         })
     }
 
@@ -123,7 +148,7 @@ impl BlockBasedTableReader {
         let (handle, _) = BlockHandle::decode_from(index_iter.value())?;
 
         // Step 3: read the data block and look up the key inside it.
-        let block_bytes = read_block(&self.file, handle)?;
+        let block_bytes = self.read_block_bytes(handle)?;
         let block = Block::new(block_bytes)?;
         let mut it = block.iter();
         it.seek(key);
@@ -174,14 +199,46 @@ impl BlockBasedTableReader {
     /// Read the data block at `handle` (verifying its trailer) and
     /// return the payload bytes. Public-in-crate so the SST iterator
     /// can fetch the next data block on demand.
+    ///
+    /// If a block cache is configured, checks the cache first and
+    /// inserts the decompressed result on a miss.
     pub(crate) fn read_block_bytes(&self, handle: BlockHandle) -> Result<Vec<u8>> {
-        read_block(&self.file, handle)
+        // Build cache key: cache_id (8 LE) + offset (8 LE) = 16 bytes.
+        let cache_key = make_cache_key(self.cache_id, handle.offset);
+
+        // Check cache first.
+        if let Some(cache) = &self.block_cache {
+            if let Some(h) = cache.lookup(&cache_key) {
+                return Ok(h.value().to_vec());
+            }
+        }
+
+        // Cache miss — read from file.
+        let bytes = read_block(&self.file, handle)?;
+
+        // Insert into cache.
+        if let Some(cache) = &self.block_cache {
+            let charge = bytes.len();
+            // Ignore insert errors (e.g. entry too large for cache).
+            let _ = cache.insert(&cache_key, bytes.clone(), charge, CachePriority::Low);
+        }
+
+        Ok(bytes)
     }
+}
+
+/// Build a 16-byte cache key from `cache_id` and `block_offset`.
+fn make_cache_key(cache_id: u64, block_offset: u64) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    key[..8].copy_from_slice(&cache_id.to_le_bytes());
+    key[8..].copy_from_slice(&block_offset.to_le_bytes());
+    key
 }
 
 /// Read `block_handle.size` bytes plus the trailing
 /// [`BLOCK_TRAILER_SIZE`] bytes from `file`, verify the checksum,
-/// and return the block bytes (without the trailer).
+/// decompress if needed, and return the block bytes (without the
+/// trailer).
 fn read_block(file: &Arc<RandomAccessFileReader>, handle: BlockHandle) -> Result<Vec<u8>> {
     let total = handle.size as usize + BLOCK_TRAILER_SIZE;
     let mut buf = vec![0u8; total];
@@ -193,8 +250,10 @@ fn read_block(file: &Arc<RandomAccessFileReader>, handle: BlockHandle) -> Result
         )));
     }
     let (block_bytes, trailer) = buf.split_at(handle.size as usize);
-    verify_block_trailer(block_bytes, trailer)?;
-    Ok(block_bytes.to_vec())
+    let compression_byte = verify_block_trailer(block_bytes, trailer)?;
+
+    // Decompress if needed.
+    decompress_block(block_bytes, compression_byte)
 }
 
 #[cfg(test)]
@@ -410,6 +469,139 @@ mod tests {
         match result {
             Err(e) => assert!(e.is_corruption()),
             Ok(v) => assert_ne!(v, Some(b"xyz".to_vec()), "tampered byte must affect output"),
+        }
+    }
+
+    // ---- Phase 4: Block cache tests ----
+
+    fn open_table_with_cache(
+        file: Arc<InMemoryFile>,
+        cache: BlockCache,
+        cache_id: u64,
+    ) -> BlockBasedTableReader {
+        let reader: Box<dyn FsRandomAccessFile> = Box::new(InMemoryReader {
+            file: Arc::clone(&file),
+        });
+        let reader = RandomAccessFileReader::new(reader, "test").expect("size lookup");
+        BlockBasedTableReader::open_with_cache(Arc::new(reader), Some(cache), cache_id).unwrap()
+    }
+
+    #[test]
+    fn block_cache_hit_on_second_read() {
+        let cache: BlockCache = Arc::new(crate::cache::lru::LruCache::new(1024 * 1024));
+        let file = build_table(
+            &[(b"k1" as &[u8], b"v1" as &[u8])],
+            BlockBasedTableOptions::default(),
+        );
+        let reader = open_table_with_cache(file, Arc::clone(&cache), 42);
+
+        // First read — cache miss.
+        assert_eq!(reader.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+        let usage_after_first = cache.get_usage();
+        assert!(usage_after_first > 0, "cache should have entries");
+
+        // Second read — cache hit.
+        assert_eq!(reader.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+        let usage_after_second = cache.get_usage();
+        assert_eq!(
+            usage_after_first, usage_after_second,
+            "usage should not change on cache hit"
+        );
+    }
+
+    #[test]
+    fn block_cache_shared_across_readers() {
+        let cache: BlockCache = Arc::new(crate::cache::lru::LruCache::new(1024 * 1024));
+
+        let file1 = build_table(
+            &[(b"a" as &[u8], b"1" as &[u8])],
+            BlockBasedTableOptions::default(),
+        );
+        let file2 = build_table(
+            &[(b"b" as &[u8], b"2" as &[u8])],
+            BlockBasedTableOptions::default(),
+        );
+
+        let reader1 = open_table_with_cache(file1, Arc::clone(&cache), 100);
+        let reader2 = open_table_with_cache(file2, Arc::clone(&cache), 200);
+
+        assert_eq!(reader1.get(b"a").unwrap(), Some(b"1".to_vec()));
+        let usage1 = cache.get_usage();
+
+        assert_eq!(reader2.get(b"b").unwrap(), Some(b"2".to_vec()));
+        let usage2 = cache.get_usage();
+
+        // Both readers contributed to the same shared cache.
+        assert!(usage2 > usage1, "second reader should add to the shared cache");
+    }
+
+    // ---- Phase 5: Compression tests ----
+
+    #[cfg(feature = "snappy")]
+    #[test]
+    fn snappy_compression_roundtrip() {
+        let records_owned: Vec<(Vec<u8>, Vec<u8>)> = (0..200u32)
+            .map(|i| {
+                (
+                    format!("key{i:05}").into_bytes(),
+                    format!("value{i}").into_bytes(),
+                )
+            })
+            .collect();
+        let records: Vec<(&[u8], &[u8])> = records_owned
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        let opts = BlockBasedTableOptions {
+            block_size: 256,
+            compression_type: 1, // Snappy
+            ..Default::default()
+        };
+        let file = build_table(&records, opts);
+        let reader = open_table(file);
+
+        for (k, v) in &records {
+            assert_eq!(
+                reader.get(k).unwrap(),
+                Some(v.to_vec()),
+                "snappy roundtrip failed for key {:?}",
+                String::from_utf8_lossy(k)
+            );
+        }
+    }
+
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn lz4_compression_roundtrip() {
+        let records_owned: Vec<(Vec<u8>, Vec<u8>)> = (0..200u32)
+            .map(|i| {
+                (
+                    format!("key{i:05}").into_bytes(),
+                    format!("value{i}").into_bytes(),
+                )
+            })
+            .collect();
+        let records: Vec<(&[u8], &[u8])> = records_owned
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        let opts = BlockBasedTableOptions {
+            block_size: 256,
+            compression_type: 4, // LZ4
+            ..Default::default()
+        };
+        let file = build_table(&records, opts);
+        let reader = open_table(file);
+
+        for (k, v) in &records {
+            assert_eq!(
+                reader.get(k).unwrap(),
+                Some(v.to_vec()),
+                "lz4 roundtrip failed for key {:?}",
+                String::from_utf8_lossy(k)
+            );
         }
     }
 }

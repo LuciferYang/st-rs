@@ -15,6 +15,13 @@ name = "st_rs"
 path = "src/lib.rs"
 
 [dependencies]
+snap = { version = "1", optional = true }
+lz4_flex = { version = "0.11", optional = true }
+
+[features]
+default = ["snappy", "lz4"]
+snappy = ["snap"]
+lz4 = ["lz4_flex"]
 
 [dev-dependencies]
 

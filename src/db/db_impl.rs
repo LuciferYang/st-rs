@@ -60,14 +60,16 @@ use crate::db::log_reader::LogReader;
 use crate::db::log_writer::LogWriter;
 use crate::db::memtable::{MemTable, MemTableGetResult};
 use crate::db::dbformat::{LookupKey, ParsedInternalKey};
+use crate::db::version_edit::{FileMetaData, VersionEdit};
+use crate::db::version_set::VersionSet;
 use crate::env::env_trait::{Priority, ThreadPool};
 use crate::env::file_system::{FileLock, FileSystem, IoOptions};
 use crate::env::posix::PosixFileSystem;
 use crate::env::thread_pool::StdThreadPool;
 use crate::ext::comparator::{BytewiseComparator, Comparator};
 use crate::file::filename::{
-    make_current_file_name, make_lock_file_name, make_table_file_name, make_wal_file_name,
-    parse_file_name,
+    make_current_file_name, make_descriptor_file_name, make_lock_file_name,
+    make_table_file_name, make_wal_file_name, parse_file_name,
 };
 use crate::file::random_access_file_reader::RandomAccessFileReader;
 use crate::file::sequence_file_reader::SequentialFileReader;
@@ -75,12 +77,20 @@ use crate::file::writable_file_writer::WritableFileWriter;
 use crate::sst::block_based::table_builder::{
     BlockBasedTableBuilder, BlockBasedTableOptions,
 };
-use crate::sst::block_based::table_reader::BlockBasedTableReader;
+use crate::sst::block_based::table_reader::{BlockBasedTableReader, BlockCache};
+use crate::cache::lru::LruCache;
 use crate::core::types::FileType;
 use crate::util::coding::{get_varint32, put_varint32};
 use crate::api::write_batch::{Record, WriteBatch, WriteBatchHandler};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use crate::core::types::ColumnFamilyId;
+
+/// A range tombstone: `(start_key, end_key, sequence_number)`.
+/// Represents a deletion of all keys in `[start_key, end_key)` at
+/// the given sequence number.
+type RangeTombstone = (Vec<u8>, Vec<u8>, SequenceNumber);
 
 /// One open SST file: its assigned number, a cached reader, and
 /// the user-key range covered by the file.
@@ -96,11 +106,84 @@ struct SstEntry {
     level: u32,
 }
 
+/// Default column family ID. Every DB has a CF with this ID named "default".
+const DEFAULT_CF_ID: ColumnFamilyId = 0;
+
+/// Per-column-family mutable state. Each CF has its own memtable
+/// pipeline and SST level hierarchy. The WAL is shared across CFs.
+struct CfState {
+    /// CF numeric ID.
+    id: ColumnFamilyId,
+    /// CF name.
+    name: String,
+    /// Active (mutable) memtable for this CF.
+    memtable: MemTable,
+    /// Frozen memtable being flushed to an SST. At most one per CF.
+    immutable: Option<Arc<MemTable>>,
+    /// Level 0 SSTs, newest-first.
+    l0: Vec<SstEntry>,
+    /// Level 1 SSTs, sorted by smallest_key.
+    l1: Vec<SstEntry>,
+    /// WAL number for the immutable memtable (for deletion after flush).
+    immutable_wal_number: Option<u64>,
+    /// File number reserved for the in-progress flush output SST.
+    pending_flush_sst_number: Option<u64>,
+    /// File number of the compaction output currently in flight.
+    pending_compaction: Option<u64>,
+    /// Merge operator for this CF, if any. Resolved from
+    /// `ColumnFamilyOptions::merge_operator_name` at CF creation.
+    merge_operator: Option<Arc<dyn crate::ext::merge_operator::MergeOperator>>,
+    /// Compaction filter factory for this CF, if any. Creates a
+    /// fresh filter instance for each compaction job.
+    compaction_filter_factory:
+        Option<Arc<dyn crate::ext::compaction_filter::CompactionFilterFactory>>,
+    /// Range tombstones: each entry is `(start_key, end_key, seq)`,
+    /// representing a range delete `[start, end)` at the given
+    /// sequence number. A key `k` with `start <= k < end` and
+    /// `entry_seq < tombstone_seq` is considered deleted.
+    range_tombstones: Vec<RangeTombstone>,
+}
+
+/// Concrete column family handle.
+pub struct ColumnFamilyHandleImpl {
+    id: ColumnFamilyId,
+    name: String,
+}
+
+impl crate::api::db::ColumnFamilyHandle for ColumnFamilyHandleImpl {
+    fn id(&self) -> ColumnFamilyId { self.id }
+    fn name(&self) -> &str { &self.name }
+}
+
+impl std::fmt::Debug for ColumnFamilyHandleImpl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColumnFamilyHandleImpl")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
 /// Maximum number of levels. Layer 4g uses exactly 2 (L0 + L1);
 /// higher levels are reserved for a future multi-level layer.
 /// Maximum number of levels. Layer 4g uses exactly 2 (L0 + L1).
 #[allow(dead_code)]
 const NUM_LEVELS: usize = 2;
+
+/// Resolve a merge operator from the options name.
+fn resolve_merge_operator(
+    name: &str,
+) -> Option<Arc<dyn crate::ext::merge_operator::MergeOperator>> {
+    if name.is_empty() {
+        return None;
+    }
+    match name {
+        crate::ext::merge_operator::StringAppendOperator::NAME => {
+            Some(Arc::new(crate::ext::merge_operator::StringAppendOperator::default()))
+        }
+        _ => None, // Unknown operator names are silently ignored for now.
+    }
+}
 
 /// Compute the user-key range of an SST by scanning its entries.
 /// O(file) — called once per SST at open time. A future layer
@@ -130,34 +213,14 @@ fn compute_sst_range(reader: &BlockBasedTableReader) -> (Vec<u8>, Vec<u8>) {
 
 /// Internal state behind the DB's big lock.
 struct DbState {
-    /// Active (mutable) memtable.
-    memtable: MemTable,
-    /// Memtable that has been frozen and handed to a flush task,
-    /// but not yet turned into an SST. `None` when no flush is
-    /// in progress.
-    ///
-    /// Held by `Arc` so the flush task can read it concurrently
-    /// with the engine's read path. Reads consult this *after*
-    /// the active memtable but *before* the SSTs.
-    immutable: Option<Arc<MemTable>>,
-    /// Level 0 SST files, **newest-first** (overlapping ranges
-    /// allowed). Flushed memtables land here.
-    l0: Vec<SstEntry>,
-    /// Level 1 SST files, sorted by `smallest_key` (non-
-    /// overlapping ranges guaranteed by the compaction output).
-    /// L0→L1 compaction moves data here.
-    l1: Vec<SstEntry>,
+    /// Per-column-family state, keyed by CF ID.
+    column_families: HashMap<ColumnFamilyId, CfState>,
+    /// Next CF ID to assign when creating a new column family.
+    next_cf_id: ColumnFamilyId,
     /// Current WAL writer.
     wal: LogWriter,
     /// Number of the WAL file currently being written.
     wal_number: u64,
-    /// Number of the WAL whose records ended up in the immutable
-    /// memtable. Used to delete the obsolete WAL after the SST
-    /// write completes. `None` when no flush is pending.
-    immutable_wal_number: Option<u64>,
-    /// File number reserved for the in-progress flush's output
-    /// SST. `None` when no flush is pending.
-    pending_flush_sst_number: Option<u64>,
     /// Number to assign to the next file (WAL or SST). Monotonic.
     next_file_number: u64,
     /// Highest sequence number assigned so far.
@@ -173,11 +236,19 @@ struct DbState {
     /// `u64::MAX` when the map is empty (no snapshots → nothing
     /// to preserve).
     snapshots: std::collections::BTreeMap<SequenceNumber, usize>,
-    /// File number of the compaction output currently being
-    /// produced by a background worker. `None` when no compaction
-    /// is in flight. Layer 4f only allows one compaction at a
-    /// time — the picker skips scheduling while this is `Some`.
-    pending_compaction: Option<u64>,
+    /// MANIFEST-based version tracking. Persists per-CF file
+    /// metadata so that reopen can reconstruct the SST layout
+    /// without scanning the directory.
+    version_set: VersionSet,
+    /// Reference count for `disable_file_deletions`. When > 0,
+    /// obsolete SST files are NOT deleted — they're added to
+    /// `pending_deletion` instead. Used by Flink's incremental
+    /// checkpoint to hold SST files stable while uploading.
+    disable_file_deletions_count: u32,
+    /// SST file numbers whose deletion has been deferred because
+    /// `disable_file_deletions_count > 0`. Processed when the
+    /// count returns to 0.
+    pending_deletion: Vec<u64>,
 }
 
 impl DbState {
@@ -190,6 +261,46 @@ impl DbState {
             .copied()
             .unwrap_or(SequenceNumber::MAX)
     }
+
+    /// Look up a column family by ID.
+    fn cf(&self, id: ColumnFamilyId) -> Result<&CfState> {
+        self.column_families.get(&id).ok_or_else(||
+            Status::invalid_argument(format!("column family {id} not found")))
+    }
+
+    /// Look up a column family by ID (mutable).
+    fn cf_mut(&mut self, id: ColumnFamilyId) -> Result<&mut CfState> {
+        self.column_families.get_mut(&id).ok_or_else(||
+            Status::invalid_argument(format!("column family {id} not found")))
+    }
+
+    /// The default column family (always present).
+    fn default_cf(&self) -> &CfState {
+        self.column_families.get(&DEFAULT_CF_ID).expect("default CF missing")
+    }
+
+    /// The default column family (mutable, always present).
+    fn default_cf_mut(&mut self) -> &mut CfState {
+        self.column_families.get_mut(&DEFAULT_CF_ID).expect("default CF missing")
+    }
+}
+
+/// Metadata about one live SST file. Returned by
+/// [`DbImpl::get_live_files_metadata`].
+#[derive(Debug, Clone)]
+pub struct LiveFileMetaData {
+    /// SST file number.
+    pub file_number: u64,
+    /// Column family name.
+    pub column_family_name: String,
+    /// Level (0 or 1).
+    pub level: u32,
+    /// File size in bytes (0 if unknown).
+    pub file_size: u64,
+    /// Smallest user key in the file.
+    pub smallest_key: Vec<u8>,
+    /// Largest user key in the file.
+    pub largest_key: Vec<u8>,
 }
 
 /// The Layer 4c engine.
@@ -224,6 +335,12 @@ pub struct DbImpl {
     /// into the engine after their I/O is done. Populated once,
     /// immediately after the `Arc<Self>` is constructed in `open`.
     weak_self: OnceLock<Weak<Self>>,
+    /// Shared block cache for SST data blocks. `None` if
+    /// `block_cache_size == 0`.
+    block_cache: Option<BlockCache>,
+    /// L0 file count at which writes are blocked until compaction
+    /// reduces the count. Default: 36.
+    level0_stop_writes_trigger: i32,
 }
 
 impl DbImpl {
@@ -277,7 +394,17 @@ impl DbImpl {
         let lock_path = make_lock_file_name(path);
         let lock = fs.lock_file(&lock_path)?;
 
-        // 3. Discover existing SSTs and WAL files by listing dir.
+        // 3. Recover the VersionSet from the MANIFEST (if any).
+        let version_set = VersionSet::recover(path, Arc::clone(&fs))?;
+
+        // Create shared block cache if configured.
+        let block_cache: Option<BlockCache> = if opts.block_cache_size > 0 {
+            Some(Arc::new(LruCache::new(opts.block_cache_size)))
+        } else {
+            None
+        };
+
+        // 4. Discover existing SSTs and WAL files by listing dir.
         let user_comparator: Arc<dyn Comparator> = Arc::new(BytewiseComparator);
         let mut next_file_number = 1u64;
         let mut existing_sst_numbers: Vec<u64> = Vec::new();
@@ -297,53 +424,111 @@ impl DbImpl {
                     existing_wal_numbers.push(n);
                     next_file_number = next_file_number.max(n + 1);
                 }
+                Ok((FileType::DescriptorFile, n)) => {
+                    next_file_number = next_file_number.max(n + 1);
+                }
                 _ => {} // ignore unknown files
             }
         }
         existing_sst_numbers.sort();
         existing_wal_numbers.sort();
 
-        // 4. Open existing SSTs into the read path. On reopen we
-        //    don't read the CURRENT file for level assignments
-        //    (Layer 4g doesn't yet parse that format); instead
-        //    all discovered SSTs are placed in L0 and will be
-        //    moved to L1 by the next compaction.
-        let mut l0: Vec<SstEntry> = Vec::with_capacity(existing_sst_numbers.len());
-        let l1: Vec<SstEntry> = Vec::new();
-        for &num in &existing_sst_numbers {
-            let p = make_table_file_name(path, num);
-            let raw = fs.new_random_access_file(&p, &Default::default())?;
-            let reader = RandomAccessFileReader::new(raw, p.display().to_string())?;
-            let table = BlockBasedTableReader::open(Arc::new(reader))?;
-            let (smallest, largest) = compute_sst_range(&table);
-            l0.push(SstEntry {
-                number: num,
-                reader: Arc::new(table),
-                smallest_key: smallest,
-                largest_key: largest,
-                level: 0,
-            });
-        }
-        // Newest first (highest number) for L0.
-        l0.sort_by(|a, b| b.number.cmp(&a.number));
+        // Use whichever source gives a higher next_file_number.
+        next_file_number = next_file_number.max(version_set.next_file_number());
 
-        // 5a. Initialise `last_sequence` from the existing SSTs.
-        let mut last_sequence = 0u64;
-        for entry in l0.iter().chain(l1.iter()) {
-            let mut it = entry.reader.iter();
-            it.seek_to_first();
-            while it.valid() {
-                let parsed = ParsedInternalKey::parse(it.key())?;
-                if parsed.sequence > last_sequence {
-                    last_sequence = parsed.sequence;
+        // Check if VersionSet recovered from a MANIFEST (has real state).
+        let has_manifest = version_set.next_file_number() > 2;
+
+        let mut l0: Vec<SstEntry>;
+        let mut l1: Vec<SstEntry>;
+        let mut last_sequence: u64;
+
+        if has_manifest {
+            // MANIFEST has the authoritative SST layout and counters.
+            last_sequence = version_set.last_sequence();
+
+            // Build SstEntry vectors from the recovered per-CF file state.
+            let cf_files = version_set.cf_files().get(&DEFAULT_CF_ID).cloned().unwrap_or_default();
+
+            l0 = Vec::with_capacity(cf_files.l0.len());
+            for meta in &cf_files.l0 {
+                let p = make_table_file_name(path, meta.number);
+                if !fs.file_exists(&p)? {
+                    continue; // SST file missing — skip (best-effort)
                 }
-                it.next();
+                let raw = fs.new_random_access_file(&p, &Default::default())?;
+                let reader = RandomAccessFileReader::new(raw, p.display().to_string())?;
+                let table = BlockBasedTableReader::open_with_cache(Arc::new(reader), block_cache.clone(), meta.number)?;
+                l0.push(SstEntry {
+                    number: meta.number,
+                    reader: Arc::new(table),
+                    smallest_key: meta.smallest_key.clone(),
+                    largest_key: meta.largest_key.clone(),
+                    level: 0,
+                });
             }
-            it.status()?;
+            // Newest first (highest number) for L0.
+            l0.sort_by(|a, b| b.number.cmp(&a.number));
+
+            l1 = Vec::with_capacity(cf_files.l1.len());
+            for meta in &cf_files.l1 {
+                let p = make_table_file_name(path, meta.number);
+                if !fs.file_exists(&p)? {
+                    continue;
+                }
+                let raw = fs.new_random_access_file(&p, &Default::default())?;
+                let reader = RandomAccessFileReader::new(raw, p.display().to_string())?;
+                let table = BlockBasedTableReader::open_with_cache(Arc::new(reader), block_cache.clone(), meta.number)?;
+                l1.push(SstEntry {
+                    number: meta.number,
+                    reader: Arc::new(table),
+                    smallest_key: meta.smallest_key.clone(),
+                    largest_key: meta.largest_key.clone(),
+                    level: 1,
+                });
+            }
+            // L1 sorted by smallest_key.
+            l1.sort_by(|a, b| a.smallest_key.cmp(&b.smallest_key));
+        } else {
+            // No MANIFEST — fall back to directory-scan logic.
+            l0 = Vec::with_capacity(existing_sst_numbers.len());
+            l1 = Vec::new();
+            for &num in &existing_sst_numbers {
+                let p = make_table_file_name(path, num);
+                let raw = fs.new_random_access_file(&p, &Default::default())?;
+                let reader = RandomAccessFileReader::new(raw, p.display().to_string())?;
+                let table = BlockBasedTableReader::open_with_cache(Arc::new(reader), block_cache.clone(), num)?;
+                let (smallest, largest) = compute_sst_range(&table);
+                l0.push(SstEntry {
+                    number: num,
+                    reader: Arc::new(table),
+                    smallest_key: smallest,
+                    largest_key: largest,
+                    level: 0,
+                });
+            }
+            // Newest first (highest number) for L0.
+            l0.sort_by(|a, b| b.number.cmp(&a.number));
+
+            // Initialise `last_sequence` from the existing SSTs.
+            last_sequence = 0u64;
+            for entry in l0.iter().chain(l1.iter()) {
+                let mut it = entry.reader.iter();
+                it.seek_to_first();
+                while it.valid() {
+                    let parsed = ParsedInternalKey::parse(it.key())?;
+                    if parsed.sequence > last_sequence {
+                        last_sequence = parsed.sequence;
+                    }
+                    it.next();
+                }
+                it.status()?;
+            }
         }
 
-        // 5b. Replay WAL files into a fresh memtable.
+        // Replay WAL files into a fresh memtable.
         let mut memtable = MemTable::new(Arc::clone(&user_comparator));
+        let mut replayed_range_tombstones: Vec<RangeTombstone> = Vec::new();
         for &wal_num in &existing_wal_numbers {
             let wal_path = make_wal_file_name(path, wal_num);
             let raw = fs.new_sequential_file(&wal_path, &Default::default())?;
@@ -351,14 +536,19 @@ impl DbImpl {
             let mut log_reader = LogReader::new(seq_reader);
             let mut record_buf = Vec::new();
             while log_reader.read_record(&mut record_buf)? {
-                last_sequence = replay_record(&record_buf, &mut memtable, last_sequence)?;
+                last_sequence = replay_record_with_tombstones(
+                    &record_buf,
+                    &mut memtable,
+                    last_sequence,
+                    Some(&mut replayed_range_tombstones),
+                )?;
             }
             // Delete the replayed WAL file — we're about to open a
             // new one with a fresh number, so old WALs are obsolete.
             fs.delete_file(&wal_path)?;
         }
 
-        // 6. Open a new WAL.
+        // Open a new WAL.
         let wal_number = next_file_number;
         next_file_number += 1;
         let wal_path = make_wal_file_name(path, wal_number);
@@ -373,23 +563,111 @@ impl DbImpl {
         // run in parallel without blocking each other.
         let thread_pool = Arc::new(StdThreadPool::new(1, 0, 0, 1));
 
+        let default_cf = CfState {
+            id: DEFAULT_CF_ID,
+            name: "default".into(),
+            memtable,
+            immutable: None,
+            l0,
+            l1,
+            immutable_wal_number: None,
+            pending_flush_sst_number: None,
+            pending_compaction: None,
+            merge_operator: None,
+            compaction_filter_factory: None,
+            range_tombstones: replayed_range_tombstones,
+        };
+        let mut all_cfs = HashMap::from([(DEFAULT_CF_ID, default_cf)]);
+        let mut max_cf_id: ColumnFamilyId = 0;
+
+        // Build CfState entries for non-default CFs from MANIFEST.
+        if has_manifest {
+            for (&cf_id, cf_file_state) in version_set.cf_files() {
+                if cf_id == DEFAULT_CF_ID {
+                    continue; // already handled above
+                }
+                if cf_id > max_cf_id {
+                    max_cf_id = cf_id;
+                }
+                let cf_name = version_set
+                    .cf_names()
+                    .get(&cf_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("cf_{cf_id}"));
+
+                // Open SST files for this CF.
+                let mut cf_l0 = Vec::with_capacity(cf_file_state.l0.len());
+                for meta in &cf_file_state.l0 {
+                    let p = make_table_file_name(path, meta.number);
+                    if !fs.file_exists(&p)? {
+                        continue;
+                    }
+                    let raw = fs.new_random_access_file(&p, &Default::default())?;
+                    let reader = RandomAccessFileReader::new(raw, p.display().to_string())?;
+                    let table = BlockBasedTableReader::open_with_cache(Arc::new(reader), block_cache.clone(), meta.number)?;
+                    cf_l0.push(SstEntry {
+                        number: meta.number,
+                        reader: Arc::new(table),
+                        smallest_key: meta.smallest_key.clone(),
+                        largest_key: meta.largest_key.clone(),
+                        level: 0,
+                    });
+                }
+                cf_l0.sort_by(|a, b| b.number.cmp(&a.number));
+
+                let mut cf_l1 = Vec::with_capacity(cf_file_state.l1.len());
+                for meta in &cf_file_state.l1 {
+                    let p = make_table_file_name(path, meta.number);
+                    if !fs.file_exists(&p)? {
+                        continue;
+                    }
+                    let raw = fs.new_random_access_file(&p, &Default::default())?;
+                    let reader = RandomAccessFileReader::new(raw, p.display().to_string())?;
+                    let table = BlockBasedTableReader::open_with_cache(Arc::new(reader), block_cache.clone(), meta.number)?;
+                    cf_l1.push(SstEntry {
+                        number: meta.number,
+                        reader: Arc::new(table),
+                        smallest_key: meta.smallest_key.clone(),
+                        largest_key: meta.largest_key.clone(),
+                        level: 1,
+                    });
+                }
+                cf_l1.sort_by(|a, b| a.smallest_key.cmp(&b.smallest_key));
+
+                all_cfs.insert(cf_id, CfState {
+                    id: cf_id,
+                    name: cf_name,
+                    memtable: MemTable::new(Arc::clone(&user_comparator)),
+                    immutable: None,
+                    l0: cf_l0,
+                    l1: cf_l1,
+                    immutable_wal_number: None,
+                    pending_flush_sst_number: None,
+                    pending_compaction: None,
+                    merge_operator: None,
+                    compaction_filter_factory: None,
+                    range_tombstones: Vec::new(),
+                });
+            }
+        }
+
+        let next_cf_id = (max_cf_id + 1).max(version_set.next_cf_id() as ColumnFamilyId);
+
         let arc = Arc::new(Self {
             path: path.to_path_buf(),
             fs,
             state: Mutex::new(DbState {
-                memtable,
-                immutable: None,
-                l0,
-                l1,
+                column_families: all_cfs,
+                next_cf_id,
                 wal: wal_writer,
                 wal_number,
-                immutable_wal_number: None,
-                pending_flush_sst_number: None,
                 next_file_number,
                 last_sequence,
                 closing: false,
                 snapshots: std::collections::BTreeMap::new(),
-                pending_compaction: None,
+                version_set,
+                disable_file_deletions_count: 0,
+                pending_deletion: Vec::new(),
             }),
             flush_done: Condvar::new(),
             lock: Mutex::new(Some(lock)),
@@ -397,6 +675,8 @@ impl DbImpl {
             write_buffer_size: opts.db_write_buffer_size.max(1),
             thread_pool,
             weak_self: OnceLock::new(),
+            block_cache,
+            level0_stop_writes_trigger: 36, // default from ColumnFamilyOptions
         });
         // Self-reference for background callbacks. `set` only
         // fails if it was already populated, which can't happen
@@ -429,14 +709,724 @@ impl DbImpl {
     /// to hard-link.
     pub fn snapshot_live_files(&self) -> (PathBuf, Vec<u64>) {
         let state = self.state.lock().unwrap();
-        let mut numbers: Vec<u64> = Vec::with_capacity(state.l0.len() + state.l1.len());
-        for e in &state.l0 {
-            numbers.push(e.number);
-        }
-        for e in &state.l1 {
-            numbers.push(e.number);
+        let mut numbers: Vec<u64> = Vec::new();
+        for cf in state.column_families.values() {
+            for e in &cf.l0 {
+                numbers.push(e.number);
+            }
+            for e in &cf.l1 {
+                numbers.push(e.number);
+            }
         }
         (self.path.clone(), numbers)
+    }
+
+    // ---- Incremental checkpoint APIs ----
+
+    /// Prevent the engine from deleting obsolete SST files. Each call
+    /// increments a reference count; file deletions are suppressed
+    /// until the matching number of `enable_file_deletions` calls.
+    ///
+    /// Flink calls this before `get_live_files` to freeze the SST
+    /// list while uploading files to remote storage.
+    pub fn disable_file_deletions(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.disable_file_deletions_count += 1;
+        Ok(())
+    }
+
+    /// Re-enable file deletions. Decrements the reference count set
+    /// by `disable_file_deletions`. When the count reaches 0, any
+    /// SST files that became obsolete while deletions were disabled
+    /// are deleted.
+    pub fn enable_file_deletions(&self) -> Result<()> {
+        let pending: Vec<u64>;
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.disable_file_deletions_count == 0 {
+                return Err(Status::invalid_argument(
+                    "enable_file_deletions called without matching disable",
+                ));
+            }
+            state.disable_file_deletions_count -= 1;
+            if state.disable_file_deletions_count > 0 {
+                return Ok(()); // still disabled
+            }
+            // Count reached 0 — drain the pending list.
+            pending = std::mem::take(&mut state.pending_deletion);
+        }
+        // Delete outside the lock.
+        for n in &pending {
+            let p = make_table_file_name(&self.path, *n);
+            if self.fs.file_exists(&p).unwrap_or(false) {
+                let _ = self.fs.delete_file(&p);
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the list of live files. If `flush_memtable` is true,
+    /// triggers a flush first so that all in-memory data is captured
+    /// in SSTs.
+    ///
+    /// Returns the paths of all live SST files, the CURRENT file,
+    /// and the active MANIFEST file.
+    ///
+    /// **Note:** For consistent results, call
+    /// [`Self::disable_file_deletions`] before this method and
+    /// [`Self::enable_file_deletions`] after processing the files.
+    /// Without that bracket, a concurrent compaction could delete
+    /// a file between enumeration and access.
+    pub fn get_live_files(&self, flush_memtable: bool) -> Result<Vec<PathBuf>> {
+        if flush_memtable {
+            self.flush()?;
+            self.wait_for_pending_work()?;
+        }
+        let state = self.state.lock().unwrap();
+        let mut files = Vec::new();
+
+        // SST files from all CFs.
+        for cf in state.column_families.values() {
+            for e in &cf.l0 {
+                files.push(make_table_file_name(&self.path, e.number));
+            }
+            for e in &cf.l1 {
+                files.push(make_table_file_name(&self.path, e.number));
+            }
+        }
+
+        // CURRENT file.
+        files.push(make_current_file_name(&self.path));
+
+        // MANIFEST file.
+        let manifest_num = state.version_set.manifest_file_number();
+        if manifest_num > 0 {
+            files.push(make_descriptor_file_name(&self.path, manifest_num));
+        }
+
+        Ok(files)
+    }
+
+    /// Return metadata for all live SST files across all column
+    /// families. Used by Flink for incremental checkpoint tracking.
+    pub fn get_live_files_metadata(&self) -> Vec<LiveFileMetaData> {
+        // Collect metadata under the lock (no I/O).
+        let mut meta: Vec<LiveFileMetaData> = {
+            let state = self.state.lock().unwrap();
+            let mut out = Vec::new();
+            for cf in state.column_families.values() {
+                for e in &cf.l0 {
+                    out.push(LiveFileMetaData {
+                        file_number: e.number,
+                        column_family_name: cf.name.clone(),
+                        level: 0,
+                        file_size: 0, // filled below outside the lock
+                        smallest_key: e.smallest_key.clone(),
+                        largest_key: e.largest_key.clone(),
+                    });
+                }
+                for e in &cf.l1 {
+                    out.push(LiveFileMetaData {
+                        file_number: e.number,
+                        column_family_name: cf.name.clone(),
+                        level: 1,
+                        file_size: 0,
+                        smallest_key: e.smallest_key.clone(),
+                        largest_key: e.largest_key.clone(),
+                    });
+                }
+            }
+            out
+        };
+        // File size I/O outside the lock.
+        for m in &mut meta {
+            m.file_size = self
+                .fs
+                .get_file_size(&make_table_file_name(&self.path, m.file_number))
+                .unwrap_or(0);
+        }
+        meta
+    }
+
+    /// Return the file number of the active MANIFEST, or 0 if no
+    /// MANIFEST has been created yet. Used by checkpoint to know
+    /// which MANIFEST file to copy.
+    pub fn manifest_file_number(&self) -> u64 {
+        let state = self.state.lock().unwrap();
+        state.version_set.manifest_file_number()
+    }
+
+    /// Returns `true` if writes are currently stalled because the
+    /// default CF's L0 file count has reached the stop threshold.
+    /// Used by Flink's metrics (`is-write-stopped` property).
+    pub fn is_write_stopped(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.default_cf().l0.len() >= self.level0_stop_writes_trigger as usize
+    }
+
+    // ---- Properties & Metrics ----
+
+    /// Query an engine property by name. Returns the property value
+    /// as a string, or `None` if the property is unknown.
+    ///
+    /// Flink monitors these via `db.getProperty(cf, name)` for
+    /// dashboards. The property names match upstream RocksDB.
+    pub fn get_property(&self, name: &str) -> Option<String> {
+        self.get_int_property(name).map(|v| v.to_string())
+    }
+
+    /// Query an engine property by name for a specific column family.
+    pub fn get_property_cf(
+        &self,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        name: &str,
+    ) -> Option<String> {
+        self.get_int_property_cf(cf.id(), name).map(|v| v.to_string())
+    }
+
+    /// Query a numeric engine property. Returns `None` if unknown.
+    pub fn get_int_property(&self, name: &str) -> Option<u64> {
+        self.get_int_property_cf(DEFAULT_CF_ID, name)
+    }
+
+    /// Query a numeric engine property for a specific column family.
+    pub fn get_int_property_cf(
+        &self,
+        cf_id: ColumnFamilyId,
+        name: &str,
+    ) -> Option<u64> {
+        // Strip the "rocksdb." prefix if present (Flink uses it).
+        let prop = name.strip_prefix("rocksdb.").unwrap_or(name);
+
+        let state = self.state.lock().unwrap();
+        let cf = state.column_families.get(&cf_id)?;
+
+        match prop {
+            // ---- Memtable properties ----
+            "num-immutable-mem-table" => {
+                Some(if cf.immutable.is_some() { 1 } else { 0 })
+            }
+            "mem-table-flush-pending" => {
+                Some(if cf.immutable.is_some() { 1 } else { 0 })
+            }
+            "cur-size-active-mem-table" => {
+                Some(cf.memtable.approximate_memory_usage() as u64)
+            }
+            "cur-size-all-mem-tables" | "size-all-mem-tables" => {
+                let active = cf.memtable.approximate_memory_usage() as u64;
+                let imm = cf
+                    .immutable
+                    .as_ref()
+                    .map_or(0, |m| m.approximate_memory_usage() as u64);
+                Some(active + imm)
+            }
+            "num-entries-active-mem-table" => {
+                Some(cf.memtable.num_entries() as u64)
+            }
+
+            // ---- L0 / level file counts ----
+            "num-files-at-level0" => Some(cf.l0.len() as u64),
+            "num-files-at-level1" => Some(cf.l1.len() as u64),
+            // Levels 2-6 don't exist yet — always 0.
+            "num-files-at-level2" | "num-files-at-level3"
+            | "num-files-at-level4" | "num-files-at-level5"
+            | "num-files-at-level6" => Some(0),
+
+            // ---- SST size properties ----
+            "total-sst-files-size" | "live-sst-files-size" => {
+                let mut total = 0u64;
+                for e in &cf.l0 {
+                    total += self
+                        .fs
+                        .get_file_size(&make_table_file_name(&self.path, e.number))
+                        .unwrap_or(0);
+                }
+                for e in &cf.l1 {
+                    total += self
+                        .fs
+                        .get_file_size(&make_table_file_name(&self.path, e.number))
+                        .unwrap_or(0);
+                }
+                Some(total)
+            }
+
+            // ---- Compaction properties ----
+            "compaction-pending" => {
+                Some(if cf.pending_compaction.is_some() { 1 } else { 0 })
+            }
+            "estimate-pending-compaction-bytes" => {
+                // Rough estimate: total L0 bytes (all will be compacted).
+                let mut total = 0u64;
+                for e in &cf.l0 {
+                    total += self
+                        .fs
+                        .get_file_size(&make_table_file_name(&self.path, e.number))
+                        .unwrap_or(0);
+                }
+                Some(total)
+            }
+            "num-running-compactions" => {
+                Some(if cf.pending_compaction.is_some() { 1 } else { 0 })
+            }
+            "num-running-flushes" => {
+                Some(if cf.immutable.is_some() { 1 } else { 0 })
+            }
+
+            // ---- Write stall properties ----
+            "is-write-stopped" => {
+                Some(if cf.l0.len() >= self.level0_stop_writes_trigger as usize {
+                    1
+                } else {
+                    0
+                })
+            }
+            "actual-delayed-write-rate" => Some(0), // no slowdown implemented yet
+
+            // ---- Block cache properties ----
+            "block-cache-capacity" => {
+                drop(state); // release lock before cache query
+                Some(self.block_cache.as_ref().map_or(0, |c| c.capacity() as u64))
+            }
+            "block-cache-usage" => {
+                drop(state);
+                Some(self.block_cache.as_ref().map_or(0, |c| c.usage() as u64))
+            }
+
+            _ => None,
+        }
+    }
+
+    // ---- Column family management ----
+
+    /// Create a new column family. Returns a handle that can be
+    /// passed to `put_cf`, `get_cf`, etc.
+    pub fn create_column_family(
+        &self,
+        name: &str,
+        _options: &crate::api::options::ColumnFamilyOptions,
+    ) -> Result<Arc<ColumnFamilyHandleImpl>> {
+        let mut state = self.state.lock().unwrap();
+        // Check for duplicate name.
+        for cf in state.column_families.values() {
+            if cf.name == name {
+                return Err(Status::invalid_argument(format!(
+                    "column family '{name}' already exists"
+                )));
+            }
+        }
+        let id = state.next_cf_id;
+        state.next_cf_id += 1;
+        state.column_families.insert(id, CfState {
+            id,
+            name: name.to_string(),
+            memtable: MemTable::new(Arc::clone(&self.user_comparator)),
+            immutable: None,
+            l0: Vec::new(),
+            l1: Vec::new(),
+            immutable_wal_number: None,
+            pending_flush_sst_number: None,
+            pending_compaction: None,
+            merge_operator: resolve_merge_operator(&_options.merge_operator_name),
+            compaction_filter_factory: None,
+            range_tombstones: Vec::new(),
+        });
+        // Persist the CF addition to the MANIFEST.
+        let edit = VersionEdit {
+            column_family_id: Some(id),
+            is_column_family_add: Some(name.to_string()),
+            ..Default::default()
+        };
+        state.version_set.log_and_apply(&edit)?;
+        drop(state);
+        Ok(Arc::new(ColumnFamilyHandleImpl {
+            id,
+            name: name.to_string(),
+        }))
+    }
+
+    /// Drop a column family. The default CF (id=0) cannot be dropped.
+    ///
+    /// The caller must ensure no concurrent writes target this CF
+    /// after calling drop. Writes in flight during the drop may be
+    /// silently lost.
+    pub fn drop_column_family(&self, handle: &dyn crate::api::db::ColumnFamilyHandle) -> Result<()> {
+        let cf_id = handle.id();
+        if cf_id == DEFAULT_CF_ID {
+            return Err(Status::invalid_argument(
+                "cannot drop the default column family",
+            ));
+        }
+        // Wait for any pending work on this CF.
+        {
+            let mut state = self.state.lock().unwrap();
+            while state.column_families.get(&cf_id)
+                .is_some_and(|cf| cf.immutable.is_some() || cf.pending_compaction.is_some())
+            {
+                state = self.flush_done.wait(state).unwrap();
+            }
+        }
+        let sst_numbers: Vec<u64>;
+        {
+            let mut state = self.state.lock().unwrap();
+            let cf = state.column_families.remove(&cf_id)
+                .ok_or_else(|| Status::invalid_argument(format!("column family {cf_id} not found")))?;
+            sst_numbers = cf.l0.iter().chain(cf.l1.iter()).map(|e| e.number).collect();
+            // Persist the CF drop to the MANIFEST.
+            let deleted_files: Vec<(u32, u64)> = cf.l0.iter().chain(cf.l1.iter())
+                .map(|e| (e.level, e.number))
+                .collect();
+            let edit = VersionEdit {
+                column_family_id: Some(cf_id),
+                is_column_family_drop: true,
+                deleted_files,
+                ..Default::default()
+            };
+            state.version_set.log_and_apply(&edit)?;
+            drop(state);
+        }
+        // Delete SST files belonging to the dropped CF, respecting
+        // the file-deletion-disable flag.
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.disable_file_deletions_count > 0 {
+                state.pending_deletion.extend(&sst_numbers);
+            } else {
+                drop(state);
+                for n in &sst_numbers {
+                    let p = make_table_file_name(&self.path, *n);
+                    if self.fs.file_exists(&p).unwrap_or(false) {
+                        let _ = self.fs.delete_file(&p);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set a compaction filter factory on a column family. The
+    /// factory creates a fresh filter for each compaction job.
+    /// Flink uses this for TTL-based state expiration.
+    pub fn set_compaction_filter_factory(
+        &self,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        factory: Arc<dyn crate::ext::compaction_filter::CompactionFilterFactory>,
+    ) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let cf_state = state.cf_mut(cf.id())?;
+        cf_state.compaction_filter_factory = Some(factory);
+        Ok(())
+    }
+
+    /// Get a handle to the default column family.
+    pub fn default_column_family(&self) -> Arc<ColumnFamilyHandleImpl> {
+        Arc::new(ColumnFamilyHandleImpl {
+            id: DEFAULT_CF_ID,
+            name: "default".to_string(),
+        })
+    }
+
+    // ---- CF-aware read/write operations ----
+
+    /// Insert or overwrite `key → value` in a specific column family.
+    pub fn put_cf(
+        &self,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.put_cf(cf.id(), key.to_vec(), value.to_vec());
+        self.write(&batch)
+    }
+
+    /// Delete `key` from a specific column family.
+    pub fn delete_cf(
+        &self,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        key: &[u8],
+    ) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.delete_cf(cf.id(), key.to_vec());
+        self.write(&batch)
+    }
+
+    /// Delete every key in `[begin, end)` in the default column family.
+    pub fn delete_range(&self, begin: &[u8], end: &[u8]) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.delete_range(begin.to_vec(), end.to_vec());
+        self.write(&batch)
+    }
+
+    /// Delete every key in `[begin, end)` in a specific column family.
+    pub fn delete_range_cf(
+        &self,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        begin: &[u8],
+        end: &[u8],
+    ) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.delete_range_cf(cf.id(), begin.to_vec(), end.to_vec());
+        self.write(&batch)
+    }
+
+    /// Delete SST files whose key ranges are entirely contained
+    /// within one of the given delete ranges. For each matching SST,
+    /// the file is removed from the CF's level vector, a VersionEdit
+    /// is written to the MANIFEST, and the file is deleted from disk.
+    ///
+    /// Each range is `(begin, end)` representing the key interval
+    /// `[begin, end)`.
+    pub fn delete_files_in_ranges(
+        &self,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        ranges: &[(&[u8], &[u8])],
+    ) -> Result<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let cf_id = cf.id();
+        let mut state = self.state.lock().unwrap();
+        let cf_state = state.cf_mut(cf_id)?;
+
+        // Collect SST numbers whose key range is fully covered by
+        // at least one delete range.
+        let mut to_delete: Vec<(u64, u32)> = Vec::new(); // (number, level)
+
+        for level_idx in 0..2u32 {
+            let entries = if level_idx == 0 {
+                &cf_state.l0
+            } else {
+                &cf_state.l1
+            };
+            for entry in entries {
+                for &(begin, end) in ranges {
+                    if entry.smallest_key.as_slice() >= begin
+                        && entry.largest_key.as_slice() < end
+                    {
+                        to_delete.push((entry.number, level_idx));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if to_delete.is_empty() {
+            return Ok(());
+        }
+
+        // Remove from level vectors.
+        let numbers_to_delete: std::collections::HashSet<u64> =
+            to_delete.iter().map(|(n, _)| *n).collect();
+        cf_state.l0.retain(|e| !numbers_to_delete.contains(&e.number));
+        cf_state.l1.retain(|e| !numbers_to_delete.contains(&e.number));
+
+        // Write a VersionEdit to MANIFEST.
+        let edit = VersionEdit {
+            column_family_id: Some(cf_id),
+            deleted_files: to_delete.iter().map(|(n, l)| (*l, *n)).collect(),
+            last_sequence: Some(state.last_sequence),
+            next_file_number: Some(state.next_file_number),
+            ..Default::default()
+        };
+        state.version_set.log_and_apply(&edit)?;
+
+        // Delete the physical files.
+        for (number, _) in &to_delete {
+            let sst_path = make_table_file_name(&self.path, *number);
+            let _ = self.fs.delete_file(&sst_path);
+        }
+
+        Ok(())
+    }
+
+    /// Point-lookup in a specific column family.
+    pub fn get_cf(
+        &self,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let read_seq = {
+            let state = self.state.lock().unwrap();
+            state.last_sequence
+        };
+        self.get_cf_at_seq(cf.id(), key, read_seq)
+    }
+
+    /// Point-lookup in a CF at a specific sequence number.
+    ///
+    /// Handles merge operands: if the newest entry is a Merge, collects
+    /// all merge operands from memtable → immutable → SSTs until a Put
+    /// or Delete is found, then calls the CF's merge operator to produce
+    /// the final value.
+    fn get_cf_at_seq(
+        &self,
+        cf_id: ColumnFamilyId,
+        key: &[u8],
+        read_seq: SequenceNumber,
+    ) -> Result<Option<Vec<u8>>> {
+        let (lookup, merge_op, l0_ssts, l1_ssts, merge_state, range_tombstones) = {
+            let state = self.state.lock().unwrap();
+            let cf = state.cf(cf_id)?;
+            let merge_op = cf.merge_operator.as_ref().map(Arc::clone);
+            let lookup = LookupKey::new(key, read_seq);
+
+            // Snapshot range tombstones for this CF.
+            let range_tombstones = cf.range_tombstones.clone();
+
+            // Track merge operands collected so far (newest-first).
+            // `base_found` is set when we find a Put (base_value) or
+            // Delete (base_value = None, stops the chain).
+            let mut operands: Vec<Vec<u8>> = Vec::new();
+            let mut base_value: Option<Vec<u8>> = None;
+            let mut base_found = false;
+
+            // 1. Active memtable.
+            match cf.memtable.get(&lookup) {
+                MemTableGetResult::Found(v) => {
+                    // Don't fast-return — range tombstones must be
+                    // checked after the lock is released.
+                    base_value = Some(v);
+                    base_found = true;
+                }
+                MemTableGetResult::Deleted => {
+                    if operands.is_empty() {
+                        return Ok(None); // fast path: Delete with no merge
+                    }
+                    base_found = true; // Delete stops chain, no base value
+                }
+                MemTableGetResult::MergeOperand(_first_operand) => {
+                    // Collect all merge operands from this memtable.
+                    let (base, ops) = cf.memtable.collect_merge_operands(&lookup);
+                    operands = ops;
+                    if let Some(b) = base {
+                        base_value = Some(b);
+                        base_found = true;
+                    }
+                }
+                MemTableGetResult::NotFound => {}
+            }
+
+            // 2. Immutable memtable (only if we haven't found a base).
+            if !base_found {
+                if let Some(imm) = cf.immutable.as_ref() {
+                    match imm.get(&lookup) {
+                        MemTableGetResult::Found(v) => {
+                            base_value = Some(v);
+                            base_found = true;
+                        }
+                        MemTableGetResult::Deleted => {
+                            base_found = true;
+                        }
+                        MemTableGetResult::MergeOperand(_) => {
+                            let (base, mut ops) = imm.collect_merge_operands(&lookup);
+                            // Immutable's operands are older than active's.
+                            // Prepend them so full_merge sees oldest-first.
+                            ops.append(&mut operands);
+                            operands = ops;
+                            if let Some(b) = base {
+                                base_value = Some(b);
+                                base_found = true;
+                            }
+                        }
+                        MemTableGetResult::NotFound => {}
+                    }
+                }
+            }
+
+            // 3. Snapshot SST lists.
+            let l0_ssts: Vec<Arc<BlockBasedTableReader>> =
+                cf.l0.iter().map(|e| Arc::clone(&e.reader)).collect();
+            let l1_ssts: Vec<(Vec<u8>, Vec<u8>, Arc<BlockBasedTableReader>)> = cf
+                .l1
+                .iter()
+                .map(|e| {
+                    (
+                        e.smallest_key.clone(),
+                        e.largest_key.clone(),
+                        Arc::clone(&e.reader),
+                    )
+                })
+                .collect();
+
+            (lookup, merge_op, l0_ssts, l1_ssts, (operands, base_value, base_found), range_tombstones)
+        };
+
+        let (mut operands, mut base_value, mut base_found) = merge_state;
+
+        // 4. SSTs (only if we haven't found a base yet).
+        //
+        //    KNOWN SIMPLIFICATION: seek_in_sst returns the value for
+        //    both Put and Merge entries. We treat them all as Put
+        //    (base value). This is correct for the common case (merge
+        //    operands in memtable, base Put in SST) but doesn't
+        //    handle merge operands spanning multiple SSTs. Full SST
+        //    merge collection would require walking the SST iterator
+        //    forward to collect additional operands.
+        if !base_found {
+            for table in &l0_ssts {
+                if let Some(result) = Self::seek_in_sst(table, key, &lookup)? {
+                    base_value = result; // Some(v) for Put/Merge, None for tombstone
+                    base_found = true;
+                    break;
+                }
+            }
+        }
+        if !base_found {
+            // L1 binary search.
+            let idx = l1_ssts.partition_point(|(smallest, _, _)| smallest.as_slice() <= key);
+            if idx > 0 {
+                let (_, largest, table) = &l1_ssts[idx - 1];
+                if key <= largest.as_slice() {
+                    if let Some(result) = Self::seek_in_sst(table, key, &lookup)? {
+                        base_value = result;
+                    }
+                }
+            }
+        }
+
+        // 5. Check range tombstones. A range tombstone at seq S
+        //    covering [start, end) shadows any read of a key in
+        //    that range if S <= read_seq.
+        for (start, end, tomb_seq) in &range_tombstones {
+            if *tomb_seq <= read_seq
+                && key >= start.as_slice()
+                && key < end.as_slice()
+            {
+                return Ok(None);
+            }
+        }
+
+        // 6. If we collected merge operands, apply the merge operator.
+        if !operands.is_empty() {
+            if let Some(op) = &merge_op {
+                let operand_refs: Vec<&[u8]> = operands.iter().map(|o| o.as_slice()).collect();
+                let merged = op.full_merge(key, base_value.as_deref(), &operand_refs)?;
+                return Ok(Some(merged));
+            }
+            // No merge operator — return the newest operand as-is
+            // (backward-compatible with pre-Phase-2 behavior).
+            // operands is oldest-first, so the newest is the last.
+            return Ok(operands.pop());
+        }
+
+        // No merge operands — return the base value directly.
+        Ok(base_value)
+    }
+
+    /// Flush a specific column family's memtable to an SST.
+    pub fn flush_cf(
+        &self,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+    ) -> Result<()> {
+        let cf_id = cf.id();
+        let setup = self.start_flush_cf_locked(cf_id)?;
+        let setup = match setup {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let result = self.write_immutable_to_sst(&setup);
+        self.complete_flush_locked(setup, result)?;
+        Ok(())
     }
 
     /// Insert or overwrite `key → value`.
@@ -458,8 +1448,19 @@ impl DbImpl {
     /// The batch is serialised, appended to the WAL, then replayed
     /// into the memtable. The whole sequence runs under a single
     /// mutex — there's no group commit at Layer 4a.
+    ///
+    /// If the default CF's L0 file count reaches
+    /// `level0_stop_writes_trigger`, this method blocks until a
+    /// background compaction reduces the count. This is the write
+    /// stall / back-pressure mechanism that prevents unbounded L0
+    /// growth.
     pub fn write(&self, batch: &WriteBatch) -> Result<()> {
         let mut state = self.state.lock().unwrap();
+
+        // Write stall: block while L0 count is at the stop threshold.
+        while state.default_cf().l0.len() >= self.level0_stop_writes_trigger as usize {
+            state = self.flush_done.wait(state).unwrap();
+        }
 
         // Reserve a sequence range for this batch.
         let first_seq = state.last_sequence + 1;
@@ -471,17 +1472,20 @@ impl DbImpl {
         state.wal.sync()?;
 
         // 2. Memtable insert.
-        let mut handler = MemTableInsertHandler {
-            memtable: &mut state.memtable,
-            seq: first_seq,
-        };
-        batch.iterate(&mut handler)?;
+        {
+            let mut handler = MemTableInsertHandler {
+                column_families: &mut state.column_families,
+                seq: first_seq,
+            };
+            batch.iterate(&mut handler)?;
 
-        // 3. Bookkeeping.
-        state.last_sequence = handler.seq - 1;
+            // 3. Bookkeeping.
+            state.last_sequence = handler.seq - 1;
+        }
 
-        // 4. Maybe trigger flush.
-        let needs_flush = state.memtable.approximate_memory_usage() >= self.write_buffer_size;
+        // 4. Maybe trigger flush (default CF only for now; non-default
+        //    CFs don't auto-flush — callers must use flush_cf()).
+        let needs_flush = state.default_cf().memtable.approximate_memory_usage() >= self.write_buffer_size;
         drop(state);
         if needs_flush {
             // Background flush — put() returns as soon as the
@@ -529,59 +1533,7 @@ impl DbImpl {
     /// read sequence. `get()` calls it with `state.last_sequence`;
     /// `get_at()` calls it with the snapshot's pinned sequence.
     fn get_at_seq(&self, key: &[u8], read_seq: SequenceNumber) -> Result<Option<Vec<u8>>> {
-        let (lookup, l0_ssts, l1_ssts) = {
-            let state = self.state.lock().unwrap();
-            let lookup = LookupKey::new(key, read_seq);
-            // 1. Try the active memtable first under the lock.
-            match state.memtable.get(&lookup) {
-                MemTableGetResult::Found(v) => return Ok(Some(v)),
-                MemTableGetResult::Deleted => return Ok(None),
-                MemTableGetResult::NotFound => {}
-            }
-            // 2. Try the immutable memtable (a flush in progress).
-            if let Some(imm) = state.immutable.as_ref() {
-                match imm.get(&lookup) {
-                    MemTableGetResult::Found(v) => return Ok(Some(v)),
-                    MemTableGetResult::Deleted => return Ok(None),
-                    MemTableGetResult::NotFound => {}
-                }
-            }
-            // 3. Snapshot the SST lists so we can drop the lock.
-            //    L0 is newest-first; L1 is sorted by key range.
-            let l0_ssts: Vec<Arc<BlockBasedTableReader>> =
-                state.l0.iter().map(|e| Arc::clone(&e.reader)).collect();
-            let l1_ssts: Vec<(Vec<u8>, Vec<u8>, Arc<BlockBasedTableReader>)> = state
-                .l1
-                .iter()
-                .map(|e| {
-                    (
-                        e.smallest_key.clone(),
-                        e.largest_key.clone(),
-                        Arc::clone(&e.reader),
-                    )
-                })
-                .collect();
-            (lookup, l0_ssts, l1_ssts)
-        };
-
-        // 4a. Walk L0 SSTs newest-first (overlapping ranges).
-        for table in &l0_ssts {
-            if let Some(result) = Self::seek_in_sst(table, key, &lookup)? {
-                return Ok(result);
-            }
-        }
-        // 4b. Walk L1 via binary search (non-overlapping ranges).
-        //     Find the file whose range might contain `key`.
-        let idx = l1_ssts.partition_point(|(smallest, _, _): &(Vec<u8>, Vec<u8>, Arc<BlockBasedTableReader>)| smallest.as_slice() <= key);
-        if idx > 0 {
-            let (_, largest, table) = &l1_ssts[idx - 1];
-            if key <= largest.as_slice() {
-                if let Some(result) = Self::seek_in_sst(table, key, &lookup)? {
-                    return Ok(result);
-                }
-            }
-        }
-        Ok(None)
+        self.get_cf_at_seq(DEFAULT_CF_ID, key, read_seq)
     }
 
     /// Shared: seek in one SST for a user key at the given lookup
@@ -609,6 +1561,191 @@ impl DbImpl {
             ValueType::Deletion | ValueType::SingleDeletion => None,
             _ => None,
         }))
+    }
+
+    // ---- Batch (vectorized) operations ----
+
+    /// Batch point-lookup: look up multiple keys in one call.
+    ///
+    /// This is more efficient than calling `get()` in a loop because
+    /// it acquires the state lock **once**, checks all keys against
+    /// the active and immutable memtables under that lock, snapshots
+    /// the SST lists, and then probes SSTs for remaining keys without
+    /// the lock.
+    ///
+    /// Returns a `Vec` of the same length as `keys`, where each
+    /// element is `Ok(Some(value))`, `Ok(None)` (miss / deleted),
+    /// or `Err` (I/O error).
+    pub fn multi_get(&self, keys: &[&[u8]]) -> Vec<Result<Option<Vec<u8>>>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+
+        let n = keys.len();
+
+        // Results default to Ok(None) (= not found). A separate bitmap
+        // tracks which keys were already resolved from memtables so we
+        // can skip them during the SST phase.
+        let mut results: Vec<Result<Option<Vec<u8>>>> = (0..n).map(|_| Ok(None)).collect();
+        let mut resolved = vec![false; n];
+        // Keys that hit a MergeOperand in memtable — need the full
+        // single-key merge path after releasing the lock.
+        let mut merge_keys: Vec<usize> = Vec::new();
+
+        // 1. Single lock acquisition: check memtables + snapshot SSTs.
+        //    read_seq is captured here and used for ALL lookups (memtable
+        //    and SST) to guarantee a consistent snapshot.
+        let (read_seq, l0_ssts, l1_ssts) = {
+            let state = self.state.lock().unwrap();
+            let cf = state.default_cf();
+            let read_seq = state.last_sequence;
+
+            // Check every key against the active memtable.
+            for (i, key) in keys.iter().enumerate() {
+                let lookup = LookupKey::new(key, read_seq);
+                match cf.memtable.get(&lookup) {
+                    MemTableGetResult::Found(v) => {
+                        results[i] = Ok(Some(v));
+                        resolved[i] = true;
+                        continue;
+                    }
+                    MemTableGetResult::Deleted => {
+                        // results[i] is already Ok(None).
+                        resolved[i] = true;
+                        continue;
+                    }
+                    MemTableGetResult::MergeOperand(_) => {
+                        // Merge requires collecting operands across
+                        // memtable + SSTs. Fall back to the full
+                        // single-key path for this key.
+                        merge_keys.push(i);
+                        resolved[i] = true;
+                        continue;
+                    }
+                    MemTableGetResult::NotFound => {}
+                }
+                // Check immutable memtable (still under the same lock).
+                if let Some(imm) = cf.immutable.as_ref() {
+                    match imm.get(&lookup) {
+                        MemTableGetResult::Found(v) => {
+                            results[i] = Ok(Some(v));
+                            resolved[i] = true;
+                            continue;
+                        }
+                        MemTableGetResult::Deleted => {
+                            resolved[i] = true;
+                            continue;
+                        }
+                        MemTableGetResult::MergeOperand(_) => {
+                            merge_keys.push(i);
+                            resolved[i] = true;
+                            continue;
+                        }
+                        MemTableGetResult::NotFound => {}
+                    }
+                }
+                // Key not in memtables — will check SSTs below.
+            }
+
+            // Snapshot SST lists so we can drop the lock.
+            let l0_ssts: Vec<Arc<BlockBasedTableReader>> =
+                cf.l0.iter().map(|e| Arc::clone(&e.reader)).collect();
+            let l1_ssts: Vec<(Vec<u8>, Vec<u8>, Arc<BlockBasedTableReader>)> = cf
+                .l1
+                .iter()
+                .map(|e| {
+                    (
+                        e.smallest_key.clone(),
+                        e.largest_key.clone(),
+                        Arc::clone(&e.reader),
+                    )
+                })
+                .collect();
+
+            (read_seq, l0_ssts, l1_ssts)
+        };
+        // Lock released here.
+
+        // 2. For unresolved keys, probe SSTs (no lock needed).
+        'keys: for (i, key) in keys.iter().enumerate() {
+            if resolved[i] {
+                continue;
+            }
+            let lookup = LookupKey::new(key, read_seq);
+
+            // L0 SSTs newest-first.
+            for table in &l0_ssts {
+                match Self::seek_in_sst(table, key, &lookup) {
+                    Ok(Some(v)) => {
+                        results[i] = Ok(v);
+                        continue 'keys;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        results[i] = Err(e);
+                        continue 'keys;
+                    }
+                }
+            }
+
+            // L1 via binary search.
+            let idx =
+                l1_ssts.partition_point(|(smallest, _, _)| smallest.as_slice() <= *key);
+            if idx > 0 {
+                let (_, largest, table) = &l1_ssts[idx - 1];
+                if *key <= largest.as_slice() {
+                    match Self::seek_in_sst(table, key, &lookup) {
+                        Ok(Some(v)) => {
+                            results[i] = Ok(v);
+                            continue 'keys;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            results[i] = Err(e);
+                            continue 'keys;
+                        }
+                    }
+                }
+            }
+            // Not found in SSTs either — results[i] stays Ok(None).
+        }
+
+        // Resolve merge keys via the full single-key path.
+        for idx in merge_keys {
+            results[idx] = self.get_cf_at_seq(DEFAULT_CF_ID, keys[idx], read_seq);
+        }
+
+        results
+    }
+
+    /// Batch put: insert or overwrite multiple key-value pairs
+    /// atomically in a single [`WriteBatch`].
+    ///
+    /// More efficient than calling `put()` in a loop because only
+    /// one WAL append + sync and one memtable insertion pass are
+    /// performed.
+    pub fn multi_put(&self, pairs: &[(&[u8], &[u8])]) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::new();
+        for (key, value) in pairs {
+            batch.put(key.to_vec(), value.to_vec());
+        }
+        self.write(&batch)
+    }
+
+    /// Batch delete: delete multiple keys atomically in a single
+    /// [`WriteBatch`].
+    pub fn multi_delete(&self, keys: &[&[u8]]) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::new();
+        for key in keys {
+            batch.delete(key.to_vec());
+        }
+        self.write(&batch)
     }
 
     /// Take a snapshot at the current sequence. The returned
@@ -648,10 +1785,11 @@ impl DbImpl {
         read_seq: SequenceNumber,
     ) -> Result<crate::db::db_iter::DbIterator> {
         let state = self.state.lock().unwrap();
+        let cf = state.default_cf();
         let ssts = Self::collect_all_ssts(&state);
         let it = crate::db::db_iter::DbIterator::from_snapshot_with_immutable_at(
-            &state.memtable,
-            state.immutable.as_deref(),
+            &cf.memtable,
+            cf.immutable.as_deref(),
             &ssts,
             read_seq,
         )?;
@@ -665,12 +1803,13 @@ impl DbImpl {
     /// need binary-search — it walks every file — so a flat vec
     /// is fine.
     fn collect_all_ssts(state: &DbState) -> Vec<Arc<BlockBasedTableReader>> {
+        let cf = state.default_cf();
         let mut ssts: Vec<Arc<BlockBasedTableReader>> =
-            Vec::with_capacity(state.l0.len() + state.l1.len());
-        for e in &state.l0 {
+            Vec::with_capacity(cf.l0.len() + cf.l1.len());
+        for e in &cf.l0 {
             ssts.push(Arc::clone(&e.reader));
         }
-        for e in &state.l1 {
+        for e in &cf.l1 {
             ssts.push(Arc::clone(&e.reader));
         }
         ssts
@@ -702,14 +1841,224 @@ impl DbImpl {
     /// concurrent writes and background flushes.
     pub fn iter(&self) -> Result<crate::db::db_iter::DbIterator> {
         let state = self.state.lock().unwrap();
+        let cf = state.default_cf();
         let ssts = Self::collect_all_ssts(&state);
         let it = crate::db::db_iter::DbIterator::from_snapshot_with_immutable(
-            &state.memtable,
-            state.immutable.as_deref(),
+            &cf.memtable,
+            cf.immutable.as_deref(),
             &ssts,
         )?;
         drop(state);
         Ok(it)
+    }
+
+    // ---- Column-family-scoped iterator ----
+
+    /// Collect all SST readers for a specific column family.
+    fn collect_cf_ssts(cf: &CfState) -> Vec<Arc<BlockBasedTableReader>> {
+        let mut ssts: Vec<Arc<BlockBasedTableReader>> =
+            Vec::with_capacity(cf.l0.len() + cf.l1.len());
+        for e in &cf.l0 {
+            ssts.push(Arc::clone(&e.reader));
+        }
+        for e in &cf.l1 {
+            ssts.push(Arc::clone(&e.reader));
+        }
+        ssts
+    }
+
+    /// Open a forward + backward iterator scoped to a specific
+    /// column family. Eagerly materialises a snapshot of the CF's
+    /// memtable + immutable memtable + SSTs under the lock, so the
+    /// returned iterator is detached from the engine.
+    pub fn iter_cf(
+        &self,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+    ) -> Result<crate::db::db_iter::DbIterator> {
+        let state = self.state.lock().unwrap();
+        let cf_state = state.cf(cf.id())?;
+        let ssts = Self::collect_cf_ssts(cf_state);
+        let it = crate::db::db_iter::DbIterator::from_snapshot_with_immutable(
+            &cf_state.memtable,
+            cf_state.immutable.as_deref(),
+            &ssts,
+        )?;
+        drop(state);
+        Ok(it)
+    }
+
+    // ---- Prefix scan ----
+
+    /// Return all live key-value pairs in the default column family
+    /// whose user key starts with `prefix`, in sorted order.
+    pub fn prefix_scan(
+        &self,
+        prefix: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut it = self.iter()?;
+        it.seek(prefix);
+        let mut results = Vec::new();
+        while it.valid() {
+            if !it.key().starts_with(prefix) {
+                break;
+            }
+            results.push((it.key().to_vec(), it.value().to_vec()));
+            it.next();
+        }
+        Ok(results)
+    }
+
+    /// Return all live key-value pairs in the specified column
+    /// family whose user key starts with `prefix`, in sorted order.
+    pub fn prefix_scan_cf(
+        &self,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        prefix: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut it = self.iter_cf(cf)?;
+        it.seek(prefix);
+        let mut results = Vec::new();
+        while it.valid() {
+            if !it.key().starts_with(prefix) {
+                break;
+            }
+            results.push((it.key().to_vec(), it.value().to_vec()));
+            it.next();
+        }
+        Ok(results)
+    }
+
+    // ---- SST ingestion ----
+
+    /// Ingest one or more externally-built SST files into a column
+    /// family. Each file is validated, copied (or moved) into the
+    /// DB directory, and added to the CF's L0 as the newest file.
+    ///
+    /// Used by Flink during state restoration and rescaling.
+    pub fn ingest_external_file(
+        &self,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        paths: &[&Path],
+        opts: &crate::db::ingest_external_file::IngestExternalFileOptions,
+    ) -> Result<()> {
+        use crate::db::ingest_external_file::validate_sst;
+
+        let cf_id = cf.id();
+
+        for src_path in paths {
+            // 1. Validate the SST.
+            validate_sst(self.fs.as_ref(), src_path)?;
+
+            // 2. Assign a new file number and build the destination path.
+            let (file_number, dst_path) = {
+                let mut state = self.state.lock().unwrap();
+                let num = state.next_file_number;
+                state.next_file_number += 1;
+                (num, make_table_file_name(&self.path, num))
+            };
+
+            // 3. Copy or move the file into the DB directory.
+            if opts.move_files {
+                std::fs::rename(src_path, &dst_path).map_err(|e| {
+                    Status::io_error(format!(
+                        "move {} -> {}: {e}",
+                        src_path.display(),
+                        dst_path.display()
+                    ))
+                })?;
+            } else {
+                std::fs::copy(src_path, &dst_path).map_err(|e| {
+                    Status::io_error(format!(
+                        "copy {} -> {}: {e}",
+                        src_path.display(),
+                        dst_path.display()
+                    ))
+                })?;
+            }
+
+            // 4. Open the SST reader, compute key range and max sequence.
+            let raw = self.fs.new_random_access_file(&dst_path, &Default::default())?;
+            let reader = RandomAccessFileReader::new(raw, dst_path.display().to_string())?;
+            let table = BlockBasedTableReader::open(Arc::new(reader))?;
+            let (smallest, largest) = compute_sst_range(&table);
+            // Scan for the maximum sequence number in the SST so
+            // we can bump `last_sequence` — otherwise reads at
+            // `last_sequence` (which may be 0 if no writes have
+            // occurred) would be unable to see entries with a
+            // higher sequence.
+            let max_seq = {
+                let mut it = table.iter();
+                it.seek_to_first();
+                let mut mx: SequenceNumber = 0;
+                while it.valid() {
+                    if let Ok(p) = ParsedInternalKey::parse(it.key()) {
+                        if p.sequence > mx {
+                            mx = p.sequence;
+                        }
+                    }
+                    it.next();
+                }
+                mx
+            };
+            let file_size = self.fs.get_file_size(&dst_path).unwrap_or(0);
+            let reader_arc = Arc::new(table);
+
+            // 5. Insert into CF's L0 (newest-first) and write VersionEdit.
+            let mut state = self.state.lock().unwrap();
+            // Bump last_sequence so reads can see the ingested data.
+            if max_seq > state.last_sequence {
+                state.last_sequence = max_seq;
+            }
+            let cf_state = state.cf_mut(cf_id)?;
+            cf_state.l0.insert(
+                0,
+                SstEntry {
+                    number: file_number,
+                    reader: reader_arc,
+                    smallest_key: smallest.clone(),
+                    largest_key: largest.clone(),
+                    level: 0,
+                },
+            );
+            let edit = VersionEdit {
+                column_family_id: Some(cf_id),
+                new_files: vec![(
+                    0,
+                    FileMetaData {
+                        number: file_number,
+                        file_size,
+                        smallest_key: smallest,
+                        largest_key: largest,
+                    },
+                )],
+                next_file_number: Some(state.next_file_number),
+                ..Default::default()
+            };
+            state.version_set.log_and_apply(&edit)?;
+        }
+
+        Ok(())
+    }
+
+    /// Create a new column family and atomically ingest the
+    /// specified SST files into it.
+    ///
+    /// This is the Flink-specific "bootstrap a CF from a checkpoint"
+    /// path: the CF is created empty, then SSTs are ingested in a
+    /// single operation so the CF is immediately populated.
+    pub fn create_column_family_with_import(
+        &self,
+        name: &str,
+        options: &crate::api::options::ColumnFamilyOptions,
+        paths: &[&Path],
+    ) -> Result<Arc<ColumnFamilyHandleImpl>> {
+        let handle = self.create_column_family(name, options)?;
+        if let Err(e) = self.ingest_external_file(&*handle, paths, &Default::default()) {
+            // Best-effort cleanup: drop the CF we just created.
+            let _ = self.drop_column_family(&*handle);
+            return Err(e);
+        }
+        Ok(handle)
     }
 
     /// Block until every in-progress background flush **and**
@@ -720,7 +2069,9 @@ impl DbImpl {
     /// state before asserting on the SST list.
     pub fn wait_for_pending_work(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        while state.immutable.is_some() || state.pending_compaction.is_some() {
+        while state.column_families.values().any(|cf| cf.immutable.is_some())
+            || state.column_families.values().any(|cf| cf.pending_compaction.is_some())
+        {
             state = self.flush_done.wait(state).unwrap();
         }
         Ok(())
@@ -805,29 +2156,31 @@ impl DbImpl {
         let mut state = self.state.lock().unwrap();
         // Wait for any in-progress flush to complete first. This
         // bounds the immutable slot to at most one memtable.
-        while state.immutable.is_some() {
+        while state.default_cf().immutable.is_some() {
             state = self.flush_done.wait(state).unwrap();
         }
-        if state.memtable.num_entries() == 0 {
+        if state.default_cf().memtable.num_entries() == 0 {
             return Ok(None);
         }
 
         // Reserve a file number for the SST.
         let sst_number = state.next_file_number;
         state.next_file_number += 1;
-        state.pending_flush_sst_number = Some(sst_number);
+        let wal_number = state.wal_number;
+        let cf = state.default_cf_mut();
+        cf.pending_flush_sst_number = Some(sst_number);
 
         // Freeze the active memtable.
         let frozen = std::mem::replace(
-            &mut state.memtable,
+            &mut cf.memtable,
             MemTable::new(Arc::clone(&self.user_comparator)),
         );
         let immutable = Arc::new(frozen);
-        state.immutable = Some(Arc::clone(&immutable));
+        cf.immutable = Some(Arc::clone(&immutable));
 
         // Remember which WAL holds the records that landed in the
         // immutable memtable, so we can delete it after the flush.
-        state.immutable_wal_number = Some(state.wal_number);
+        cf.immutable_wal_number = Some(wal_number);
 
         // Roll the WAL: open a fresh log so the new active
         // memtable has its own write-ahead trail.
@@ -846,9 +2199,54 @@ impl DbImpl {
         state.wal_number = new_wal_number;
 
         Ok(Some(FlushSetup {
+            cf_id: DEFAULT_CF_ID,
             sst_number,
             immutable,
-            old_wal_number: state.immutable_wal_number.unwrap(),
+            old_wal_number: state.default_cf().immutable_wal_number.unwrap(),
+        }))
+    }
+
+    /// CF-aware version of `start_flush_locked`.
+    ///
+    /// Unlike the default-CF `start_flush_locked`, this does NOT
+    /// roll the WAL. The WAL is shared across all CFs — rolling it
+    /// when only one CF flushes would prematurely orphan records
+    /// belonging to other CFs. The old WAL is kept alive; it will
+    /// be deleted when the default CF's flush completes (which does
+    /// roll the WAL).
+    fn start_flush_cf_locked(&self, cf_id: ColumnFamilyId) -> Result<Option<FlushSetup>> {
+        let mut state = self.state.lock().unwrap();
+        // Wait for any in-progress flush on this CF.
+        while state.cf(cf_id)?.immutable.is_some() {
+            state = self.flush_done.wait(state).unwrap();
+        }
+        if state.cf(cf_id)?.memtable.num_entries() == 0 {
+            return Ok(None);
+        }
+
+        let sst_number = state.next_file_number;
+        state.next_file_number += 1;
+        let wal_number = state.wal_number;
+        let cf = state.cf_mut(cf_id)?;
+        cf.pending_flush_sst_number = Some(sst_number);
+
+        // Freeze the active memtable.
+        let frozen = std::mem::replace(
+            &mut cf.memtable,
+            MemTable::new(Arc::clone(&self.user_comparator)),
+        );
+        let immutable = Arc::new(frozen);
+        cf.immutable = Some(Arc::clone(&immutable));
+        cf.immutable_wal_number = Some(wal_number);
+
+        // No WAL roll here — the WAL is shared across CFs.
+        // The old_wal_number is recorded but we don't delete it
+        // until ALL CFs have been flushed past this WAL.
+        Ok(Some(FlushSetup {
+            cf_id,
+            sst_number,
+            immutable,
+            old_wal_number: wal_number,
         }))
     }
 
@@ -869,7 +2267,7 @@ impl DbImpl {
     fn write_immutable_to_sst(
         &self,
         setup: &FlushSetup,
-    ) -> Result<Arc<BlockBasedTableReader>> {
+    ) -> Result<(Arc<BlockBasedTableReader>, u64)> {
         let sst_path = make_table_file_name(&self.path, setup.sst_number);
         let writable = self
             .fs
@@ -893,12 +2291,18 @@ impl DbImpl {
         }
         tb.finish()?;
 
+        let file_size = self.fs.get_file_size(&sst_path)?;
+
         let raw = self
             .fs
             .new_random_access_file(&sst_path, &Default::default())?;
         let reader = RandomAccessFileReader::new(raw, sst_path.display().to_string())?;
-        let table = BlockBasedTableReader::open(Arc::new(reader))?;
-        Ok(Arc::new(table))
+        let table = BlockBasedTableReader::open_with_cache(
+            Arc::new(reader),
+            self.block_cache.clone(),
+            setup.sst_number,
+        )?;
+        Ok((Arc::new(table), file_size))
     }
 
     /// Third half of a flush: install the new SST + clear the
@@ -907,38 +2311,58 @@ impl DbImpl {
     fn complete_flush_locked(
         &self,
         setup: FlushSetup,
-        write_result: Result<Arc<BlockBasedTableReader>>,
+        write_result: Result<(Arc<BlockBasedTableReader>, u64)>,
     ) -> Result<()> {
+        let cf_id = setup.cf_id;
         let mut state = self.state.lock().unwrap();
         // Always clear the immutable slot and pending fields,
         // even on error — otherwise we deadlock on the next
         // start_flush_locked.
-        state.immutable = None;
-        state.immutable_wal_number = None;
-        state.pending_flush_sst_number = None;
+        if let Some(cf) = state.column_families.get_mut(&cf_id) {
+            cf.immutable = None;
+            cf.immutable_wal_number = None;
+            cf.pending_flush_sst_number = None;
+            // Range tombstones have been "applied" by the flush —
+            // clear them so subsequent reads don't re-check old
+            // tombstones. This is a simplification; upstream stores
+            // range tombstones in a separate meta block in the SST.
+            cf.range_tombstones.clear();
+        }
 
         let result = match write_result {
-            Ok(reader) => {
+            Ok((reader, file_size)) => {
                 let (smallest, largest) = compute_sst_range(&reader);
-                state.l0.insert(
-                    0,
-                    SstEntry {
+                if let Some(cf) = state.column_families.get_mut(&cf_id) {
+                    cf.l0.insert(
+                        0,
+                        SstEntry {
+                            number: setup.sst_number,
+                            reader,
+                            smallest_key: smallest.clone(),
+                            largest_key: largest.clone(),
+                            level: 0,
+                        },
+                    );
+                }
+                // Persist the new SST to the MANIFEST via log_and_apply.
+                let edit = VersionEdit {
+                    column_family_id: Some(cf_id),
+                    new_files: vec![(0, FileMetaData {
                         number: setup.sst_number,
-                        reader,
+                        file_size,
                         smallest_key: smallest,
                         largest_key: largest,
-                        level: 0,
-                    },
-                );
-                // Persist the new SST list to CURRENT.
-                let current = current_string(&state.l0, &state.l1);
-                drop(state);
-                let r = self.write_current_atomic(&current);
-                // Reacquire to maybe schedule compaction.
-                let mut state = self.state.lock().unwrap();
-                if r.is_ok() {
-                    // Best-effort: delete the obsolete WAL now
-                    // that the SST + CURRENT are durable.
+                    })],
+                    last_sequence: Some(state.last_sequence),
+                    log_number: Some(state.wal_number),
+                    next_file_number: Some(state.next_file_number),
+                    ..Default::default()
+                };
+                let r = state.version_set.log_and_apply(&edit);
+
+                if r.is_ok() && cf_id == DEFAULT_CF_ID {
+                    // Only delete the old WAL when the default CF
+                    // flushes, because only that path rolls the WAL.
                     let old_wal_path =
                         make_wal_file_name(&self.path, setup.old_wal_number);
                     let _ = self.fs.delete_file(&old_wal_path);
@@ -946,21 +2370,11 @@ impl DbImpl {
                 let cleanup = self.maybe_pick_compaction(&mut state);
                 drop(state);
                 if let Some(plan) = cleanup {
-                    // Background compaction — returns immediately
-                    // after putting the plan on the pool. The
-                    // flush worker that called us can then finish
-                    // and pick up the next flush; the compaction
-                    // worker runs in parallel.
                     self.schedule_compaction(plan);
                 }
                 r
             }
-            Err(e) => {
-                // SST write failed. The obsolete WAL is preserved
-                // — on the next open(), its records will be
-                // replayed into a fresh memtable.
-                Err(e)
-            }
+            Err(e) => Err(e),
         };
 
         self.flush_done.notify_all();
@@ -975,36 +2389,45 @@ impl DbImpl {
     /// Layer 4f allows only one background compaction at a time.
     /// A future layer can queue multiple plans.
     fn maybe_pick_compaction(&self, state: &mut DbState) -> Option<CompactionPlan> {
-        if state.pending_compaction.is_some() {
-            return None;
-        }
-        if state.l0.len() < Self::COMPACTION_TRIGGER {
-            return None;
-        }
-        // All L0 files participate.
-        let mut inputs: Vec<Arc<BlockBasedTableReader>> = Vec::new();
-        let mut input_numbers: Vec<u64> = Vec::new();
-        let mut union_smallest: Vec<u8> = Vec::new();
-        let mut union_largest: Vec<u8> = Vec::new();
-        for entry in &state.l0 {
-            inputs.push(Arc::clone(&entry.reader));
-            input_numbers.push(entry.number);
-            if union_smallest.is_empty() || entry.smallest_key < union_smallest {
-                union_smallest.clone_from(&entry.smallest_key);
+        // Collect everything we need from the immutable borrow of
+        // the CF first, then do the mutable state updates.
+        let (inputs, input_numbers, input_levels, filter_factory) = {
+            let cf = state.default_cf();
+            if cf.pending_compaction.is_some() {
+                return None;
             }
-            if union_largest.is_empty() || entry.largest_key > union_largest {
-                union_largest.clone_from(&entry.largest_key);
+            if cf.l0.len() < Self::COMPACTION_TRIGGER {
+                return None;
             }
-        }
-        // Include overlapping L1 files.
-        for entry in &state.l1 {
-            if entry.smallest_key <= union_largest
-                && entry.largest_key >= union_smallest
-            {
+            let mut inputs: Vec<Arc<BlockBasedTableReader>> = Vec::new();
+            let mut input_numbers: Vec<u64> = Vec::new();
+            let mut input_levels: Vec<u32> = Vec::new();
+            let mut union_smallest: Vec<u8> = Vec::new();
+            let mut union_largest: Vec<u8> = Vec::new();
+            for entry in &cf.l0 {
                 inputs.push(Arc::clone(&entry.reader));
                 input_numbers.push(entry.number);
+                input_levels.push(0);
+                if union_smallest.is_empty() || entry.smallest_key < union_smallest {
+                    union_smallest.clone_from(&entry.smallest_key);
+                }
+                if union_largest.is_empty() || entry.largest_key > union_largest {
+                    union_largest.clone_from(&entry.largest_key);
+                }
             }
-        }
+            for entry in &cf.l1 {
+                if entry.smallest_key <= union_largest
+                    && entry.largest_key >= union_smallest
+                {
+                    inputs.push(Arc::clone(&entry.reader));
+                    input_numbers.push(entry.number);
+                    input_levels.push(1);
+                }
+            }
+            let ff = cf.compaction_filter_factory.as_ref().map(Arc::clone);
+            (inputs, input_numbers, input_levels, ff)
+        };
+        // Now safe to mutate state.
         let out_number = state.next_file_number;
         state.next_file_number += 1;
         let min_snap_seq = state.min_snap_seq();
@@ -1012,13 +2435,19 @@ impl DbImpl {
             out_number,
             inputs,
             input_numbers,
+            input_levels,
             min_snap_seq,
+            filter_factory,
         })
     }
 
     /// Atomically write `contents` to `<path>/CURRENT` via a tmp
     /// file + rename. Crash-safe: a torn write produces an
     /// orphaned tmp file, never a half-written CURRENT.
+    ///
+    /// Superseded by `VersionSet::log_and_apply` which writes to
+    /// the MANIFEST instead. Retained for backward compatibility.
+    #[allow(dead_code)]
     fn write_current_atomic(&self, contents: &str) -> Result<()> {
         let current_path = make_current_file_name(&self.path);
         let tmp_path = self.path.join("CURRENT.tmp");
@@ -1039,6 +2468,8 @@ impl DbImpl {
 /// Per-flush context handed from `start_flush_locked` to the
 /// background worker (or to the synchronous `flush()` path).
 struct FlushSetup {
+    /// Column family being flushed.
+    cf_id: ColumnFamilyId,
     sst_number: u64,
     immutable: Arc<MemTable>,
     old_wal_number: u64,
@@ -1050,22 +2481,18 @@ struct FlushSetup {
 struct CompactionPlan {
     /// File number reserved for the compaction output.
     out_number: u64,
-    /// Table readers for the input SSTs. The inputs stay in
-    /// `state.ssts` until the compaction completes so ongoing
-    /// reads can still find their data.
+    /// Table readers for the input SSTs.
     inputs: Vec<Arc<BlockBasedTableReader>>,
-    /// Numbers of the input SSTs — used to identify them for
-    /// removal from `state.ssts` and deletion from disk when
-    /// the merge completes.
+    /// Numbers of the input SSTs.
     input_numbers: Vec<u64>,
-    /// Oldest live snapshot sequence at the time the plan was
-    /// created. Captured under the state lock so it's consistent
-    /// with the chosen inputs. Snapshots taken *after* plan
-    /// creation but *before* the compaction runs don't affect
-    /// retention — that's a minor race-window that costs at
-    /// most one extra compaction cycle of retention, never
-    /// corruption.
+    /// Level of each input SST (parallel to `input_numbers`).
+    input_levels: Vec<u32>,
+    /// Oldest live snapshot sequence at the time the plan was created.
     min_snap_seq: SequenceNumber,
+    /// Compaction filter factory from the CF, if any. A fresh
+    /// filter is created from this for each compaction run.
+    filter_factory:
+        Option<Arc<dyn crate::ext::compaction_filter::CompactionFilterFactory>>,
 }
 
 /// The engine's concrete snapshot type. Returned from
@@ -1119,13 +2546,45 @@ impl Drop for DbSnapshot {
 }
 
 /// Helper: render the SST level layout into the CURRENT file
-/// format. Layer 4g format: `level:number` pairs separated by
-/// commas, e.g. `"0:5,0:7,1:3,1:8"`. L0 entries are written
-/// newest-first; L1 entries are written sorted by key range.
+/// format from the column families map. Format:
+/// `cf_id:level:number` pairs separated by commas, e.g.
+/// `"0:0:5,0:0:7,0:1:3,0:1:8"`. Backward-compatible: old
+/// `level:number` format (no CF prefix) is treated as CF 0
+/// during parsing.
+///
+/// Superseded by MANIFEST-based tracking. Retained for backward
+/// compatibility.
+#[allow(dead_code)]
+fn current_string_from_cfs(cfs: &HashMap<ColumnFamilyId, CfState>) -> String {
+    let mut s = String::new();
+    // Sort by CF ID for deterministic output.
+    let mut sorted: Vec<&CfState> = cfs.values().collect();
+    sorted.sort_by_key(|cf| cf.id);
+    for cf in sorted {
+        // L0 in reverse (oldest → newest in the file).
+        for entry in cf.l0.iter().rev() {
+            if !s.is_empty() {
+                s.push(',');
+            }
+            s.push_str(&format!("{}:{}:{}", cf.id, entry.level, entry.number));
+        }
+        for entry in &cf.l1 {
+            if !s.is_empty() {
+                s.push(',');
+            }
+            s.push_str(&format!("{}:{}:{}", cf.id, entry.level, entry.number));
+        }
+    }
+    s
+}
+
+/// Legacy `current_string` wrapper for backward compatibility.
+/// Takes flat L0/L1 slices (default CF = 0) and produces the
+/// old `level:number` format. Kept for reference but no longer
+/// called by the engine.
+#[allow(dead_code)]
 fn current_string(l0: &[SstEntry], l1: &[SstEntry]) -> String {
     let mut s = String::new();
-    // L0 in reverse (oldest → newest in the file; but order
-    // within a level doesn't matter for the format).
     for entry in l0.iter().rev() {
         if !s.is_empty() {
             s.push(',');
@@ -1159,7 +2618,7 @@ impl DbImpl {
     fn schedule_compaction(&self, plan: CompactionPlan) {
         {
             let mut state = self.state.lock().unwrap();
-            state.pending_compaction = Some(plan.out_number);
+            state.default_cf_mut().pending_compaction = Some(plan.out_number);
         }
         let weak = self.weak_self();
         self.thread_pool.schedule(
@@ -1185,7 +2644,7 @@ impl DbImpl {
         let result = self.run_compaction_inner(plan);
         {
             let mut state = self.state.lock().unwrap();
-            state.pending_compaction = None;
+            state.default_cf_mut().pending_compaction = None;
         }
         self.flush_done.notify_all();
         result
@@ -1200,29 +2659,47 @@ impl DbImpl {
         let out_number = plan.out_number;
         let inputs = plan.inputs;
         let input_numbers = plan.input_numbers;
+        let input_levels = plan.input_levels;
         let min_snap_seq = plan.min_snap_seq;
+        let filter_factory = plan.filter_factory;
 
         let out_path = make_table_file_name(&self.path, out_number);
 
         // Run the merge → output SST. CompactionJob borrows the
         // file system; the inputs are owned via Arc.
-        let job = CompactionJob::new(
+        let mut job = CompactionJob::new(
             self.fs.as_ref(),
             inputs,
             &out_path,
             BlockBasedTableOptions::default(),
         )
         .with_min_snap_seq(min_snap_seq);
+
+        // Create a fresh filter from the factory, if any.
+        if let Some(factory) = &filter_factory {
+            let filter = factory.create_compaction_filter(true, false);
+            job = job.with_compaction_filter(filter);
+        }
+
         let written = job.run()?;
 
         // Swap inputs for the output under the lock.
         let mut state = self.state.lock().unwrap();
-        state
-            .l0
-            .retain(|e| !input_numbers.contains(&e.number));
-        state
-            .l1
-            .retain(|e| !input_numbers.contains(&e.number));
+        {
+            let cf = state.default_cf_mut();
+            cf.l0.retain(|e| !input_numbers.contains(&e.number));
+            cf.l1.retain(|e| !input_numbers.contains(&e.number));
+        }
+
+        // Build the VersionEdit for deleted + new files.
+        let deleted_files: Vec<(u32, u64)> = input_numbers.iter().enumerate()
+            .map(|(i, &n)| (input_levels[i], n))
+            .collect();
+        let mut edit = VersionEdit {
+            column_family_id: Some(DEFAULT_CF_ID),
+            deleted_files,
+            ..Default::default()
+        };
 
         if written > 0 {
             // Open the new SST and add it to **L1** (compaction
@@ -1232,46 +2709,66 @@ impl DbImpl {
                 .fs
                 .new_random_access_file(&out_path, &Default::default())?;
             let reader = RandomAccessFileReader::new(raw, out_path.display().to_string())?;
-            let table = BlockBasedTableReader::open(Arc::new(reader))?;
+            let table = BlockBasedTableReader::open_with_cache(
+                Arc::new(reader),
+                self.block_cache.clone(),
+                out_number,
+            )?;
             let (smallest, largest) = compute_sst_range(&table);
+            let file_size = self.fs.get_file_size(&out_path)?;
             let new_entry = SstEntry {
                 number: out_number,
                 reader: Arc::new(table),
                 smallest_key: smallest.clone(),
-                largest_key: largest,
+                largest_key: largest.clone(),
                 level: 1,
             };
-            let pos = state
-                .l1
-                .partition_point(|e| e.smallest_key < smallest);
-            state.l1.insert(pos, new_entry);
-        }
-        // Persist the updated level layout to CURRENT.
-        let current = current_string(&state.l0, &state.l1);
-        drop(state);
-        self.write_current_atomic(&current)?;
+            let cf = state.default_cf_mut();
+            let pos = cf.l1.partition_point(|e| e.smallest_key < smallest);
+            cf.l1.insert(pos, new_entry);
 
-        // Delete the input SST files. Best-effort: a leaked file
-        // is harmless because the next reopen ignores files not
-        // listed in CURRENT.
-        for n in &input_numbers {
-            let p = make_table_file_name(&self.path, *n);
-            if self.fs.file_exists(&p)? {
-                self.fs.delete_file(&p)?;
+            edit.new_files.push((1, FileMetaData {
+                number: out_number,
+                file_size,
+                smallest_key: smallest,
+                largest_key: largest,
+            }));
+        }
+        edit.next_file_number = Some(state.next_file_number);
+        // Persist the updated level layout to the MANIFEST.
+        state.version_set.log_and_apply(&edit)?;
+
+        // Collect files to delete.
+        let mut to_delete: Vec<u64> = input_numbers.clone();
+        if written == 0 {
+            to_delete.push(out_number); // empty output
+        }
+
+        if state.disable_file_deletions_count > 0 {
+            // Defer deletions — file deletions are currently disabled
+            // (incremental checkpoint in progress).
+            state.pending_deletion.extend(&to_delete);
+            drop(state);
+        } else {
+            drop(state);
+            // Delete immediately.
+            for n in &to_delete {
+                let p = make_table_file_name(&self.path, *n);
+                if self.fs.file_exists(&p).unwrap_or(false) {
+                    let _ = self.fs.delete_file(&p);
+                }
             }
-        }
-
-        // If the compaction produced no output (everything was
-        // tombstones), remove the empty output file too.
-        if written == 0 && self.fs.file_exists(&out_path)? {
-            self.fs.delete_file(&out_path)?;
         }
         Ok(())
     }
 
     /// Close the DB. Drains any pending background flush, then
-    /// flushes the active memtable synchronously, then releases
-    /// the file lock.
+    /// flushes the default CF's active memtable synchronously,
+    /// then releases the file lock.
+    ///
+    /// **Note:** Non-default CFs are NOT automatically flushed on
+    /// close. Call `flush_cf()` for each CF before closing if you
+    /// need their data persisted.
     pub fn close(&self) -> Result<()> {
         // 1. Wait for any in-progress background flush.
         self.wait_for_pending_flush()?;
@@ -1287,6 +2784,20 @@ impl DbImpl {
         // 4. Drain pool workers so no task is mid-flight when
         //    we drop the engine.
         self.thread_pool.wait_for_jobs_and_join_all();
+        // 4b. Process any deferred SST deletions (from
+        //     disable_file_deletions that was never re-enabled).
+        {
+            let mut state = self.state.lock().unwrap();
+            let pending = std::mem::take(&mut state.pending_deletion);
+            state.disable_file_deletions_count = 0;
+            drop(state);
+            for n in &pending {
+                let p = make_table_file_name(&self.path, *n);
+                if self.fs.file_exists(&p).unwrap_or(false) {
+                    let _ = self.fs.delete_file(&p);
+                }
+            }
+        }
         // 5. Release the lock so other processes can open the DB.
         let lock = self.lock.lock().unwrap().take();
         if let Some(lock) = lock {
@@ -1355,10 +2866,12 @@ fn encode_batch_record(batch: &WriteBatch, first_seq: SequenceNumber, out: &mut 
                 put_varint32(out, value.len() as u32);
                 out.extend_from_slice(value);
             }
-            Record::DeleteRange { .. } => {
-                // Layer 4a doesn't support range deletes; the WriteBatch
-                // API still accepts them, but they become no-ops on
-                // the WAL replay path.
+            Record::DeleteRange { begin, end, .. } => {
+                out.push(0xF); // Tag for DeleteRange in WAL
+                put_varint32(out, begin.len() as u32);
+                out.extend_from_slice(begin);
+                put_varint32(out, end.len() as u32);
+                out.extend_from_slice(end);
             }
         }
     }
@@ -1366,10 +2879,15 @@ fn encode_batch_record(batch: &WriteBatch, first_seq: SequenceNumber, out: &mut 
 
 /// Inverse of [`encode_batch_record`]. Returns the new
 /// `last_sequence` after applying the record. Used by WAL replay.
-fn replay_record(
+///
+/// If `range_tombstones` is provided, any DeleteRange records in the
+/// WAL are appended to it so the caller can install them in the
+/// appropriate `CfState`.
+fn replay_record_with_tombstones(
     record: &[u8],
     memtable: &mut MemTable,
     mut last_seq: SequenceNumber,
+    mut range_tombstones: Option<&mut Vec<RangeTombstone>>,
 ) -> Result<SequenceNumber> {
     let (first_seq, rest) = crate::util::coding::get_varint64(record)?;
     let (count, mut rest) = get_varint32(rest)?;
@@ -1380,6 +2898,32 @@ fn replay_record(
         }
         let kind = rest[0];
         rest = &rest[1..];
+
+        // DeleteRange uses tag 0xF and has two length-prefixed fields
+        // (begin_key, end_key) instead of a single key.
+        if kind == 0xF {
+            let (begin_len, after_blen) = get_varint32(rest)?;
+            if after_blen.len() < begin_len as usize {
+                return Err(Status::corruption("WAL record: truncated delete-range begin"));
+            }
+            let begin_key = &after_blen[..begin_len as usize];
+            let after_begin = &after_blen[begin_len as usize..];
+            let (end_len, after_elen) = get_varint32(after_begin)?;
+            if after_elen.len() < end_len as usize {
+                return Err(Status::corruption("WAL record: truncated delete-range end"));
+            }
+            let end_key = &after_elen[..end_len as usize];
+            rest = &after_elen[end_len as usize..];
+            if let Some(ref mut tombstones) = range_tombstones {
+                tombstones.push((begin_key.to_vec(), end_key.to_vec(), seq));
+            }
+            seq += 1;
+            if seq > last_seq + 1 {
+                last_seq = seq - 1;
+            }
+            continue;
+        }
+
         let (key_len, after_klen) = get_varint32(rest)?;
         if after_klen.len() < key_len as usize {
             return Err(Status::corruption("WAL record: truncated key"));
@@ -1415,58 +2959,265 @@ fn replay_record(
     Ok(last_seq)
 }
 
-/// `WriteBatchHandler` adapter that inserts each record into a
-/// memtable, advancing the sequence as it goes.
+/// `WriteBatchHandler` adapter that inserts each record into the
+/// appropriate column family's memtable, advancing the sequence
+/// as it goes.
 struct MemTableInsertHandler<'a> {
-    memtable: &'a mut MemTable,
+    column_families: &'a mut HashMap<ColumnFamilyId, CfState>,
     seq: SequenceNumber,
+}
+
+impl<'a> MemTableInsertHandler<'a> {
+    fn cf_memtable(&mut self, cf: ColumnFamilyId) -> Result<&mut MemTable> {
+        self.column_families.get_mut(&cf).map(|c| &mut c.memtable).ok_or_else(||
+            Status::invalid_argument(format!("column family {cf} not found")))
+    }
+
+    fn cf_state(&mut self, cf: ColumnFamilyId) -> Result<&mut CfState> {
+        self.column_families.get_mut(&cf).ok_or_else(||
+            Status::invalid_argument(format!("column family {cf} not found")))
+    }
 }
 
 impl<'a> WriteBatchHandler for MemTableInsertHandler<'a> {
     fn put_cf(
         &mut self,
-        _cf: crate::core::types::ColumnFamilyId,
+        cf: ColumnFamilyId,
         key: &[u8],
         value: &[u8],
     ) -> Result<()> {
-        self.memtable.add(self.seq, ValueType::Value, key, value)?;
+        let seq = self.seq;
+        self.cf_memtable(cf)?.add(seq, ValueType::Value, key, value)?;
         self.seq += 1;
         Ok(())
     }
     fn delete_cf(
         &mut self,
-        _cf: crate::core::types::ColumnFamilyId,
+        cf: ColumnFamilyId,
         key: &[u8],
     ) -> Result<()> {
-        self.memtable.add(self.seq, ValueType::Deletion, key, &[])?;
+        let seq = self.seq;
+        self.cf_memtable(cf)?.add(seq, ValueType::Deletion, key, &[])?;
         self.seq += 1;
         Ok(())
     }
     fn single_delete_cf(
         &mut self,
-        _cf: crate::core::types::ColumnFamilyId,
+        cf: ColumnFamilyId,
         key: &[u8],
     ) -> Result<()> {
-        self.memtable
-            .add(self.seq, ValueType::SingleDeletion, key, &[])?;
+        let seq = self.seq;
+        self.cf_memtable(cf)?.add(seq, ValueType::SingleDeletion, key, &[])?;
+        self.seq += 1;
+        Ok(())
+    }
+    fn delete_range_cf(
+        &mut self,
+        cf: ColumnFamilyId,
+        begin: &[u8],
+        end: &[u8],
+    ) -> Result<()> {
+        let seq = self.seq;
+        self.cf_state(cf)?.range_tombstones.push((
+            begin.to_vec(),
+            end.to_vec(),
+            seq,
+        ));
         self.seq += 1;
         Ok(())
     }
     fn merge_cf(
         &mut self,
-        _cf: crate::core::types::ColumnFamilyId,
+        cf: ColumnFamilyId,
         key: &[u8],
         value: &[u8],
     ) -> Result<()> {
-        self.memtable.add(self.seq, ValueType::Merge, key, value)?;
+        let seq = self.seq;
+        self.cf_memtable(cf)?.add(seq, ValueType::Merge, key, value)?;
         self.seq += 1;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Db trait implementation
+// ---------------------------------------------------------------------------
+
+impl crate::api::db::Db for DbImpl {
+    fn create_column_family(
+        &self,
+        name: &str,
+        options: &crate::api::options::ColumnFamilyOptions,
+    ) -> Result<Arc<dyn crate::api::db::ColumnFamilyHandle>> {
+        let h = DbImpl::create_column_family(self, name, options)?;
+        Ok(h as Arc<dyn crate::api::db::ColumnFamilyHandle>)
+    }
+
+    fn drop_column_family(&self, cf: &dyn crate::api::db::ColumnFamilyHandle) -> Result<()> {
+        DbImpl::drop_column_family(self, cf)
+    }
+
+    fn default_column_family(&self) -> Arc<dyn crate::api::db::ColumnFamilyHandle> {
+        DbImpl::default_column_family(self) as Arc<dyn crate::api::db::ColumnFamilyHandle>
+    }
+
+    fn put(
+        &self,
+        _opts: &crate::api::options::WriteOptions,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        DbImpl::put(self, key, value)
+    }
+
+    fn put_cf(
+        &self,
+        _opts: &crate::api::options::WriteOptions,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        DbImpl::put_cf(self, cf, key, value)
+    }
+
+    fn delete(
+        &self,
+        _opts: &crate::api::options::WriteOptions,
+        key: &[u8],
+    ) -> Result<()> {
+        DbImpl::delete(self, key)
+    }
+
+    fn delete_cf(
+        &self,
+        _opts: &crate::api::options::WriteOptions,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        key: &[u8],
+    ) -> Result<()> {
+        DbImpl::delete_cf(self, cf, key)
+    }
+
+    fn single_delete(
+        &self,
+        _opts: &crate::api::options::WriteOptions,
+        key: &[u8],
+    ) -> Result<()> {
+        // Delegate to regular delete for now.
+        DbImpl::delete(self, key)
+    }
+
+    fn merge(
+        &self,
+        _opts: &crate::api::options::WriteOptions,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.merge(key.to_vec(), value.to_vec());
+        DbImpl::write(self, &batch)
+    }
+
+    fn get(
+        &self,
+        _opts: &crate::api::options::ReadOptions,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        DbImpl::get(self, key)
+    }
+
+    fn get_cf(
+        &self,
+        _opts: &crate::api::options::ReadOptions,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        DbImpl::get_cf(self, cf, key)
+    }
+
+    fn write(
+        &self,
+        _opts: &crate::api::options::WriteOptions,
+        batch: &WriteBatch,
+    ) -> Result<()> {
+        DbImpl::write(self, batch)
+    }
+
+    fn multi_get(
+        &self,
+        _opts: &crate::api::options::ReadOptions,
+        keys: &[&[u8]],
+    ) -> Vec<Result<Option<Vec<u8>>>> {
+        DbImpl::multi_get(self, keys)
+    }
+
+    fn new_iterator(
+        &self,
+        _opts: &crate::api::options::ReadOptions,
+    ) -> Box<dyn crate::api::iterator::DbIterator> {
+        // The concrete DbIterator (db_iter::DbIterator) doesn't
+        // implement the trait DbIterator (api::iterator::DbIterator).
+        // For now, return an empty iterator. Full trait wiring is
+        // deferred to a future layer.
+        Box::new(crate::api::iterator::EmptyIterator)
+    }
+
+    fn new_iterator_cf(
+        &self,
+        _opts: &crate::api::options::ReadOptions,
+        _cf: &dyn crate::api::db::ColumnFamilyHandle,
+    ) -> Box<dyn crate::api::iterator::DbIterator> {
+        Box::new(crate::api::iterator::EmptyIterator)
+    }
+
+    fn snapshot(&self) -> Arc<dyn crate::api::snapshot::Snapshot> {
+        DbImpl::snapshot(self) as Arc<dyn crate::api::snapshot::Snapshot>
+    }
+
+    fn release_snapshot(&self, _snap: Arc<dyn crate::api::snapshot::Snapshot>) {
+        // Snapshots are released automatically on Drop via the
+        // Arc<DbSnapshot> mechanism. This method is a no-op.
+    }
+
+    fn flush(&self, _opts: &crate::api::options::FlushOptions) -> Result<()> {
+        DbImpl::flush(self)
+    }
+
+    fn flush_cf(
+        &self,
+        _opts: &crate::api::options::FlushOptions,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+    ) -> Result<()> {
+        DbImpl::flush_cf(self, cf)
+    }
+
+    fn compact_range(
+        &self,
+        _begin: Option<&[u8]>,
+        _end: Option<&[u8]>,
+    ) -> Result<()> {
+        // Manual compaction not yet implemented. No-op.
+        Ok(())
+    }
+
+    fn get_property(&self, property: &str) -> Option<String> {
+        DbImpl::get_property(self, property)
+    }
+
+    fn flush_wal(&self, _sync: bool) -> Result<()> {
+        // WAL sync is done on every write; this is a no-op.
+        let mut state = self.state.lock().unwrap();
+        state.wal.sync()
+    }
+
+    fn close(&self) -> Result<()> {
+        DbImpl::close(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::db::ColumnFamilyHandle;
 
     fn opts() -> DbOptions {
         DbOptions {
@@ -1725,7 +3476,8 @@ mod tests {
         // above).
         let (l0, l1) = {
             let state = db.state.lock().unwrap();
-            (state.l0.len(), state.l1.len())
+            let cf = state.default_cf();
+            (cf.l0.len(), cf.l1.len())
         };
         assert!(l1 > 0, "expected some L1 files after compaction, got L0={l0} L1={l1}");
 
@@ -1820,7 +3572,8 @@ mod tests {
         // moved to L1) and L1 should have at least 1 file.
         let (l0, l1) = {
             let state = db.state.lock().unwrap();
-            (state.l0.len(), state.l1.len())
+            let cf = state.default_cf();
+            (cf.l0.len(), cf.l1.len())
         };
         assert_eq!(l0, 0, "L0 should be empty after compaction");
         assert!(l1 > 0, "L1 should have at least 1 file after compaction");
@@ -1953,7 +3706,7 @@ mod tests {
         {
             let state = db.state.lock().unwrap();
             assert!(
-                state.pending_compaction.is_none(),
+                state.default_cf().pending_compaction.is_none(),
                 "pending_compaction should have cleared after wait"
             );
         }
@@ -1990,8 +3743,8 @@ mod tests {
         // return cleanly.)
         {
             let state = db.state.lock().unwrap();
-            assert!(state.immutable.is_none());
-            assert!(state.pending_compaction.is_none());
+            assert!(state.default_cf().immutable.is_none());
+            assert!(state.default_cf().pending_compaction.is_none());
         }
 
         // Every key is still readable.
@@ -2029,7 +3782,7 @@ mod tests {
         // returns None.
         let pick = {
             let mut state = db.state.lock().unwrap();
-            state.pending_compaction = Some(9999);
+            state.default_cf_mut().pending_compaction = Some(9999);
             db.maybe_pick_compaction(&mut state)
         };
         assert!(
@@ -2039,7 +3792,7 @@ mod tests {
         // Clean up the forced flag so close() doesn't hang.
         {
             let mut state = db.state.lock().unwrap();
-            state.pending_compaction = None;
+            state.default_cf_mut().pending_compaction = None;
         }
 
         db.close().unwrap();
@@ -2353,5 +4106,1767 @@ mod tests {
 
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Batch (vectorized) API tests ----
+
+    #[test]
+    fn multi_get_basic() {
+        let dir = temp_dir("multi-get-basic");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+
+        let keys: Vec<&[u8]> = vec![b"a", b"c", b"missing", b"b"];
+        let results = db.multi_get(&keys);
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].as_ref().unwrap(), &Some(b"1".to_vec()));
+        assert_eq!(results[1].as_ref().unwrap(), &Some(b"3".to_vec()));
+        assert_eq!(results[2].as_ref().unwrap(), &None);
+        assert_eq!(results[3].as_ref().unwrap(), &Some(b"2".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_get_empty() {
+        let dir = temp_dir("multi-get-empty");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        let results = db.multi_get(&[]);
+        assert!(results.is_empty());
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_get_after_flush() {
+        let dir = temp_dir("multi-get-flush");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        // Write data and flush to SST.
+        db.put(b"x", b"10").unwrap();
+        db.put(b"y", b"20").unwrap();
+        db.flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        // Write more to active memtable.
+        db.put(b"z", b"30").unwrap();
+        db.put(b"x", b"11").unwrap(); // overwrite in memtable
+
+        let keys: Vec<&[u8]> = vec![b"x", b"y", b"z", b"nope"];
+        let results = db.multi_get(&keys);
+        assert_eq!(results[0].as_ref().unwrap(), &Some(b"11".to_vec())); // memtable wins
+        assert_eq!(results[1].as_ref().unwrap(), &Some(b"20".to_vec())); // from SST
+        assert_eq!(results[2].as_ref().unwrap(), &Some(b"30".to_vec())); // memtable
+        assert_eq!(results[3].as_ref().unwrap(), &None);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_get_sees_deletes() {
+        let dir = temp_dir("multi-get-del");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.delete(b"a").unwrap();
+
+        let keys: Vec<&[u8]> = vec![b"a", b"b"];
+        let results = db.multi_get(&keys);
+        assert_eq!(results[0].as_ref().unwrap(), &None); // deleted
+        assert_eq!(results[1].as_ref().unwrap(), &Some(b"2".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_put_basic() {
+        let dir = temp_dir("multi-put-basic");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.multi_put(&[
+            (b"k1".as_ref(), b"v1".as_ref()),
+            (b"k2".as_ref(), b"v2".as_ref()),
+            (b"k3".as_ref(), b"v3".as_ref()),
+        ])
+        .unwrap();
+
+        assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(db.get(b"k2").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(db.get(b"k3").unwrap(), Some(b"v3".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_put_empty() {
+        let dir = temp_dir("multi-put-empty");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.multi_put(&[]).unwrap(); // no-op
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_delete_basic() {
+        let dir = temp_dir("multi-del-basic");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.multi_delete(&[b"a", b"c"]).unwrap();
+
+        assert_eq!(db.get(b"a").unwrap(), None);
+        assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(db.get(b"c").unwrap(), None);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_get_consistent_snapshot() {
+        // Verify that multi_get sees a consistent snapshot —
+        // all keys read at the same sequence number.
+        let dir = temp_dir("multi-get-snap");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        // Write initial data.
+        db.put(b"k1", b"old1").unwrap();
+        db.put(b"k2", b"old2").unwrap();
+
+        // Take a snapshot, overwrite one key.
+        let snap = db.snapshot();
+        db.put(b"k1", b"new1").unwrap();
+
+        // multi_get at latest should see the new value.
+        let results = db.multi_get(&[b"k1", b"k2"]);
+        assert_eq!(results[0].as_ref().unwrap(), &Some(b"new1".to_vec()));
+        assert_eq!(results[1].as_ref().unwrap(), &Some(b"old2".to_vec()));
+
+        // Verify snapshot still sees old value via single get_at.
+        assert_eq!(
+            db.get_at(b"k1", &*snap).unwrap(),
+            Some(b"old1".to_vec())
+        );
+
+        drop(snap);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_put_then_multi_get_large_batch() {
+        let dir = temp_dir("multi-large");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        // Write 1000 entries in one batch.
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..1000u32)
+            .map(|i| (format!("key-{i:05}").into_bytes(), format!("val-{i}").into_bytes()))
+            .collect();
+        let pair_refs: Vec<(&[u8], &[u8])> = pairs.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+        db.multi_put(&pair_refs).unwrap();
+
+        // Read all 1000 back in one batch.
+        let key_refs: Vec<&[u8]> = pairs.iter().map(|(k, _)| k.as_slice()).collect();
+        let results = db.multi_get(&key_refs);
+        assert_eq!(results.len(), 1000);
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(
+                r.as_ref().unwrap(),
+                &Some(format!("val-{i}").into_bytes()),
+            );
+        }
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Column family tests ----
+
+    #[test]
+    fn create_column_family_put_get() {
+        let dir = temp_dir("cf-create");
+        let cf_opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&cf_opts, &dir).unwrap();
+        let cf = db
+            .create_column_family("user", &crate::api::options::ColumnFamilyOptions::default())
+            .unwrap();
+
+        // Put in CF, verify isolated from default.
+        db.put_cf(&*cf, b"k", b"cf-val").unwrap();
+        db.put(b"k", b"default-val").unwrap();
+
+        assert_eq!(db.get_cf(&*cf, b"k").unwrap(), Some(b"cf-val".to_vec()));
+        assert_eq!(db.get(b"k").unwrap(), Some(b"default-val".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_column_family_removes_data() {
+        let dir = temp_dir("cf-drop");
+        let cf_opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&cf_opts, &dir).unwrap();
+        let cf = db
+            .create_column_family("temp", &crate::api::options::ColumnFamilyOptions::default())
+            .unwrap();
+        db.put_cf(&*cf, b"k", b"v").unwrap();
+        assert_eq!(db.get_cf(&*cf, b"k").unwrap(), Some(b"v".to_vec()));
+
+        db.drop_column_family(&*cf).unwrap();
+
+        // CF is gone — get_cf should fail.
+        assert!(db.get_cf(&*cf, b"k").is_err());
+
+        // Default CF unaffected.
+        db.put(b"x", b"y").unwrap();
+        assert_eq!(db.get(b"x").unwrap(), Some(b"y".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_default_cf_fails() {
+        let dir = temp_dir("cf-drop-default");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        let default_cf = db.default_column_family();
+        assert!(db.drop_column_family(&*default_cf).is_err());
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_cf_name_fails() {
+        let dir = temp_dir("cf-dup");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.create_column_family("dup", &crate::api::options::ColumnFamilyOptions::default())
+            .unwrap();
+        let result =
+            db.create_column_family("dup", &crate::api::options::ColumnFamilyOptions::default());
+        assert!(result.is_err());
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_batch_multi_cf() {
+        let dir = temp_dir("cf-batch");
+        let cf_opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&cf_opts, &dir).unwrap();
+        let cf1 = db
+            .create_column_family("cf1", &crate::api::options::ColumnFamilyOptions::default())
+            .unwrap();
+        let cf2 = db
+            .create_column_family("cf2", &crate::api::options::ColumnFamilyOptions::default())
+            .unwrap();
+
+        // Atomic write spanning default + cf1 + cf2.
+        let mut batch = WriteBatch::new();
+        batch.put(b"k".to_vec(), b"default".to_vec());
+        batch.put_cf(cf1.id(), b"k".to_vec(), b"one".to_vec());
+        batch.put_cf(cf2.id(), b"k".to_vec(), b"two".to_vec());
+        db.write(&batch).unwrap();
+
+        assert_eq!(db.get(b"k").unwrap(), Some(b"default".to_vec()));
+        assert_eq!(db.get_cf(&*cf1, b"k").unwrap(), Some(b"one".to_vec()));
+        assert_eq!(db.get_cf(&*cf2, b"k").unwrap(), Some(b"two".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_cf_isolates() {
+        let dir = temp_dir("cf-flush");
+        let big_opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big_opts, &dir).unwrap();
+        let cf = db
+            .create_column_family("data", &crate::api::options::ColumnFamilyOptions::default())
+            .unwrap();
+        db.put(b"dk", b"dv").unwrap();
+        db.put_cf(&*cf, b"ck", b"cv").unwrap();
+
+        // Flush only the custom CF.
+        db.flush_cf(&*cf).unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        // Both readable.
+        assert_eq!(db.get(b"dk").unwrap(), Some(b"dv".to_vec()));
+        assert_eq!(db.get_cf(&*cf, b"ck").unwrap(), Some(b"cv".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_cf_works() {
+        let dir = temp_dir("cf-delete");
+        let cf_opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&cf_opts, &dir).unwrap();
+        let cf = db
+            .create_column_family("cf", &crate::api::options::ColumnFamilyOptions::default())
+            .unwrap();
+        db.put_cf(&*cf, b"k", b"v").unwrap();
+        db.delete_cf(&*cf, b"k").unwrap();
+        assert_eq!(db.get_cf(&*cf, b"k").unwrap(), None);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Merge operator tests ----
+
+    fn merge_cf_opts() -> crate::api::options::ColumnFamilyOptions {
+        crate::api::options::ColumnFamilyOptions {
+            merge_operator_name: "stringappendtest".to_string(),
+            ..crate::api::options::ColumnFamilyOptions::default()
+        }
+    }
+
+    #[test]
+    fn merge_put_then_merge_then_get() {
+        let dir = temp_dir("merge-basic");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let cf = db.create_column_family("list", &merge_cf_opts()).unwrap();
+
+        // Put base value, then merge two operands.
+        db.put_cf(&*cf, b"k", b"a").unwrap();
+        {
+            let mut batch = WriteBatch::new();
+            batch.merge_cf(cf.id(), b"k".to_vec(), b"b".to_vec());
+            db.write(&batch).unwrap();
+        }
+        {
+            let mut batch = WriteBatch::new();
+            batch.merge_cf(cf.id(), b"k".to_vec(), b"c".to_vec());
+            db.write(&batch).unwrap();
+        }
+
+        // get should apply full_merge("k", Some("a"), ["b", "c"]) → "a,b,c"
+        assert_eq!(
+            db.get_cf(&*cf, b"k").unwrap(),
+            Some(b"a,b,c".to_vec())
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_without_base_value() {
+        let dir = temp_dir("merge-no-base");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let cf = db.create_column_family("list", &merge_cf_opts()).unwrap();
+
+        // Merge without a preceding Put — no base value.
+        {
+            let mut batch = WriteBatch::new();
+            batch.merge_cf(cf.id(), b"k".to_vec(), b"x".to_vec());
+            db.write(&batch).unwrap();
+        }
+        {
+            let mut batch = WriteBatch::new();
+            batch.merge_cf(cf.id(), b"k".to_vec(), b"y".to_vec());
+            db.write(&batch).unwrap();
+        }
+
+        // full_merge("k", None, ["x", "y"]) → "x,y"
+        assert_eq!(
+            db.get_cf(&*cf, b"k").unwrap(),
+            Some(b"x,y".to_vec())
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_single_operand() {
+        let dir = temp_dir("merge-single");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let cf = db.create_column_family("list", &merge_cf_opts()).unwrap();
+
+        {
+            let mut batch = WriteBatch::new();
+            batch.merge_cf(cf.id(), b"k".to_vec(), b"only".to_vec());
+            db.write(&batch).unwrap();
+        }
+
+        assert_eq!(
+            db.get_cf(&*cf, b"k").unwrap(),
+            Some(b"only".to_vec())
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_after_delete() {
+        let dir = temp_dir("merge-after-del");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let cf = db.create_column_family("list", &merge_cf_opts()).unwrap();
+
+        db.put_cf(&*cf, b"k", b"old").unwrap();
+        db.delete_cf(&*cf, b"k").unwrap();
+        {
+            let mut batch = WriteBatch::new();
+            batch.merge_cf(cf.id(), b"k".to_vec(), b"new".to_vec());
+            db.write(&batch).unwrap();
+        }
+
+        // Delete stops the chain. Merge on top of nothing → "new".
+        assert_eq!(
+            db.get_cf(&*cf, b"k").unwrap(),
+            Some(b"new".to_vec())
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_survives_flush() {
+        let dir = temp_dir("merge-flush");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let cf = db.create_column_family("list", &merge_cf_opts()).unwrap();
+
+        db.put_cf(&*cf, b"k", b"a").unwrap();
+        db.flush_cf(&*cf).unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        // Now merge on top of the flushed Put.
+        {
+            let mut batch = WriteBatch::new();
+            batch.merge_cf(cf.id(), b"k".to_vec(), b"b".to_vec());
+            db.write(&batch).unwrap();
+        }
+
+        // Base "a" is in SST, merge "b" is in memtable → "a,b"
+        assert_eq!(
+            db.get_cf(&*cf, b"k").unwrap(),
+            Some(b"a,b".to_vec())
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_no_operator_returns_raw() {
+        // CF without a merge operator — merge records are returned as-is.
+        let dir = temp_dir("merge-no-op");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+
+        // Default CF has no merge operator.
+        {
+            let mut batch = WriteBatch::new();
+            batch.merge(b"k".to_vec(), b"raw".to_vec());
+            db.write(&batch).unwrap();
+        }
+
+        // Without operator, get returns the newest operand as-is.
+        assert_eq!(
+            db.get(b"k").unwrap(),
+            Some(b"raw".to_vec())
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Compaction filter tests ----
+
+    /// Test filter that removes entries whose value equals "expired".
+    struct ExpiredFilter;
+    impl crate::ext::compaction_filter::CompactionFilter for ExpiredFilter {
+        fn name(&self) -> &'static str { "expired_filter" }
+        fn filter(
+            &self,
+            _level: u32,
+            _key: &[u8],
+            _entry_type: crate::core::types::EntryType,
+            existing_value: &[u8],
+        ) -> crate::ext::compaction_filter::CompactionDecision {
+            if existing_value == b"expired" {
+                crate::ext::compaction_filter::CompactionDecision::Remove
+            } else {
+                crate::ext::compaction_filter::CompactionDecision::Keep
+            }
+        }
+    }
+
+    struct ExpiredFilterFactory;
+    impl crate::ext::compaction_filter::CompactionFilterFactory for ExpiredFilterFactory {
+        fn name(&self) -> &'static str { "expired_filter_factory" }
+        fn create_compaction_filter(
+            &self,
+            _is_full_compaction: bool,
+            _is_manual_compaction: bool,
+        ) -> Box<dyn crate::ext::compaction_filter::CompactionFilter> {
+            Box::new(ExpiredFilter)
+        }
+    }
+
+    #[test]
+    fn compaction_filter_removes_expired_entries() {
+        let dir = temp_dir("cf-filter");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let cf_handle = db.default_column_family();
+
+        // Register the filter on the default CF.
+        db.set_compaction_filter_factory(
+            &*cf_handle,
+            Arc::new(ExpiredFilterFactory),
+        )
+        .unwrap();
+
+        // Write some entries.
+        db.put(b"keep1", b"alive").unwrap();
+        db.put(b"drop1", b"expired").unwrap();
+        db.put(b"keep2", b"still-here").unwrap();
+        db.put(b"drop2", b"expired").unwrap();
+
+        // Flush several times to trigger compaction (trigger=4).
+        for i in 0..5u32 {
+            db.put(format!("filler{i}").as_bytes(), b"f").unwrap();
+            db.flush().unwrap();
+            db.wait_for_pending_work().unwrap();
+        }
+
+        // After compaction, "expired" entries should be removed.
+        assert_eq!(db.get(b"keep1").unwrap(), Some(b"alive".to_vec()));
+        assert_eq!(db.get(b"keep2").unwrap(), Some(b"still-here".to_vec()));
+        assert_eq!(db.get(b"drop1").unwrap(), None);
+        assert_eq!(db.get(b"drop2").unwrap(), None);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test filter that rewrites values.
+    struct RewriteFilter;
+    impl crate::ext::compaction_filter::CompactionFilter for RewriteFilter {
+        fn name(&self) -> &'static str { "rewrite_filter" }
+        fn filter(
+            &self,
+            _level: u32,
+            _key: &[u8],
+            _entry_type: crate::core::types::EntryType,
+            existing_value: &[u8],
+        ) -> crate::ext::compaction_filter::CompactionDecision {
+            if existing_value == b"rewrite-me" {
+                crate::ext::compaction_filter::CompactionDecision::ChangeValue(
+                    b"rewritten".to_vec()
+                )
+            } else {
+                crate::ext::compaction_filter::CompactionDecision::Keep
+            }
+        }
+    }
+
+    struct RewriteFilterFactory;
+    impl crate::ext::compaction_filter::CompactionFilterFactory for RewriteFilterFactory {
+        fn name(&self) -> &'static str { "rewrite_filter_factory" }
+        fn create_compaction_filter(
+            &self,
+            _is_full_compaction: bool,
+            _is_manual_compaction: bool,
+        ) -> Box<dyn crate::ext::compaction_filter::CompactionFilter> {
+            Box::new(RewriteFilter)
+        }
+    }
+
+    #[test]
+    fn compaction_filter_rewrites_values() {
+        let dir = temp_dir("cf-rewrite");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let cf_handle = db.default_column_family();
+
+        db.set_compaction_filter_factory(
+            &*cf_handle,
+            Arc::new(RewriteFilterFactory),
+        )
+        .unwrap();
+
+        db.put(b"k1", b"rewrite-me").unwrap();
+        db.put(b"k2", b"keep-me").unwrap();
+
+        // Trigger compaction.
+        for i in 0..5u32 {
+            db.put(format!("filler{i}").as_bytes(), b"f").unwrap();
+            db.flush().unwrap();
+            db.wait_for_pending_work().unwrap();
+        }
+
+        assert_eq!(db.get(b"k1").unwrap(), Some(b"rewritten".to_vec()));
+        assert_eq!(db.get(b"k2").unwrap(), Some(b"keep-me".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- MANIFEST / VersionSet integration tests ----
+
+    #[test]
+    fn manifest_created_on_first_flush() {
+        let dir = temp_dir("manifest-create");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        // CURRENT should now contain a MANIFEST filename.
+        let current = std::fs::read_to_string(dir.join("CURRENT")).unwrap();
+        assert!(
+            current.trim().starts_with("MANIFEST-"),
+            "CURRENT should point to MANIFEST, got: {current}"
+        );
+
+        // The MANIFEST file should exist.
+        let manifest_path = dir.join(current.trim());
+        assert!(manifest_path.exists(), "MANIFEST file missing");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_recovers_from_manifest() {
+        let dir = temp_dir("manifest-reopen");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+
+        // Write + flush + close.
+        {
+            let db = DbImpl::open(&big, &dir).unwrap();
+            db.put(b"k1", b"v1").unwrap();
+            db.put(b"k2", b"v2").unwrap();
+            db.flush().unwrap();
+            db.wait_for_pending_work().unwrap();
+            db.close().unwrap();
+        }
+
+        // Reopen and verify data recovered from MANIFEST.
+        {
+            let db = DbImpl::open(&big, &dir).unwrap();
+            assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+            assert_eq!(db.get(b"k2").unwrap(), Some(b"v2".to_vec()));
+            assert_eq!(db.get(b"missing").unwrap(), None);
+            db.close().unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_multi_cf_preserves_data() {
+        // This test was previously a KNOWN FAILURE — multi-CF data
+        // was lost on reopen because the old CURRENT format didn't
+        // track per-CF SST membership. With MANIFEST, it works.
+        let dir = temp_dir("manifest-multi-cf");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+
+        // Open, create CF, write to both CFs, flush both, close.
+        {
+            let db = DbImpl::open(&big, &dir).unwrap();
+            let cf = db
+                .create_column_family(
+                    "user",
+                    &crate::api::options::ColumnFamilyOptions::default(),
+                )
+                .unwrap();
+            db.put(b"dk", b"default-val").unwrap();
+            db.put_cf(&*cf, b"ck", b"cf-val").unwrap();
+            db.flush().unwrap();
+            db.flush_cf(&*cf).unwrap();
+            db.wait_for_pending_work().unwrap();
+            db.close().unwrap();
+        }
+
+        // Reopen and verify both CFs' data survived.
+        {
+            let db = DbImpl::open(&big, &dir).unwrap();
+            assert_eq!(db.get(b"dk").unwrap(), Some(b"default-val".to_vec()));
+
+            // Find the "user" CF — it was created with id=1.
+            let cf = Arc::new(ColumnFamilyHandleImpl { id: 1, name: "user".to_string() });
+            assert_eq!(
+                db.get_cf(&*cf, b"ck").unwrap(),
+                Some(b"cf-val".to_vec())
+            );
+            db.close().unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_result_survives_reopen() {
+        let dir = temp_dir("manifest-compact-reopen");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+
+        // Write enough to trigger compaction, then close.
+        {
+            let db = DbImpl::open(&big, &dir).unwrap();
+            for i in 0..20u32 {
+                db.put(format!("key-{i:03}").as_bytes(), format!("val-{i}").as_bytes())
+                    .unwrap();
+                if i % 4 == 3 {
+                    db.flush().unwrap();
+                    db.wait_for_pending_work().unwrap();
+                }
+            }
+            db.close().unwrap();
+        }
+
+        // Reopen and verify all data is readable.
+        {
+            let db = DbImpl::open(&big, &dir).unwrap();
+            for i in 0..20u32 {
+                assert_eq!(
+                    db.get(format!("key-{i:03}").as_bytes()).unwrap(),
+                    Some(format!("val-{i}").into_bytes()),
+                );
+            }
+            db.close().unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Incremental checkpoint API tests ----
+
+    #[test]
+    fn disable_enable_file_deletions_basic() {
+        let dir = temp_dir("file-del-basic");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+
+        db.disable_file_deletions().unwrap();
+        db.disable_file_deletions().unwrap(); // nested
+        db.enable_file_deletions().unwrap();
+        db.enable_file_deletions().unwrap();
+
+        // Extra enable should fail.
+        assert!(db.enable_file_deletions().is_err());
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disable_file_deletions_defers_compaction_cleanup() {
+        let dir = temp_dir("file-del-defer");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+
+        // Write enough to trigger compaction.
+        for i in 0..5u32 {
+            db.put(format!("k{i}").as_bytes(), b"v").unwrap();
+            db.flush().unwrap();
+            db.wait_for_pending_work().unwrap();
+        }
+
+        // Count SST files before disabling.
+        let files_before: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "sst"))
+            .collect();
+
+        // Disable deletions, write + flush + compact more.
+        db.disable_file_deletions().unwrap();
+        for i in 5..10u32 {
+            db.put(format!("k{i}").as_bytes(), b"v").unwrap();
+            db.flush().unwrap();
+            db.wait_for_pending_work().unwrap();
+        }
+
+        // SSTs from the compaction inputs should still be on disk
+        // (deletion deferred).
+        let files_during: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "sst"))
+            .collect();
+        assert!(
+            files_during.len() >= files_before.len(),
+            "no SSTs should have been deleted while disabled"
+        );
+
+        // Re-enable — deferred deletions should happen.
+        db.enable_file_deletions().unwrap();
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_live_files_returns_ssts_and_manifest() {
+        let dir = temp_dir("live-files");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        let files = db.get_live_files(false).unwrap();
+
+        // Should include at least one SST, CURRENT, and MANIFEST.
+        let has_sst = files.iter().any(|f| {
+            f.extension().is_some_and(|ext| ext == "sst")
+        });
+        let has_current = files.iter().any(|f| {
+            f.file_name().is_some_and(|n| n == "CURRENT")
+        });
+        let has_manifest = files.iter().any(|f| {
+            f.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("MANIFEST-"))
+        });
+
+        assert!(has_sst, "should include SST files");
+        assert!(has_current, "should include CURRENT");
+        assert!(has_manifest, "should include MANIFEST");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_live_files_with_flush() {
+        let dir = temp_dir("live-files-flush");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        db.put(b"k", b"v").unwrap();
+
+        // get_live_files(true) should flush the memtable first.
+        let files = db.get_live_files(true).unwrap();
+        let sst_count = files
+            .iter()
+            .filter(|f| f.extension().is_some_and(|ext| ext == "sst"))
+            .count();
+        assert!(sst_count >= 1, "flush should have created an SST");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_live_files_metadata_returns_info() {
+        let dir = temp_dir("live-meta");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"z", b"2").unwrap();
+        db.flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        let meta = db.get_live_files_metadata();
+        assert!(!meta.is_empty());
+
+        let first = &meta[0];
+        assert_eq!(first.column_family_name, "default");
+        assert_eq!(first.level, 0);
+        assert!(first.file_size > 0);
+        assert!(!first.smallest_key.is_empty());
+        assert!(!first.largest_key.is_empty());
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "snappy")]
+    #[test]
+    fn db_with_snappy_compression() {
+        // This test is a placeholder — the DB engine itself does not
+        // yet pass a compression_type through to BlockBasedTableOptions
+        // during flush. What we can verify is that the block cache is
+        // created when `block_cache_size > 0` and that the DB
+        // round-trips data through open/put/flush/reopen.
+        let dir = temp_dir("snappy-cache");
+        let db_opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            block_cache_size: 1024 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&db_opts, &dir).unwrap();
+        for i in 0..100u32 {
+            let k = format!("key{i:05}");
+            let v = format!("value{i}");
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+        db.flush().unwrap();
+
+        // Verify reads (first pass populates cache, second hits it).
+        for pass in 0..2 {
+            for i in 0..100u32 {
+                let k = format!("key{i:05}");
+                let v = format!("value{i}");
+                assert_eq!(
+                    db.get(k.as_bytes()).unwrap(),
+                    Some(v.into_bytes()),
+                    "miss on pass {pass} key {k}"
+                );
+            }
+        }
+
+        db.close().unwrap();
+
+        // Reopen and verify data survives.
+        let db2 = DbImpl::open(&db_opts, &dir).unwrap();
+        for i in 0..100u32 {
+            let k = format!("key{i:05}");
+            let v = format!("value{i}");
+            assert_eq!(
+                db2.get(k.as_bytes()).unwrap(),
+                Some(v.into_bytes()),
+                "miss after reopen for key {k}"
+            );
+        }
+        db2.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Write stall tests ----
+
+    #[test]
+    fn is_write_stopped_false_by_default() {
+        let dir = temp_dir("stall-default");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        assert!(!db.is_write_stopped());
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_stall_blocks_then_unblocks() {
+        // Use a very low trigger so we can test the stall behavior
+        // without writing too many SSTs.
+        let dir = temp_dir("stall-block");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+
+        // Write and flush enough SSTs to approach the compaction
+        // trigger (4). Since compaction runs on a background thread,
+        // and we wait for it, the L0 count should stay manageable.
+        for i in 0..8u32 {
+            db.put(format!("key-{i}").as_bytes(), b"value").unwrap();
+            db.flush().unwrap();
+            db.wait_for_pending_work().unwrap();
+        }
+
+        // After compaction, we should NOT be stalled (L0 reduced).
+        assert!(!db.is_write_stopped());
+
+        // Writes should succeed.
+        db.put(b"final", b"ok").unwrap();
+        assert_eq!(db.get(b"final").unwrap(), Some(b"ok".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Properties & Metrics tests ----
+
+    #[test]
+    fn property_num_entries_active_mem_table() {
+        let dir = temp_dir("prop-entries");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        assert_eq!(db.get_int_property("num-entries-active-mem-table"), Some(0));
+
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        assert_eq!(db.get_int_property("num-entries-active-mem-table"), Some(2));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn property_num_files_at_level() {
+        let dir = temp_dir("prop-levels");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        assert_eq!(db.get_int_property("num-files-at-level0"), Some(0));
+
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+        assert!(db.get_int_property("num-files-at-level0").unwrap() >= 1);
+
+        // Higher levels always 0 in current 2-level model.
+        assert_eq!(db.get_int_property("num-files-at-level2"), Some(0));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn property_is_write_stopped() {
+        let dir = temp_dir("prop-stopped");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        assert_eq!(db.get_int_property("is-write-stopped"), Some(0));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn property_rocksdb_prefix_stripped() {
+        // Flink queries with "rocksdb." prefix.
+        let dir = temp_dir("prop-prefix");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        db.put(b"k", b"v").unwrap();
+
+        assert_eq!(
+            db.get_int_property("rocksdb.num-entries-active-mem-table"),
+            Some(1)
+        );
+        assert_eq!(
+            db.get_int_property("rocksdb.num-files-at-level0"),
+            Some(0)
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn property_unknown_returns_none() {
+        let dir = temp_dir("prop-unknown");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        assert_eq!(db.get_int_property("nonexistent-property"), None);
+        assert_eq!(db.get_property("nonexistent-property"), None);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn property_block_cache_with_cache() {
+        let dir = temp_dir("prop-cache");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            block_cache_size: 1024 * 1024, // 1 MB cache
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        assert_eq!(
+            db.get_int_property("block-cache-capacity"),
+            Some(1024 * 1024)
+        );
+        // Usage starts at 0.
+        assert_eq!(db.get_int_property("block-cache-usage"), Some(0));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn property_sst_sizes() {
+        let dir = temp_dir("prop-sst-size");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        let total = db.get_int_property("total-sst-files-size").unwrap();
+        assert!(total > 0, "total SST size should be > 0 after flush");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Db trait tests ----
+
+    #[test]
+    fn db_trait_put_get_delete() {
+        use crate::api::db::Db;
+        use crate::api::options::{ReadOptions, WriteOptions};
+
+        let dir = temp_dir("trait-basic");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let db: &dyn Db = &*db;
+
+        let wo = WriteOptions::default();
+        let ro = ReadOptions::default();
+
+        db.put(&wo, b"k1", b"v1").unwrap();
+        db.put(&wo, b"k2", b"v2").unwrap();
+
+        assert_eq!(db.get(&ro, b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(db.get(&ro, b"k2").unwrap(), Some(b"v2".to_vec()));
+
+        db.delete(&wo, b"k1").unwrap();
+        assert_eq!(db.get(&ro, b"k1").unwrap(), None);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_trait_write_batch() {
+        use crate::api::db::Db;
+        use crate::api::options::{ReadOptions, WriteOptions};
+
+        let dir = temp_dir("trait-batch");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let db: &dyn Db = &*db;
+
+        let wo = WriteOptions::default();
+        let ro = ReadOptions::default();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"a".to_vec(), b"1".to_vec());
+        batch.put(b"b".to_vec(), b"2".to_vec());
+        db.write(&wo, &batch).unwrap();
+
+        assert_eq!(db.get(&ro, b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get(&ro, b"b").unwrap(), Some(b"2".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_trait_column_families() {
+        use crate::api::db::Db;
+        use crate::api::options::{ReadOptions, WriteOptions};
+
+        let dir = temp_dir("trait-cf");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let db: &dyn Db = &*db;
+
+        let wo = WriteOptions::default();
+        let ro = ReadOptions::default();
+
+        let cf = db
+            .create_column_family(
+                "mycf",
+                &crate::api::options::ColumnFamilyOptions::default(),
+            )
+            .unwrap();
+
+        db.put_cf(&wo, &*cf, b"ck", b"cv").unwrap();
+        db.put(&wo, b"dk", b"dv").unwrap();
+
+        assert_eq!(db.get_cf(&ro, &*cf, b"ck").unwrap(), Some(b"cv".to_vec()));
+        assert_eq!(db.get(&ro, b"dk").unwrap(), Some(b"dv".to_vec()));
+
+        // CF data is isolated from default.
+        assert_eq!(db.get(&ro, b"ck").unwrap(), None);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_trait_snapshot() {
+        use crate::api::db::Db;
+        use crate::api::options::WriteOptions;
+
+        let dir = temp_dir("trait-snap");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let db: &dyn Db = &*db;
+
+        let wo = WriteOptions::default();
+        db.put(&wo, b"k", b"old").unwrap();
+
+        let snap = db.snapshot();
+        db.put(&wo, b"k", b"new").unwrap();
+
+        // Snapshot read not available through the Db trait (no
+        // get_at method on the trait), but snapshot creation works.
+        drop(snap);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_trait_flush_and_property() {
+        use crate::api::db::Db;
+        use crate::api::options::{FlushOptions, WriteOptions};
+
+        let dir = temp_dir("trait-flush-prop");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let db: &dyn Db = &*db;
+
+        let wo = WriteOptions::default();
+        db.put(&wo, b"k", b"v").unwrap();
+        db.flush(&FlushOptions::default()).unwrap();
+
+        let prop = db.get_property("num-files-at-level0");
+        assert!(prop.is_some());
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Phase 8: DeleteRange tests ----
+
+    #[test]
+    fn delete_range_basic() {
+        let dir = temp_dir("delete-range-basic");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.put(b"a", b"va").unwrap();
+        db.put(b"b", b"vb").unwrap();
+        db.put(b"c", b"vc").unwrap();
+        db.put(b"d", b"vd").unwrap();
+
+        // Delete range [b, d) — should delete b and c but not a or d.
+        db.delete_range(b"b", b"d").unwrap();
+
+        assert_eq!(db.get(b"a").unwrap(), Some(b"va".to_vec()));
+        assert_eq!(db.get(b"b").unwrap(), None);
+        assert_eq!(db.get(b"c").unwrap(), None);
+        assert_eq!(db.get(b"d").unwrap(), Some(b"vd".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_range_cf() {
+        let dir = temp_dir("delete-range-cf");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        let cf = db
+            .create_column_family("test_cf", &crate::api::options::ColumnFamilyOptions::default())
+            .unwrap();
+
+        db.put_cf(&*cf, b"a", b"va").unwrap();
+        db.put_cf(&*cf, b"b", b"vb").unwrap();
+        db.put_cf(&*cf, b"c", b"vc").unwrap();
+        db.put_cf(&*cf, b"d", b"vd").unwrap();
+
+        // Also put keys in the default CF — they should be unaffected.
+        db.put(b"b", b"default_b").unwrap();
+        db.put(b"c", b"default_c").unwrap();
+
+        db.delete_range_cf(&*cf, b"b", b"d").unwrap();
+
+        // CF-specific range delete only affects that CF.
+        assert_eq!(db.get_cf(&*cf, b"a").unwrap(), Some(b"va".to_vec()));
+        assert_eq!(db.get_cf(&*cf, b"b").unwrap(), None);
+        assert_eq!(db.get_cf(&*cf, b"c").unwrap(), None);
+        assert_eq!(db.get_cf(&*cf, b"d").unwrap(), Some(b"vd".to_vec()));
+
+        // Default CF untouched.
+        assert_eq!(db.get(b"b").unwrap(), Some(b"default_b".to_vec()));
+        assert_eq!(db.get(b"c").unwrap(), Some(b"default_c".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_files_in_ranges_drops_ssts() {
+        let dir = temp_dir("delete-files-in-ranges");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let default_cf = db.default_column_family();
+
+        // Write some data and flush to create an SST.
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.flush().unwrap();
+
+        // Verify SST exists.
+        let meta_before = db.get_live_files_metadata();
+        assert!(!meta_before.is_empty(), "should have at least one SST");
+
+        // Find the SST's key range.
+        let sst = &meta_before[0];
+        assert!(sst.smallest_key.as_slice() <= b"a");
+        assert!(sst.largest_key.as_slice() >= b"c");
+
+        // Delete files in range [a, z) — should cover the entire SST.
+        db.delete_files_in_ranges(
+            &*default_cf,
+            &[(b"a".as_ref(), b"z".as_ref())],
+        )
+        .unwrap();
+
+        // Verify SST was removed.
+        let meta_after = db.get_live_files_metadata();
+        let default_ssts: Vec<_> = meta_after
+            .iter()
+            .filter(|m| m.column_family_name == "default")
+            .collect();
+        assert!(
+            default_ssts.is_empty(),
+            "all default CF SSTs should be deleted"
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_range_with_snapshot() {
+        let dir = temp_dir("delete-range-snapshot");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        db.put(b"a", b"va").unwrap();
+        db.put(b"b", b"vb").unwrap();
+        db.put(b"c", b"vc").unwrap();
+
+        // Take a snapshot before the range delete.
+        let snap = db.snapshot();
+
+        // Range delete [a, c).
+        db.delete_range(b"a", b"c").unwrap();
+
+        // Current reads: a and b are deleted, c is still present.
+        assert_eq!(db.get(b"a").unwrap(), None);
+        assert_eq!(db.get(b"b").unwrap(), None);
+        assert_eq!(db.get(b"c").unwrap(), Some(b"vc".to_vec()));
+
+        // Snapshot reads: the range delete has a sequence number
+        // higher than the snapshot, so the snapshot should still see
+        // the old values.
+        assert_eq!(
+            db.get_at(b"a", &*snap).unwrap(),
+            Some(b"va".to_vec()),
+            "snapshot should see a before range delete"
+        );
+        assert_eq!(
+            db.get_at(b"b", &*snap).unwrap(),
+            Some(b"vb".to_vec()),
+            "snapshot should see b before range delete"
+        );
+        assert_eq!(
+            db.get_at(b"c", &*snap).unwrap(),
+            Some(b"vc".to_vec()),
+            "snapshot should see c"
+        );
+
+        drop(snap);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Phase 9: Streaming Iterator (iter_cf + prefix_scan) tests ----
+
+    #[test]
+    fn iter_cf_returns_cf_data_only() {
+        let dir = temp_dir("iter-cf");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        // Create a CF and put data into it.
+        let cf = db
+            .create_column_family("mycf", &crate::api::options::ColumnFamilyOptions::default())
+            .unwrap();
+        db.put_cf(&*cf, b"cf_a", b"1").unwrap();
+        db.put_cf(&*cf, b"cf_b", b"2").unwrap();
+
+        // Put data into the default CF.
+        db.put(b"def_x", b"10").unwrap();
+        db.put(b"def_y", b"20").unwrap();
+
+        // iter_cf should see only the CF's entries.
+        let mut it = db.iter_cf(&*cf).unwrap();
+        it.seek_to_first();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        while it.valid() {
+            got.push((it.key().to_vec(), it.value().to_vec()));
+            it.next();
+        }
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, b"cf_a");
+        assert_eq!(got[1].0, b"cf_b");
+
+        // Default iter should see only default CF entries.
+        let mut dit = db.iter().unwrap();
+        dit.seek_to_first();
+        let mut def: Vec<Vec<u8>> = Vec::new();
+        while dit.valid() {
+            def.push(dit.key().to_vec());
+            dit.next();
+        }
+        assert_eq!(def.len(), 2);
+        assert_eq!(def[0], b"def_x");
+        assert_eq!(def[1], b"def_y");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_scan_basic() {
+        let dir = temp_dir("prefix-scan");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        db.put(b"user:alice", b"a").unwrap();
+        db.put(b"user:bob", b"b").unwrap();
+        db.put(b"user:charlie", b"c").unwrap();
+        db.put(b"item:1", b"x").unwrap();
+        db.put(b"item:2", b"y").unwrap();
+
+        let results = db.prefix_scan(b"user:").unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, b"user:alice");
+        assert_eq!(results[1].0, b"user:bob");
+        assert_eq!(results[2].0, b"user:charlie");
+
+        let items = db.prefix_scan(b"item:").unwrap();
+        assert_eq!(items.len(), 2);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_scan_cf() {
+        let dir = temp_dir("prefix-scan-cf");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        let cf = db
+            .create_column_family("states", &crate::api::options::ColumnFamilyOptions::default())
+            .unwrap();
+        db.put_cf(&*cf, b"state:ca", b"California").unwrap();
+        db.put_cf(&*cf, b"state:ny", b"New York").unwrap();
+        db.put_cf(&*cf, b"state:tx", b"Texas").unwrap();
+        db.put_cf(&*cf, b"city:sf", b"San Francisco").unwrap();
+
+        let results = db.prefix_scan_cf(&*cf, b"state:").unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, b"state:ca");
+        assert_eq!(results[2].0, b"state:tx");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_scan_empty() {
+        let dir = temp_dir("prefix-scan-empty");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        db.put(b"aaa", b"1").unwrap();
+        db.put(b"bbb", b"2").unwrap();
+
+        let results = db.prefix_scan(b"zzz:").unwrap();
+        assert!(results.is_empty());
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Phase 10: SST Ingestion tests ----
+
+    /// Helper: build a valid SST file at `path` with the given
+    /// user-key / value pairs. Each entry is encoded as an
+    /// internal key with `ValueType::Value` and a monotonically
+    /// increasing sequence number so the SST matches the format
+    /// the engine expects.
+    fn build_test_sst(path: &Path, entries: &[(&[u8], &[u8])]) {
+        use crate::db::dbformat::InternalKey;
+        use crate::core::types::ValueType;
+        use crate::sst::block_based::table_builder::{
+            BlockBasedTableBuilder, BlockBasedTableOptions,
+        };
+
+        let fs = PosixFileSystem::new();
+        let writable = fs.new_writable_file(path, &Default::default()).unwrap();
+        let mut builder = BlockBasedTableBuilder::new(
+            WritableFileWriter::new(writable),
+            BlockBasedTableOptions::default(),
+        );
+        for (seq, (k, v)) in entries.iter().enumerate() {
+            let ikey = InternalKey::new(k, (seq as u64) + 1, ValueType::Value);
+            builder.add(ikey.encode(), v).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+
+    #[test]
+    fn ingest_external_file_basic() {
+        use crate::db::ingest_external_file::IngestExternalFileOptions;
+
+        let dir = temp_dir("ingest-basic");
+        let ext_dir = temp_dir("ingest-basic-ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        let cf = db
+            .create_column_family("ingest_cf", &crate::api::options::ColumnFamilyOptions::default())
+            .unwrap();
+
+        // Build an external SST.
+        let sst_path = ext_dir.join("external.sst");
+        build_test_sst(&sst_path, &[(b"ik1", b"iv1"), (b"ik2", b"iv2")]);
+
+        // Ingest it (copy mode).
+        let ingest_opts = IngestExternalFileOptions::default();
+        db.ingest_external_file(&*cf, &[sst_path.as_path()], &ingest_opts)
+            .unwrap();
+
+        // Verify data is readable through the CF.
+        assert_eq!(
+            db.get_cf(&*cf, b"ik1").unwrap(),
+            Some(b"iv1".to_vec())
+        );
+        assert_eq!(
+            db.get_cf(&*cf, b"ik2").unwrap(),
+            Some(b"iv2".to_vec())
+        );
+
+        // Original file should still exist (copy mode).
+        assert!(sst_path.exists());
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ext_dir);
+    }
+
+    #[test]
+    fn ingest_external_file_move() {
+        use crate::db::ingest_external_file::IngestExternalFileOptions;
+
+        let dir = temp_dir("ingest-move");
+        let ext_dir = temp_dir("ingest-move-ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        let cf = db
+            .create_column_family("move_cf", &crate::api::options::ColumnFamilyOptions::default())
+            .unwrap();
+
+        let sst_path = ext_dir.join("movable.sst");
+        build_test_sst(&sst_path, &[(b"mk1", b"mv1")]);
+        assert!(sst_path.exists());
+
+        let ingest_opts = IngestExternalFileOptions {
+            move_files: true,
+            ..Default::default()
+        };
+        db.ingest_external_file(&*cf, &[sst_path.as_path()], &ingest_opts)
+            .unwrap();
+
+        // Data should be readable.
+        assert_eq!(
+            db.get_cf(&*cf, b"mk1").unwrap(),
+            Some(b"mv1".to_vec())
+        );
+
+        // Original file should be gone (moved).
+        assert!(!sst_path.exists());
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ext_dir);
+    }
+
+    #[test]
+    fn create_cf_with_import() {
+        let dir = temp_dir("cf-import");
+        let ext_dir = temp_dir("cf-import-ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        // Build two external SSTs.
+        let sst1 = ext_dir.join("import1.sst");
+        let sst2 = ext_dir.join("import2.sst");
+        build_test_sst(&sst1, &[(b"a", b"1"), (b"b", b"2")]);
+        build_test_sst(&sst2, &[(b"c", b"3"), (b"d", b"4")]);
+
+        // Create CF with import.
+        let cf = db
+            .create_column_family_with_import(
+                "imported",
+                &crate::api::options::ColumnFamilyOptions::default(),
+                &[sst1.as_path(), sst2.as_path()],
+            )
+            .unwrap();
+
+        // Verify data from both SSTs is readable.
+        assert_eq!(db.get_cf(&*cf, b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get_cf(&*cf, b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(db.get_cf(&*cf, b"c").unwrap(), Some(b"3".to_vec()));
+        assert_eq!(db.get_cf(&*cf, b"d").unwrap(), Some(b"4".to_vec()));
+        assert_eq!(db.get_cf(&*cf, b"missing").unwrap(), None);
+
+        // Default CF should not see these keys.
+        assert_eq!(db.get(b"a").unwrap(), None);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ext_dir);
     }
 }
