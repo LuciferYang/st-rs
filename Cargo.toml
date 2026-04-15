@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "st-rs-jni"]
+
 [package]
 name = "st-rs"
 version = "0.0.1"

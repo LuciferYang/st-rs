@@ -1,0 +1,15 @@
+[package]
+name = "st-rs-jni"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+description = "JNI bindings for st-rs — exposes the Rust LSM engine to Java (org.forstdb API)"
+license = "Apache-2.0"
+
+[lib]
+name = "st_rs_jni"
+crate-type = ["cdylib"]
+
+[dependencies]
+st-rs = { path = "..", features = ["snappy", "lz4"] }
+jni = "0.21"
