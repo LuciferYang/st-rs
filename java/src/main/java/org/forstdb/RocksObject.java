@@ -37,7 +37,7 @@ public abstract class RocksObject implements AutoCloseable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
         if (nativeHandle_ != 0) {
             disposeInternal(nativeHandle_);
             nativeHandle_ = 0;

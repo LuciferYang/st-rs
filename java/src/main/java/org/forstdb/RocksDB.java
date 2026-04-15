@@ -54,11 +54,11 @@ public class RocksDB implements AutoCloseable {
 
     public byte[] get(final ColumnFamilyHandle cf, final byte[] key)
             throws RocksDBException {
-        return get(nativeHandle_, cf.getNativeHandle(), key, key.length);
+        return get(nativeHandle_, cf.getNativeHandle(), key);
     }
 
     public byte[] get(final byte[] key) throws RocksDBException {
-        return get(nativeHandle_, 0, key, key.length);
+        return get(nativeHandle_, 0, key);
     }
 
     // --- Put ---
@@ -66,12 +66,12 @@ public class RocksDB implements AutoCloseable {
     public void put(final ColumnFamilyHandle cf, final WriteOptions opts,
             final byte[] key, final byte[] value) throws RocksDBException {
         put(nativeHandle_, cf.getNativeHandle(), opts.getNativeHandle(),
-                key, key.length, value, value.length);
+                key, value);
     }
 
     public void put(final byte[] key, final byte[] value)
             throws RocksDBException {
-        put(nativeHandle_, 0, 0, key, key.length, value, value.length);
+        put(nativeHandle_, 0, 0, key, value);
     }
 
     // --- Delete ---
@@ -79,7 +79,7 @@ public class RocksDB implements AutoCloseable {
     public void delete(final ColumnFamilyHandle cf, final WriteOptions opts,
             final byte[] key) throws RocksDBException {
         delete(nativeHandle_, cf.getNativeHandle(), opts.getNativeHandle(),
-                key, key.length);
+                key);
     }
 
     // --- Merge ---
@@ -87,7 +87,7 @@ public class RocksDB implements AutoCloseable {
     public void merge(final ColumnFamilyHandle cf, final WriteOptions opts,
             final byte[] key, final byte[] value) throws RocksDBException {
         merge(nativeHandle_, cf.getNativeHandle(), opts.getNativeHandle(),
-                key, key.length, value, value.length);
+                key, value);
     }
 
     // --- WriteBatch ---
@@ -162,19 +162,19 @@ public class RocksDB implements AutoCloseable {
             throws RocksDBException;
 
     private static native byte[] get(long dbHandle, long cfHandle,
-            byte[] key, int keyLength) throws RocksDBException;
+            byte[] key) throws RocksDBException;
 
     private static native void put(long dbHandle, long cfHandle,
-            long writeOptsHandle, byte[] key, int keyLength,
-            byte[] value, int valueLength) throws RocksDBException;
+            long writeOptsHandle, byte[] key,
+            byte[] value) throws RocksDBException;
 
     private static native void delete(long dbHandle, long cfHandle,
-            long writeOptsHandle, byte[] key, int keyLength)
+            long writeOptsHandle, byte[] key)
             throws RocksDBException;
 
     private static native void merge(long dbHandle, long cfHandle,
-            long writeOptsHandle, byte[] key, int keyLength,
-            byte[] value, int valueLength) throws RocksDBException;
+            long writeOptsHandle, byte[] key,
+            byte[] value) throws RocksDBException;
 
     private static native void write(long dbHandle, long writeOptsHandle,
             long batchHandle) throws RocksDBException;

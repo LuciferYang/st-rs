@@ -33,24 +33,22 @@ public class WriteBatch extends RocksObject {
 
     public void put(final ColumnFamilyHandle cf, final byte[] key,
             final byte[] value) throws RocksDBException {
-        put(nativeHandle_, cf.getNativeHandle(),
-                key, key.length, value, value.length);
+        put(nativeHandle_, cf.getNativeHandle(), key, value);
     }
 
     public void put(final byte[] key, final byte[] value)
             throws RocksDBException {
-        put(nativeHandle_, 0, key, key.length, value, value.length);
+        put(nativeHandle_, 0, key, value);
     }
 
     public void delete(final ColumnFamilyHandle cf, final byte[] key)
             throws RocksDBException {
-        delete(nativeHandle_, cf.getNativeHandle(), key, key.length);
+        delete(nativeHandle_, cf.getNativeHandle(), key);
     }
 
     public void merge(final ColumnFamilyHandle cf, final byte[] key,
             final byte[] value) throws RocksDBException {
-        merge(nativeHandle_, cf.getNativeHandle(),
-                key, key.length, value, value.length);
+        merge(nativeHandle_, cf.getNativeHandle(), key, value);
     }
 
     public int count() {
@@ -71,14 +69,14 @@ public class WriteBatch extends RocksObject {
     private static native long newWriteBatch();
 
     private static native void put(long batchHandle, long cfHandle,
-            byte[] key, int keyLength, byte[] value, int valueLength)
+            byte[] key, byte[] value)
             throws RocksDBException;
 
     private static native void delete(long batchHandle, long cfHandle,
-            byte[] key, int keyLength) throws RocksDBException;
+            byte[] key) throws RocksDBException;
 
     private static native void merge(long batchHandle, long cfHandle,
-            byte[] key, int keyLength, byte[] value, int valueLength)
+            byte[] key, byte[] value)
             throws RocksDBException;
 
     private static native int count(long batchHandle);

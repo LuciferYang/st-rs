@@ -45,10 +45,14 @@ fn to_handle<T>(obj: T) -> jlong {
     Box::into_raw(Box::new(obj)) as jlong
 }
 
-/// Recover a reference from a jlong handle. Caller must ensure the
-/// handle is valid and points to the correct type.
-unsafe fn from_handle<T>(handle: jlong) -> &'static T {
-    &*(handle as *const T)
+/// Recover a reference from a jlong handle. Returns `None` if the
+/// handle is null (zero). Caller must ensure a non-zero handle
+/// points to the correct type.
+unsafe fn from_handle<T>(handle: jlong) -> Option<&'static T> {
+    if handle == 0 {
+        return None;
+    }
+    Some(&*(handle as *const T))
 }
 
 /// Recover and drop a Rust object from a jlong handle.
@@ -103,7 +107,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_closeDatabase(
     _class: JClass,
     handle: jlong,
 ) {
-    let db = unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) };
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
     if let Err(e) = db.close() {
         throw_rocks_exception(&mut env, &e.to_string());
     }
@@ -128,7 +138,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_get__JJ_3B(
     cf_handle: jlong,
     key: JByteArray,
 ) -> jbyteArray {
-    let db = unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) };
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return std::ptr::null_mut();
+        }
+    };
     let key_bytes = match env.convert_byte_array(&key) {
         Ok(b) => b,
         Err(_) => {
@@ -140,7 +156,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_get__JJ_3B(
     let result = if cf_handle == 0 {
         db.get(&key_bytes)
     } else {
-        let cf = unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) };
+        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+            Some(cf) => cf,
+            None => {
+                throw_rocks_exception(&mut env, "null column family handle");
+                return std::ptr::null_mut();
+            }
+        };
         db.get_cf(cf, &key_bytes)
     };
 
@@ -171,7 +193,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_put__JJJ_3B_3B(
     key: JByteArray,
     value: JByteArray,
 ) {
-    let db = unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) };
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
     let key_bytes = match env.convert_byte_array(&key) {
         Ok(b) => b,
         Err(_) => {
@@ -190,7 +218,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_put__JJJ_3B_3B(
     let result = if cf_handle == 0 {
         db.put(&key_bytes, &val_bytes)
     } else {
-        let cf = unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) };
+        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+            Some(cf) => cf,
+            None => {
+                throw_rocks_exception(&mut env, "null column family handle");
+                return;
+            }
+        };
         db.put_cf(cf, &key_bytes, &val_bytes)
     };
 
@@ -209,7 +243,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_delete__JJJ_3B(
     _write_opts_handle: jlong,
     key: JByteArray,
 ) {
-    let db = unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) };
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
     let key_bytes = match env.convert_byte_array(&key) {
         Ok(b) => b,
         Err(_) => {
@@ -221,7 +261,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_delete__JJJ_3B(
     let result = if cf_handle == 0 {
         db.delete(&key_bytes)
     } else {
-        let cf = unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) };
+        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+            Some(cf) => cf,
+            None => {
+                throw_rocks_exception(&mut env, "null column family handle");
+                return;
+            }
+        };
         db.delete_cf(cf, &key_bytes)
     };
 
@@ -241,7 +287,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_merge__JJJ_3B_3B(
     key: JByteArray,
     value: JByteArray,
 ) {
-    let db = unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) };
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
     let key_bytes = match env.convert_byte_array(&key) {
         Ok(b) => b,
         Err(_) => {
@@ -261,7 +313,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_merge__JJJ_3B_3B(
     if cf_handle == 0 {
         batch.merge(key_bytes, val_bytes);
     } else {
-        let cf = unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) };
+        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+            Some(cf) => cf,
+            None => {
+                throw_rocks_exception(&mut env, "null column family handle");
+                return;
+            }
+        };
         use st_rs::api::db::ColumnFamilyHandle;
         batch.merge_cf(cf.id(), key_bytes, val_bytes);
     }
@@ -278,7 +336,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_flush__J(
     _this: JObject,
     handle: jlong,
 ) {
-    let db = unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) };
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
     if let Err(e) = db.flush() {
         throw_rocks_exception(&mut env, &e.to_string());
     }
@@ -292,7 +356,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getProperty__JLjava_lang_String_
     handle: jlong,
     name: JString,
 ) -> jstring {
-    let db = unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) };
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return std::ptr::null_mut();
+        }
+    };
     let prop_name: String = match env.get_string(&name) {
         Ok(s) => s.into(),
         Err(_) => return std::ptr::null_mut(),
@@ -314,7 +384,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_disableFileDeletions(
     _this: JObject,
     handle: jlong,
 ) {
-    let db = unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) };
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
     if let Err(e) = db.disable_file_deletions() {
         throw_rocks_exception(&mut env, &e.to_string());
     }
@@ -328,7 +404,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_enableFileDeletions(
     handle: jlong,
     _force: jboolean,
 ) {
-    let db = unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) };
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
     if let Err(e) = db.enable_file_deletions() {
         throw_rocks_exception(&mut env, &e.to_string());
     }
@@ -358,9 +440,9 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyHandle_getNativeHandle(
     handle
 }
 
-/// `ColumnFamilyHandle.disposeInternal(long handle)`
+/// `ColumnFamilyHandle.disposeColumnFamilyHandle(long handle)`
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_ColumnFamilyHandle_disposeInternal(
+pub extern "system" fn Java_org_forstdb_ColumnFamilyHandle_disposeColumnFamilyHandle(
     _env: JNIEnv,
     _this: JObject,
     handle: jlong,
@@ -380,7 +462,13 @@ pub extern "system" fn Java_org_forstdb_RocksDB_createColumnFamily(
     handle: jlong,
     name: JString,
 ) -> jlong {
-    let db = unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) };
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return 0;
+        }
+    };
     let cf_name: String = match env.get_string(&name) {
         Ok(s) => s.into(),
         Err(_) => {
@@ -420,20 +508,42 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_newWriteBatch(
 /// `WriteBatch.put(long handle, long cfHandle, byte[] key, byte[] value)`
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_WriteBatch_put__JJ_3B_3B(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _this: JObject,
     handle: jlong,
     cf_handle: jlong,
     key: JByteArray,
     value: JByteArray,
 ) {
+    if handle == 0 {
+        throw_rocks_exception(&mut env, "null handle");
+        return;
+    }
     let batch = unsafe { &mut *(handle as *mut st_rs::WriteBatch) };
-    let k = env.convert_byte_array(&key).unwrap_or_default();
-    let v = env.convert_byte_array(&value).unwrap_or_default();
+    let k = match env.convert_byte_array(&key) {
+        Ok(b) => b,
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read key");
+            return;
+        }
+    };
+    let v = match env.convert_byte_array(&value) {
+        Ok(b) => b,
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read value");
+            return;
+        }
+    };
     if cf_handle == 0 {
         batch.put(k, v);
     } else {
-        let cf = unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) };
+        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+            Some(cf) => cf,
+            None => {
+                throw_rocks_exception(&mut env, "null column family handle");
+                return;
+            }
+        };
         use st_rs::api::db::ColumnFamilyHandle;
         batch.put_cf(cf.id(), k, v);
     }
@@ -442,18 +552,34 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_put__JJ_3B_3B(
 /// `WriteBatch.delete(long handle, long cfHandle, byte[] key)`
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_WriteBatch_delete__JJ_3B(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _this: JObject,
     handle: jlong,
     cf_handle: jlong,
     key: JByteArray,
 ) {
+    if handle == 0 {
+        throw_rocks_exception(&mut env, "null handle");
+        return;
+    }
     let batch = unsafe { &mut *(handle as *mut st_rs::WriteBatch) };
-    let k = env.convert_byte_array(&key).unwrap_or_default();
+    let k = match env.convert_byte_array(&key) {
+        Ok(b) => b,
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read key");
+            return;
+        }
+    };
     if cf_handle == 0 {
         batch.delete(k);
     } else {
-        let cf = unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) };
+        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+            Some(cf) => cf,
+            None => {
+                throw_rocks_exception(&mut env, "null column family handle");
+                return;
+            }
+        };
         use st_rs::api::db::ColumnFamilyHandle;
         batch.delete_cf(cf.id(), k);
     }
@@ -462,20 +588,42 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_delete__JJ_3B(
 /// `WriteBatch.merge(long handle, long cfHandle, byte[] key, byte[] value)`
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_WriteBatch_merge__JJ_3B_3B(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _this: JObject,
     handle: jlong,
     cf_handle: jlong,
     key: JByteArray,
     value: JByteArray,
 ) {
+    if handle == 0 {
+        throw_rocks_exception(&mut env, "null handle");
+        return;
+    }
     let batch = unsafe { &mut *(handle as *mut st_rs::WriteBatch) };
-    let k = env.convert_byte_array(&key).unwrap_or_default();
-    let v = env.convert_byte_array(&value).unwrap_or_default();
+    let k = match env.convert_byte_array(&key) {
+        Ok(b) => b,
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read key");
+            return;
+        }
+    };
+    let v = match env.convert_byte_array(&value) {
+        Ok(b) => b,
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read value");
+            return;
+        }
+    };
     if cf_handle == 0 {
         batch.merge(k, v);
     } else {
-        let cf = unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) };
+        let cf = match unsafe { from_handle::<st_rs::ColumnFamilyHandleImpl>(cf_handle) } {
+            Some(cf) => cf,
+            None => {
+                throw_rocks_exception(&mut env, "null column family handle");
+                return;
+            }
+        };
         use st_rs::api::db::ColumnFamilyHandle;
         batch.merge_cf(cf.id(), k, v);
     }
@@ -488,7 +636,10 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_count(
     _this: JObject,
     handle: jlong,
 ) -> jint {
-    let batch = unsafe { from_handle::<st_rs::WriteBatch>(handle) };
+    let batch = match unsafe { from_handle::<st_rs::WriteBatch>(handle) } {
+        Some(batch) => batch,
+        None => return 0,
+    };
     batch.count() as jint
 }
 
@@ -499,13 +650,16 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_clear(
     _this: JObject,
     handle: jlong,
 ) {
+    if handle == 0 {
+        return;
+    }
     let batch = unsafe { &mut *(handle as *mut st_rs::WriteBatch) };
     batch.clear();
 }
 
-/// `WriteBatch.disposeInternal(long handle)`
+/// `WriteBatch.disposeWriteBatch(long handle)`
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_WriteBatch_disposeInternal(
+pub extern "system" fn Java_org_forstdb_WriteBatch_disposeWriteBatch(
     _env: JNIEnv,
     _this: JObject,
     handle: jlong,
@@ -522,8 +676,20 @@ pub extern "system" fn Java_org_forstdb_RocksDB_write__JJJ(
     _write_opts_handle: jlong,
     batch_handle: jlong,
 ) {
-    let db = unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) };
-    let batch = unsafe { from_handle::<st_rs::WriteBatch>(batch_handle) };
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
+    let batch = match unsafe { from_handle::<st_rs::WriteBatch>(batch_handle) } {
+        Some(batch) => batch,
+        None => {
+            throw_rocks_exception(&mut env, "null batch handle");
+            return;
+        }
+    };
     if let Err(e) = db.write(batch) {
         throw_rocks_exception(&mut env, &e.to_string());
     }
@@ -550,13 +716,12 @@ pub extern "system" fn Java_org_forstdb_WriteOptions_setDisableWAL(
     _this: JObject,
     _handle: jlong,
     _disable: jboolean,
-) -> jlong {
+) {
     // No-op — WAL behavior controlled by the engine.
-    _handle
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_WriteOptions_disposeInternal(
+pub extern "system" fn Java_org_forstdb_WriteOptions_disposeWriteOptions(
     _env: JNIEnv,
     _this: JObject,
     handle: jlong,
@@ -577,7 +742,7 @@ pub extern "system" fn Java_org_forstdb_ReadOptions_newReadOptions(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_ReadOptions_disposeInternal(
+pub extern "system" fn Java_org_forstdb_ReadOptions_disposeReadOptions(
     _env: JNIEnv,
     _this: JObject,
     handle: jlong,
@@ -613,7 +778,7 @@ pub extern "system" fn Java_org_forstdb_DBOptions_setCreateIfMissing(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_DBOptions_disposeInternal(
+pub extern "system" fn Java_org_forstdb_DBOptions_disposeDBOptions(
     _env: JNIEnv,
     _this: JObject,
     handle: jlong,
@@ -632,7 +797,10 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getSnapshot(
     _this: JObject,
     handle: jlong,
 ) -> jlong {
-    let db = unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) };
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => return 0,
+    };
     let snap = db.snapshot();
     to_handle(snap)
 }
