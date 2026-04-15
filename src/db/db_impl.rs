@@ -3143,19 +3143,25 @@ impl crate::api::db::Db for DbImpl {
 
     fn get(
         &self,
-        _opts: &crate::api::options::ReadOptions,
+        opts: &crate::api::options::ReadOptions,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        DbImpl::get(self, key)
+        match opts.snapshot {
+            Some(seq) => self.get_at_seq(key, seq),
+            None => DbImpl::get(self, key),
+        }
     }
 
     fn get_cf(
         &self,
-        _opts: &crate::api::options::ReadOptions,
+        opts: &crate::api::options::ReadOptions,
         cf: &dyn crate::api::db::ColumnFamilyHandle,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        DbImpl::get_cf(self, cf, key)
+        match opts.snapshot {
+            Some(seq) => self.get_cf_at_seq(cf.id(), key, seq),
+            None => DbImpl::get_cf(self, cf, key),
+        }
     }
 
     fn write(
