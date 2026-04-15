@@ -140,7 +140,7 @@ pub fn create_checkpoint(db: &DbImpl, checkpoint_dir: &Path) -> Result<()> {
     // 5. Copy the MANIFEST file (if one exists). The MANIFEST
     //    is append-only during the DB's lifetime; we copy rather
     //    than hard-link to get a consistent snapshot of it.
-    let manifest_number = db.manifest_file_number();
+    //    (Reuses `manifest_number` captured above for cleanup.)
     if manifest_number > 0 {
         let src_manifest = make_descriptor_file_name(&db_path, manifest_number);
         let dst_manifest = make_descriptor_file_name(checkpoint_dir, manifest_number);

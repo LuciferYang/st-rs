@@ -2854,6 +2854,13 @@ impl Drop for DbImpl {
 /// - `0x0` = Delete (no value)
 /// - `0x7` = SingleDelete (no value)
 /// - `0x2` = Merge
+/// - `0xF` = DeleteRange (two length-prefixed byte strings)
+///
+/// **Known limitation:** The column family ID is NOT encoded. All
+/// records are replayed into the default CF on WAL recovery. Cross-CF
+/// `WriteBatch` entries will lose their CF affinity after a crash.
+/// Flink disables WAL (`WriteOptions.setDisableWAL(true)`) so this
+/// does not affect the Flink integration path.
 fn encode_batch_record(batch: &WriteBatch, first_seq: SequenceNumber, out: &mut Vec<u8>) {
     crate::util::coding::put_varint64(out, first_seq);
     put_varint32(out, batch.records().len() as u32);
