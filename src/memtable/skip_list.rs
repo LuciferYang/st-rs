@@ -243,8 +243,8 @@ impl SkipList {
         }
     }
 
-    /// Find the last node with key `<= target`. Returns `None` if
-    /// the skiplist is empty or every key is strictly greater.
+    /// Find the last node with key strictly `< target`. Returns
+    /// `None` if the skiplist is empty or every key is `>= target`.
     fn find_less_than(&self, target: &[u8]) -> Option<NodeIndex> {
         let mut current = Self::HEAD;
         let mut level = self.current_height - 1;

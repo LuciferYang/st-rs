@@ -78,11 +78,10 @@ impl WritableFileWriter {
     /// first; writes larger than the buffer capacity bypass the buffer
     /// entirely (matching upstream `WritableFileWriter::Append`).
     pub fn append(&mut self, data: &[u8], opts: &IoOptions) -> Result<()> {
-        self.logical_size += data.len() as u64;
-
         // Fast path: fits in the buffer.
         if self.buffer.len() + data.len() <= self.max_buffer_size {
             self.buffer.extend_from_slice(data);
+            self.logical_size += data.len() as u64;
             return Ok(());
         }
 
@@ -95,6 +94,9 @@ impl WritableFileWriter {
         } else {
             self.buffer.extend_from_slice(data);
         }
+        // Update logical_size only after success — avoids inflating
+        // the size if flush_buffer or direct append fails.
+        self.logical_size += data.len() as u64;
         Ok(())
     }
 
