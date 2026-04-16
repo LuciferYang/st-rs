@@ -440,4 +440,129 @@ mod tests {
         assert!(it.valid());
         assert_eq!(it.key(), b"k026");
     }
+
+    #[test]
+    fn status_is_ok_after_normal_iteration() {
+        let recs: &[(&[u8], &[u8])] = &[
+            (b"a", b"1"),
+            (b"b", b"2"),
+            (b"c", b"3"),
+        ];
+        let table = build(recs, BlockBasedTableOptions::default());
+        let mut it = table.iter();
+
+        // Before seeking, status should be ok.
+        assert!(it.status().is_ok());
+
+        it.seek_to_first();
+        assert!(it.status().is_ok());
+
+        // Walk all records.
+        while it.valid() {
+            assert!(it.status().is_ok());
+            it.next();
+        }
+        // After exhausting the iterator, status should still be ok.
+        assert!(it.status().is_ok());
+    }
+
+    #[test]
+    fn seek_to_first_key() {
+        let recs: &[(&[u8], &[u8])] = &[
+            (b"alpha", b"first"),
+            (b"beta", b"second"),
+            (b"gamma", b"third"),
+        ];
+        let table = build(recs, BlockBasedTableOptions::default());
+        let mut it = table.iter();
+
+        it.seek(b"alpha");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"alpha");
+        assert_eq!(it.value(), b"first");
+    }
+
+    #[test]
+    fn seek_to_last_key() {
+        let recs: &[(&[u8], &[u8])] = &[
+            (b"alpha", b"first"),
+            (b"beta", b"second"),
+            (b"gamma", b"third"),
+        ];
+        let table = build(recs, BlockBasedTableOptions::default());
+        let mut it = table.iter();
+
+        it.seek(b"gamma");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"gamma");
+        assert_eq!(it.value(), b"third");
+
+        // Next should exhaust the iterator.
+        it.next();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn seek_before_first_key_lands_on_first() {
+        let recs: &[(&[u8], &[u8])] = &[
+            (b"bbb", b"1"),
+            (b"ccc", b"2"),
+        ];
+        let table = build(recs, BlockBasedTableOptions::default());
+        let mut it = table.iter();
+
+        // Seek to a key before all entries.
+        it.seek(b"aaa");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"bbb");
+    }
+
+    #[test]
+    fn multiple_seeks_reset_position() {
+        let recs: &[(&[u8], &[u8])] = &[
+            (b"a", b"1"),
+            (b"b", b"2"),
+            (b"c", b"3"),
+            (b"d", b"4"),
+        ];
+        let table = build(recs, BlockBasedTableOptions::default());
+        let mut it = table.iter();
+
+        // Seek to "c".
+        it.seek(b"c");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"c");
+
+        // Re-seek to "a".
+        it.seek(b"a");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"a");
+
+        // Re-seek to first.
+        it.seek_to_first();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"a");
+    }
+
+    #[test]
+    fn seek_on_empty_table() {
+        let table = build(&[], BlockBasedTableOptions::default());
+        let mut it = table.iter();
+        it.seek(b"anything");
+        assert!(!it.valid());
+        assert!(it.status().is_ok());
+    }
+
+    #[test]
+    fn forward_iter_single_entry() {
+        let recs: &[(&[u8], &[u8])] = &[(b"only", b"one")];
+        let table = build(recs, BlockBasedTableOptions::default());
+        let mut it = table.iter();
+        it.seek_to_first();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"only");
+        assert_eq!(it.value(), b"one");
+        it.next();
+        assert!(!it.valid());
+    }
 }

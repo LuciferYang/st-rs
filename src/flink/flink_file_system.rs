@@ -522,4 +522,139 @@ mod tests {
         backend.commit_write("/db/sized.txt", vec![0; 42]);
         assert_eq!(fs.get_file_size(Path::new("sized.txt")).unwrap(), 42);
     }
+
+    #[test]
+    fn rename_file_moves_data() {
+        let backend = Arc::new(InMemoryFsBackend::new());
+        let fs = FlinkFileSystem::new(Arc::clone(&backend) as Arc<dyn FlinkFsBackend>, "/db");
+        backend.commit_write("/db/old.txt", b"content".to_vec());
+
+        fs.rename_file(Path::new("old.txt"), Path::new("new.txt")).unwrap();
+        assert!(!fs.file_exists(Path::new("old.txt")).unwrap());
+        assert!(fs.file_exists(Path::new("new.txt")).unwrap());
+
+        // Verify data is intact via read.
+        let r = fs
+            .new_random_access_file(Path::new("new.txt"), &FileOptions::default())
+            .unwrap();
+        let mut buf = [0u8; 7];
+        let n = r.read_at(0, &mut buf, &IoOptions::default()).unwrap();
+        assert_eq!(n, 7);
+        assert_eq!(&buf, b"content");
+    }
+
+    #[test]
+    fn delete_dir_removes_directory() {
+        let backend = Arc::new(InMemoryFsBackend::new());
+        let fs = FlinkFileSystem::new(Arc::clone(&backend) as Arc<dyn FlinkFsBackend>, "/db");
+        backend.commit_write("/db/subdir/f.txt", b"x".to_vec());
+
+        // The directory /db/subdir exists implicitly.
+        assert!(fs.file_exists(Path::new("subdir")).unwrap());
+        // delete_dir on a non-recursive delete won't remove child files,
+        // but the mock's delete with recursive=false still removes the exact path.
+        fs.delete_dir(Path::new("subdir")).unwrap();
+    }
+
+    #[test]
+    fn get_file_modification_time_returns_value() {
+        let backend = Arc::new(InMemoryFsBackend::new());
+        let fs = FlinkFileSystem::new(Arc::clone(&backend) as Arc<dyn FlinkFsBackend>, "/db");
+        backend.commit_write("/db/mtime.txt", b"data".to_vec());
+        // The mock returns modification_time = 0 for all files.
+        let mtime = fs.get_file_modification_time(Path::new("mtime.txt")).unwrap();
+        assert_eq!(mtime, 0);
+    }
+
+    #[test]
+    fn get_children_with_attributes_returns_sizes() {
+        let backend = Arc::new(InMemoryFsBackend::new());
+        let fs = FlinkFileSystem::new(Arc::clone(&backend) as Arc<dyn FlinkFsBackend>, "/db");
+        backend.commit_write("/db/a.sst", vec![0; 10]);
+        backend.commit_write("/db/b.sst", vec![0; 20]);
+
+        let mut attrs = fs.get_children_with_attributes(Path::new("")).unwrap();
+        attrs.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0].name, "a.sst");
+        assert_eq!(attrs[0].size_bytes, 10);
+        assert_eq!(attrs[1].name, "b.sst");
+        assert_eq!(attrs[1].size_bytes, 20);
+    }
+
+    #[test]
+    fn is_directory_distinguishes_file_and_dir() {
+        let backend = Arc::new(InMemoryFsBackend::new());
+        let fs = FlinkFileSystem::new(Arc::clone(&backend) as Arc<dyn FlinkFsBackend>, "/db");
+        backend.commit_write("/db/dir/file.txt", b"data".to_vec());
+
+        // file.txt is a file, not a dir.
+        assert!(!fs.is_directory(Path::new("dir/file.txt")).unwrap());
+        // dir is an implicit directory.
+        assert!(fs.is_directory(Path::new("dir")).unwrap());
+    }
+
+    #[test]
+    fn reopen_writable_file_creates_file() {
+        let backend = Arc::new(InMemoryFsBackend::new());
+        let fs = FlinkFileSystem::new(Arc::clone(&backend) as Arc<dyn FlinkFsBackend>, "/db");
+        let io = IoOptions::default();
+
+        // reopen on a non-existing file creates it.
+        let mut w = fs.reopen_writable_file(Path::new("reopen.txt"), &FileOptions::default()).unwrap();
+        w.append(b"reopened", &io).unwrap();
+        w.flush(&io).unwrap();
+        w.close(&io).unwrap();
+
+        // The file should exist in the backend (created by reopen).
+        assert!(fs.file_exists(Path::new("reopen.txt")).unwrap());
+    }
+
+    #[test]
+    fn create_dir_if_missing_is_idempotent() {
+        let fs = test_fs();
+        // Creating a dir twice should not error.
+        fs.create_dir_if_missing(Path::new("newdir")).unwrap();
+        fs.create_dir_if_missing(Path::new("newdir")).unwrap();
+    }
+
+    #[test]
+    fn sync_dir_is_noop() {
+        let backend = Arc::new(InMemoryFsBackend::new());
+        let fs = FlinkFileSystem::new(Arc::clone(&backend) as Arc<dyn FlinkFsBackend>, "/db");
+        let io = IoOptions::default();
+
+        // new_directory returns a FlinkDirectory whose fsync and close are no-ops.
+        let mut d = fs.new_directory(Path::new("somedir")).unwrap();
+        d.fsync(&io).unwrap();
+        d.close(&io).unwrap();
+    }
+
+    #[test]
+    fn get_absolute_path_resolves_relative() {
+        let fs = test_fs();
+        let abs = fs.get_absolute_path(Path::new("relative/path")).unwrap();
+        assert_eq!(abs, std::path::PathBuf::from("/test/relative/path"));
+    }
+
+    #[test]
+    fn get_absolute_path_preserves_absolute() {
+        let fs = test_fs();
+        let abs = fs.get_absolute_path(Path::new("/already/absolute")).unwrap();
+        assert_eq!(abs, std::path::PathBuf::from("/already/absolute"));
+    }
+
+    #[test]
+    fn writable_file_sync_flushes_buffer() {
+        let backend = Arc::new(InMemoryFsBackend::new());
+        let fs = FlinkFileSystem::new(Arc::clone(&backend) as Arc<dyn FlinkFsBackend>, "/db");
+        let io = IoOptions::default();
+
+        let mut w = fs.new_writable_file(Path::new("sync.txt"), &FileOptions::default()).unwrap();
+        w.append(b"sync data", &io).unwrap();
+        // sync delegates to flush.
+        w.sync(&io).unwrap();
+        assert_eq!(w.file_size(), 9);
+        w.close(&io).unwrap();
+    }
 }

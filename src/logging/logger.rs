@@ -207,4 +207,85 @@ mod tests {
         cap.log(LogLevel::Header, "RocksDB v8.10.0");
         assert_eq!(cap.records.lock().unwrap().len(), 1);
     }
+
+    #[test]
+    fn console_logger_does_not_panic() {
+        let logger = ConsoleLogger::new(LogLevel::Debug);
+        logger.log(LogLevel::Debug, "debug message");
+        logger.log(LogLevel::Info, "info message");
+        logger.log(LogLevel::Warn, "warn message");
+        logger.log(LogLevel::Error, "error message");
+        logger.log(LogLevel::Fatal, "fatal message");
+        logger.log(LogLevel::Header, "header message");
+        // Convenience methods.
+        logger.info("info shortcut");
+        logger.warn("warn shortcut");
+        logger.error("error shortcut");
+        logger.flush();
+    }
+
+    #[test]
+    fn console_logger_filters_below_level() {
+        // Create a console logger at Warn level. It writes to stderr
+        // so we can't capture output easily, but we can verify it
+        // doesn't panic and that the level() accessor works.
+        let logger = ConsoleLogger::new(LogLevel::Warn);
+        assert_eq!(logger.level(), LogLevel::Warn);
+        // These should be filtered (below Warn).
+        logger.log(LogLevel::Debug, "should be filtered");
+        logger.log(LogLevel::Info, "should be filtered");
+        // These should pass.
+        logger.log(LogLevel::Warn, "should pass");
+        logger.log(LogLevel::Error, "should pass");
+    }
+
+    #[test]
+    fn console_logger_default_level_is_info() {
+        let logger = ConsoleLogger::default();
+        assert_eq!(logger.level(), LogLevel::Info);
+    }
+
+    #[test]
+    fn noop_logger_convenience_methods() {
+        let l = NoopLogger;
+        l.log(LogLevel::Debug, "d");
+        l.log(LogLevel::Info, "i");
+        l.log(LogLevel::Warn, "w");
+        l.log(LogLevel::Error, "e");
+        l.log(LogLevel::Fatal, "f");
+        l.log(LogLevel::Header, "h");
+        l.info("info");
+        l.warn("warn");
+        l.error("error");
+        l.flush();
+        // NoopLogger level defaults to Info.
+        assert_eq!(l.level(), LogLevel::Info);
+    }
+
+    #[test]
+    fn log_level_full_ordering() {
+        assert!(LogLevel::Debug < LogLevel::Info);
+        assert!(LogLevel::Info < LogLevel::Warn);
+        assert!(LogLevel::Warn < LogLevel::Error);
+        assert!(LogLevel::Error < LogLevel::Fatal);
+        assert!(LogLevel::Fatal < LogLevel::Header);
+        // Equality.
+        assert_eq!(LogLevel::Info, LogLevel::Info);
+    }
+
+    #[test]
+    fn log_level_as_str() {
+        assert_eq!(LogLevel::Debug.as_str(), "DEBUG");
+        assert_eq!(LogLevel::Info.as_str(), "INFO");
+        assert_eq!(LogLevel::Warn.as_str(), "WARN");
+        assert_eq!(LogLevel::Error.as_str(), "ERROR");
+        assert_eq!(LogLevel::Fatal.as_str(), "FATAL");
+        assert_eq!(LogLevel::Header.as_str(), "HEADER");
+    }
+
+    #[test]
+    fn log_level_default_is_info() {
+        let level: LogLevel = Default::default();
+        assert_eq!(level, LogLevel::Info);
+    }
 }

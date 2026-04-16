@@ -446,4 +446,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&db_dir);
         let _ = std::fs::remove_dir_all(&cp_dir);
     }
+
+    #[test]
+    fn checkpoint_minimal_db() {
+        // Checkpoint a DB with minimal data (one key) to exercise
+        // the checkpoint path with the smallest possible dataset.
+        let db_dir = temp_dir("src8");
+        let cp_dir = temp_dir("cp8");
+
+        let db = DbImpl::open(&opts(), &db_dir).unwrap();
+        // Write a single key so flush produces an SST and CURRENT.
+        db.put(b"only-key", b"only-val").unwrap();
+        db.flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        create_checkpoint(&db, &cp_dir).unwrap();
+        db.close().unwrap();
+
+        // The checkpoint should be openable.
+        let cp = DbImpl::open(&opts(), &cp_dir).unwrap();
+        assert_eq!(cp.get(b"only-key").unwrap(), Some(b"only-val".to_vec()));
+        // Non-existent key should return None.
+        assert_eq!(cp.get(b"nonexistent").unwrap(), None);
+        cp.close().unwrap();
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&cp_dir);
+    }
+
+    #[test]
+    fn checkpoint_contains_manifest() {
+        let db_dir = temp_dir("src9");
+        let cp_dir = temp_dir("cp9");
+
+        let db = DbImpl::open(&opts(), &db_dir).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        create_checkpoint(&db, &cp_dir).unwrap();
+        db.close().unwrap();
+
+        // Verify checkpoint contains CURRENT and MANIFEST files.
+        let cp_files: Vec<String> = std::fs::read_dir(&cp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            cp_files.iter().any(|f| f == "CURRENT"),
+            "checkpoint should contain CURRENT file"
+        );
+        assert!(
+            cp_files.iter().any(|f| f.starts_with("MANIFEST-")),
+            "checkpoint should contain MANIFEST file, found: {:?}",
+            cp_files
+        );
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&cp_dir);
+    }
 }

@@ -642,4 +642,185 @@ mod tests {
         assert!(abs.is_absolute());
         cleanup(&dir);
     }
+
+    #[test]
+    fn delete_dir_removes_empty_directory() {
+        let fs = PosixFileSystem::new();
+        let dir = temp_dir("deldir");
+        let sub = dir.join("subdir");
+        fs.create_dir_if_missing(&sub).unwrap();
+        assert!(fs.is_directory(&sub).unwrap());
+        fs.delete_dir(&sub).unwrap();
+        assert!(!fs.file_exists(&sub).unwrap());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn file_exists_distinguishes_file_and_dir() {
+        let fs = PosixFileSystem::new();
+        let dir = temp_dir("exists");
+        let file_path = dir.join("f.txt");
+        let opts = FileOptions::default();
+        let io = IoOptions::default();
+
+        // File does not exist yet.
+        assert!(!fs.file_exists(&file_path).unwrap());
+
+        // Create a file.
+        let mut w = fs.new_writable_file(&file_path, &opts).unwrap();
+        w.append(b"data", &io).unwrap();
+        w.close(&io).unwrap();
+
+        assert!(fs.file_exists(&file_path).unwrap());
+        assert!(!fs.is_directory(&file_path).unwrap());
+        assert!(fs.is_directory(&dir).unwrap());
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn get_file_size_and_modification_time() {
+        let fs = PosixFileSystem::new();
+        let dir = temp_dir("sizemtime");
+        let path = dir.join("sized.txt");
+        let opts = FileOptions::default();
+        let io = IoOptions::default();
+
+        let before = now_secs();
+
+        let mut w = fs.new_writable_file(&path, &opts).unwrap();
+        w.append(b"twelve bytes", &io).unwrap();
+        w.close(&io).unwrap();
+
+        assert_eq!(fs.get_file_size(&path).unwrap(), 12);
+
+        let mtime = fs.get_file_modification_time(&path).unwrap();
+        // mtime should be reasonably close to now.
+        assert!(mtime >= before.saturating_sub(2), "mtime too old");
+        assert!(mtime <= now_secs() + 2, "mtime in the future");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn rename_file_moves_content() {
+        let fs = PosixFileSystem::new();
+        let dir = temp_dir("rename2");
+        let src = dir.join("src.txt");
+        let dst = dir.join("dst.txt");
+        let opts = FileOptions::default();
+        let io = IoOptions::default();
+
+        let mut w = fs.new_writable_file(&src, &opts).unwrap();
+        w.append(b"move me", &io).unwrap();
+        w.close(&io).unwrap();
+
+        fs.rename_file(&src, &dst).unwrap();
+        assert!(!fs.file_exists(&src).unwrap());
+        assert!(fs.file_exists(&dst).unwrap());
+        assert_eq!(fs.get_file_size(&dst).unwrap(), 7);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn get_children_with_attributes_returns_sizes() {
+        let fs = PosixFileSystem::new();
+        let dir = temp_dir("childattr");
+        let opts = FileOptions::default();
+        let io = IoOptions::default();
+
+        let mut w = fs.new_writable_file(&dir.join("small.txt"), &opts).unwrap();
+        w.append(b"abc", &io).unwrap();
+        w.close(&io).unwrap();
+
+        let mut w = fs.new_writable_file(&dir.join("big.txt"), &opts).unwrap();
+        w.append(b"abcdefghij", &io).unwrap();
+        w.close(&io).unwrap();
+
+        let mut attrs = fs.get_children_with_attributes(&dir).unwrap();
+        attrs.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0].name, "big.txt");
+        assert_eq!(attrs[0].size_bytes, 10);
+        assert_eq!(attrs[1].name, "small.txt");
+        assert_eq!(attrs[1].size_bytes, 3);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn writable_file_sync_and_close() {
+        let fs = PosixFileSystem::new();
+        let dir = temp_dir("syncclose");
+        let path = dir.join("synced.txt");
+        let opts = FileOptions::default();
+        let io = IoOptions::default();
+
+        let mut w = fs.new_writable_file(&path, &opts).unwrap();
+        w.append(b"sync data", &io).unwrap();
+        w.sync(&io).unwrap();
+        assert_eq!(w.file_size(), 9);
+        w.close(&io).unwrap();
+
+        // Verify data is durable after sync+close.
+        assert_eq!(fs.get_file_size(&path).unwrap(), 9);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn sequential_file_skip() {
+        let fs = PosixFileSystem::new();
+        let dir = temp_dir("skip");
+        let path = dir.join("skip.txt");
+        let opts = FileOptions::default();
+        let io = IoOptions::default();
+
+        let mut w = fs.new_writable_file(&path, &opts).unwrap();
+        w.append(b"abcdefghij", &io).unwrap();
+        w.close(&io).unwrap();
+
+        let mut seq = fs.new_sequential_file(&path, &opts).unwrap();
+        // Skip first 5 bytes.
+        seq.skip(5, &io).unwrap();
+        let mut buf = [0u8; 5];
+        let n = seq.read(&mut buf, &io).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"fghij");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn reopen_writable_file_appends() {
+        let fs = PosixFileSystem::new();
+        let dir = temp_dir("reopen");
+        let path = dir.join("reopen.txt");
+        let opts = FileOptions::default();
+        let io = IoOptions::default();
+
+        // Write initial data.
+        let mut w = fs.new_writable_file(&path, &opts).unwrap();
+        w.append(b"hello", &io).unwrap();
+        w.close(&io).unwrap();
+
+        // Reopen and append.
+        let mut w = fs.reopen_writable_file(&path, &opts).unwrap();
+        w.append(b" world", &io).unwrap();
+        w.close(&io).unwrap();
+
+        assert_eq!(fs.get_file_size(&path).unwrap(), 11);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn get_temperature_returns_unknown() {
+        let fs = PosixFileSystem::new();
+        let dir = temp_dir("temp");
+        let t = fs.get_temperature(&dir).unwrap();
+        assert_eq!(t, Temperature::Unknown);
+        cleanup(&dir);
+    }
 }

@@ -319,4 +319,176 @@ mod tests {
         assert!(res.unwrap_err().is_io_error());
         assert_eq!(h.0, 2, "should stop on the failing record");
     }
+
+    #[test]
+    fn delete_range_and_delete_range_cf() {
+        let mut wb = WriteBatch::new();
+        wb.delete_range(b"a".to_vec(), b"z".to_vec());
+        wb.delete_range_cf(1, b"m".to_vec(), b"n".to_vec());
+        assert_eq!(wb.count(), 2);
+
+        let records = wb.records();
+        match &records[0] {
+            Record::DeleteRange { cf, begin, end } => {
+                assert_eq!(*cf, DEFAULT_CF);
+                assert_eq!(begin, b"a");
+                assert_eq!(end, b"z");
+            }
+            _ => panic!("expected DeleteRange"),
+        }
+        match &records[1] {
+            Record::DeleteRange { cf, begin, end } => {
+                assert_eq!(*cf, 1);
+                assert_eq!(begin, b"m");
+                assert_eq!(end, b"n");
+            }
+            _ => panic!("expected DeleteRange for cf 1"),
+        }
+    }
+
+    #[test]
+    fn merge_cf_creates_merge_record() {
+        let mut wb = WriteBatch::new();
+        wb.merge_cf(2, b"key".to_vec(), b"operand".to_vec());
+        assert_eq!(wb.count(), 1);
+
+        match &wb.records()[0] {
+            Record::Merge { cf, key, value } => {
+                assert_eq!(*cf, 2);
+                assert_eq!(key, b"key");
+                assert_eq!(value, b"operand");
+            }
+            _ => panic!("expected Merge"),
+        }
+    }
+
+    #[test]
+    fn single_delete_creates_record() {
+        let mut wb = WriteBatch::new();
+        wb.single_delete(b"to_delete".to_vec());
+        assert_eq!(wb.count(), 1);
+
+        match &wb.records()[0] {
+            Record::SingleDelete { cf, key } => {
+                assert_eq!(*cf, DEFAULT_CF);
+                assert_eq!(key, b"to_delete");
+            }
+            _ => panic!("expected SingleDelete"),
+        }
+    }
+
+    #[test]
+    fn clear_empties_batch() {
+        let mut wb = WriteBatch::new();
+        wb.put(b"a".to_vec(), b"1".to_vec());
+        wb.delete(b"b".to_vec());
+        wb.merge(b"c".to_vec(), b"3".to_vec());
+        assert_eq!(wb.count(), 3);
+        assert!(!wb.is_empty());
+
+        wb.clear();
+        assert_eq!(wb.count(), 0);
+        assert!(wb.is_empty());
+    }
+
+    #[test]
+    fn iterate_dispatches_all_record_types() {
+        #[derive(Default)]
+        struct AllTypesHandler {
+            puts: Vec<(ColumnFamilyId, Vec<u8>, Vec<u8>)>,
+            deletes: Vec<(ColumnFamilyId, Vec<u8>)>,
+            single_deletes: Vec<(ColumnFamilyId, Vec<u8>)>,
+            delete_ranges: Vec<(ColumnFamilyId, Vec<u8>, Vec<u8>)>,
+            merges: Vec<(ColumnFamilyId, Vec<u8>, Vec<u8>)>,
+        }
+        impl WriteBatchHandler for AllTypesHandler {
+            fn put_cf(&mut self, cf: ColumnFamilyId, key: &[u8], value: &[u8]) -> Result<()> {
+                self.puts.push((cf, key.to_vec(), value.to_vec()));
+                Ok(())
+            }
+            fn delete_cf(&mut self, cf: ColumnFamilyId, key: &[u8]) -> Result<()> {
+                self.deletes.push((cf, key.to_vec()));
+                Ok(())
+            }
+            fn single_delete_cf(&mut self, cf: ColumnFamilyId, key: &[u8]) -> Result<()> {
+                self.single_deletes.push((cf, key.to_vec()));
+                Ok(())
+            }
+            fn delete_range_cf(&mut self, cf: ColumnFamilyId, begin: &[u8], end: &[u8]) -> Result<()> {
+                self.delete_ranges.push((cf, begin.to_vec(), end.to_vec()));
+                Ok(())
+            }
+            fn merge_cf(&mut self, cf: ColumnFamilyId, key: &[u8], value: &[u8]) -> Result<()> {
+                self.merges.push((cf, key.to_vec(), value.to_vec()));
+                Ok(())
+            }
+        }
+
+        let mut wb = WriteBatch::new();
+        wb.put(b"pk".to_vec(), b"pv".to_vec());
+        wb.delete(b"dk".to_vec());
+        wb.single_delete(b"sdk".to_vec());
+        wb.delete_range(b"ra".to_vec(), b"rz".to_vec());
+        wb.merge(b"mk".to_vec(), b"mv".to_vec());
+
+        let mut h = AllTypesHandler::default();
+        wb.iterate(&mut h).unwrap();
+
+        assert_eq!(h.puts.len(), 1);
+        assert_eq!(h.puts[0], (DEFAULT_CF, b"pk".to_vec(), b"pv".to_vec()));
+
+        assert_eq!(h.deletes.len(), 1);
+        assert_eq!(h.deletes[0], (DEFAULT_CF, b"dk".to_vec()));
+
+        assert_eq!(h.single_deletes.len(), 1);
+        assert_eq!(h.single_deletes[0], (DEFAULT_CF, b"sdk".to_vec()));
+
+        assert_eq!(h.delete_ranges.len(), 1);
+        assert_eq!(h.delete_ranges[0], (DEFAULT_CF, b"ra".to_vec(), b"rz".to_vec()));
+
+        assert_eq!(h.merges.len(), 1);
+        assert_eq!(h.merges[0], (DEFAULT_CF, b"mk".to_vec(), b"mv".to_vec()));
+    }
+
+    #[test]
+    fn merge_default_cf() {
+        let mut wb = WriteBatch::new();
+        wb.merge(b"key".to_vec(), b"val".to_vec());
+        assert_eq!(wb.count(), 1);
+        match &wb.records()[0] {
+            Record::Merge { cf, key, value } => {
+                assert_eq!(*cf, DEFAULT_CF);
+                assert_eq!(key, b"key");
+                assert_eq!(value, b"val");
+            }
+            _ => panic!("expected Merge"),
+        }
+    }
+
+    #[test]
+    fn put_cf_with_custom_cf_id() {
+        let mut wb = WriteBatch::new();
+        wb.put_cf(42, b"k".to_vec(), b"v".to_vec());
+        match &wb.records()[0] {
+            Record::Put { cf, key, value } => {
+                assert_eq!(*cf, 42);
+                assert_eq!(key, b"k");
+                assert_eq!(value, b"v");
+            }
+            _ => panic!("expected Put"),
+        }
+    }
+
+    #[test]
+    fn delete_cf_with_custom_cf_id() {
+        let mut wb = WriteBatch::new();
+        wb.delete_cf(7, b"key".to_vec());
+        match &wb.records()[0] {
+            Record::Delete { cf, key } => {
+                assert_eq!(*cf, 7);
+                assert_eq!(key, b"key");
+            }
+            _ => panic!("expected Delete"),
+        }
+    }
 }

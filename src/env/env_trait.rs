@@ -206,4 +206,57 @@ mod tests {
         assert!(c.now_nanos() > 0);
         assert!(c.now_micros() > 0);
     }
+
+    #[test]
+    fn system_clock_is_monotonically_nondecreasing() {
+        let c = SystemClockImpl;
+        let t1_micros = c.now_micros();
+        let t1_nanos = c.now_nanos();
+        // Second call should be >= first.
+        let t2_micros = c.now_micros();
+        let t2_nanos = c.now_nanos();
+        assert!(t2_micros >= t1_micros, "now_micros went backwards");
+        assert!(t2_nanos >= t1_nanos, "now_nanos went backwards");
+    }
+
+    #[test]
+    fn system_clock_nanos_greater_than_micros() {
+        let c = SystemClockImpl;
+        let micros = c.now_micros();
+        let nanos = c.now_nanos();
+        // nanos is in nanoseconds, micros in microseconds.
+        // nanos should be roughly 1000x micros.
+        assert!(nanos > micros, "nanos should be larger than micros");
+    }
+
+    #[test]
+    fn composite_env_accessors_return_correct_components() {
+        use crate::env::posix::PosixFileSystem;
+        use crate::env::thread_pool::StdThreadPool;
+
+        let fs = Arc::new(PosixFileSystem::new());
+        let clock = Arc::new(SystemClockImpl);
+        let pool = Arc::new(StdThreadPool::new(1, 0, 0, 0));
+
+        let env = CompositeEnv::new(
+            fs.clone() as Arc<dyn crate::env::file_system::FileSystem>,
+            clock.clone() as Arc<dyn Clock>,
+            pool.clone() as Arc<dyn ThreadPool>,
+        );
+
+        // Verify the filesystem name matches.
+        assert_eq!(env.file_system().name(), "PosixFileSystem");
+
+        // Verify clock returns non-zero time.
+        assert!(env.clock().now_micros() > 0);
+
+        // Verify thread pool is accessible and has the right worker count.
+        assert_eq!(env.thread_pool().get_background_threads(Priority::Low), 1);
+
+        // Verify default trait methods.
+        assert_eq!(env.host_name().unwrap(), "localhost");
+        assert_eq!(env.get_thread_id(), 0);
+
+        env.thread_pool().wait_for_jobs_and_join_all();
+    }
 }
