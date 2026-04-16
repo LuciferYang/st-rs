@@ -105,8 +105,57 @@ jobs:
       - name: Build release native library
         run: cargo build --release -p st-rs-jni
 
+      - name: Determine platform dir
+        id: platform
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu) echo "dir=linux-x86_64" >> $GITHUB_OUTPUT ;;
+            aarch64-apple-darwin)     echo "dir=osx-aarch64"   >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Stage native library
+        run: |
+          mkdir -p native/${{ steps.platform.outputs.dir }}
+          cp target/release/${{ matrix.lib }} native/${{ steps.platform.outputs.dir }}/
+
       - name: Upload native library
         uses: actions/upload-artifact@v4
         with:
-          name: st-rs-jni-${{ matrix.target }}
-          path: target/release/${{ matrix.lib }}
+          name: native-${{ matrix.target }}
+          path: native/
+
+  fat-jar:
+    name: Fat JAR (all platforms)
+    needs: release-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 11
+
+      - name: Download Linux native library
+        uses: actions/download-artifact@v4
+        with:
+          name: native-x86_64-unknown-linux-gnu
+          path: java/src/main/resources/org/forstdb/native/
+
+      - name: Download macOS native library
+        uses: actions/download-artifact@v4
+        with:
+          name: native-aarch64-apple-darwin
+          path: java/src/main/resources/org/forstdb/native/
+
+      - name: Verify bundled natives
+        run: find java/src/main/resources/org/forstdb/native/ -type f
+
+      - name: Build fat JAR
+        run: cd java && mvn package -DskipTests -q
+
+      - name: Upload fat JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: st-rs-jni-fat-jar
+          path: java/target/st-rs-jni-0.0.1-SNAPSHOT.jar
