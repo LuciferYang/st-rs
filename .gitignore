@@ -4,3 +4,4 @@ java/target/
 FLINK-INTEGRATION-PLAN.md
 FLINK-FULL-INTEGRATION-ANALYSIS.md
 VECTORIZED-STATE-DESIGN.md
+java/src/main/resources/org/forstdb/native/
