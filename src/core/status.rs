@@ -488,4 +488,275 @@ mod tests {
         assert!(s.is_io_error());
         assert!(matches!(s.subcode, SubCode::PathNotFound));
     }
+
+    // ---- Constructor coverage ----
+
+    #[test]
+    fn corruption_constructor() {
+        let s = Status::corruption("bad checksum");
+        assert!(s.is_corruption());
+        assert!(!s.is_ok());
+        assert_eq!(s.code, Code::Corruption);
+        assert_eq!(s.message.as_deref(), Some("bad checksum"));
+    }
+
+    #[test]
+    fn not_supported_constructor() {
+        let s = Status::not_supported("no bloom filter");
+        assert!(s.is_not_supported());
+        assert_eq!(s.code, Code::NotSupported);
+        assert_eq!(s.message.as_deref(), Some("no bloom filter"));
+    }
+
+    #[test]
+    fn invalid_argument_constructor() {
+        let s = Status::invalid_argument("bad path");
+        assert!(s.is_invalid_argument());
+        assert_eq!(s.code, Code::InvalidArgument);
+    }
+
+    #[test]
+    fn io_error_constructor() {
+        let s = Status::io_error("disk full");
+        assert!(s.is_io_error());
+        assert_eq!(s.code, Code::IoError);
+        assert_eq!(s.message.as_deref(), Some("disk full"));
+    }
+
+    // ---- Predicate coverage ----
+
+    #[test]
+    fn busy_predicate() {
+        let s = Status::busy("resource contention");
+        assert!(s.is_busy());
+        assert!(!s.is_ok());
+    }
+
+    #[test]
+    fn try_again_predicate() {
+        let s = Status::try_again("retry later");
+        assert!(s.is_try_again());
+    }
+
+    #[test]
+    fn timed_out_predicate() {
+        let s = Status::timed_out("deadline exceeded");
+        assert!(s.is_timed_out());
+    }
+
+    #[test]
+    fn aborted_predicate() {
+        let s = Status::aborted("cancelled by policy");
+        assert!(s.is_aborted());
+    }
+
+    #[test]
+    fn incomplete_predicate() {
+        let s = Status::incomplete("partial result");
+        assert!(s.is_incomplete());
+    }
+
+    #[test]
+    fn shutdown_in_progress_predicate() {
+        let s = Status::shutdown_in_progress("closing");
+        assert!(s.is_shutdown_in_progress());
+    }
+
+    #[test]
+    fn column_family_dropped_predicate() {
+        let s = Status::column_family_dropped("cf gone");
+        assert!(s.is_column_family_dropped());
+    }
+
+    // ---- Compound subcodes ----
+
+    #[test]
+    fn no_space_constructor_and_predicate() {
+        let s = Status::no_space();
+        assert!(s.is_io_error());
+        assert!(s.is_no_space());
+        assert_eq!(s.subcode, SubCode::NoSpace);
+    }
+
+    #[test]
+    fn memory_limit_constructor_and_predicate() {
+        let s = Status::memory_limit();
+        assert!(s.is_aborted());
+        assert!(s.is_memory_limit());
+        assert_eq!(s.subcode, SubCode::MemoryLimit);
+    }
+
+    #[test]
+    fn space_limit_constructor() {
+        let s = Status::space_limit();
+        assert!(s.is_io_error());
+        assert_eq!(s.subcode, SubCode::SpaceLimit);
+    }
+
+    #[test]
+    fn deadlock_predicate() {
+        let s = Status::with_subcode(Code::Busy, SubCode::Deadlock);
+        assert!(s.is_busy());
+        assert!(s.is_deadlock());
+    }
+
+    // ---- Display / Debug formatting ----
+
+    #[test]
+    fn display_ok() {
+        let s = Status::ok();
+        assert_eq!(format!("{s}"), "OK");
+    }
+
+    #[test]
+    fn display_corruption_with_message() {
+        let s = Status::corruption("bad block");
+        assert_eq!(format!("{s}"), "Corruption: bad block");
+    }
+
+    #[test]
+    fn display_io_error_without_message() {
+        let s = Status::no_space();
+        // No message attached, just the code name.
+        assert_eq!(format!("{s}"), "IOError");
+    }
+
+    #[test]
+    fn display_all_code_names() {
+        // Verify each code renders as expected in Display.
+        let cases = [
+            (Code::NotFound, "NotFound"),
+            (Code::NotSupported, "NotSupported"),
+            (Code::InvalidArgument, "InvalidArgument"),
+            (Code::IoError, "IOError"),
+            (Code::MergeInProgress, "MergeInProgress"),
+            (Code::Incomplete, "Incomplete"),
+            (Code::ShutdownInProgress, "ShutdownInProgress"),
+            (Code::TimedOut, "TimedOut"),
+            (Code::Aborted, "Aborted"),
+            (Code::Busy, "Busy"),
+            (Code::Expired, "Expired"),
+            (Code::TryAgain, "TryAgain"),
+            (Code::CompactionTooLarge, "CompactionTooLarge"),
+            (Code::ColumnFamilyDropped, "ColumnFamilyDropped"),
+        ];
+        for (code, expected) in cases {
+            let s = Status::with_subcode(code, SubCode::None);
+            assert_eq!(format!("{s}"), expected);
+        }
+    }
+
+    #[test]
+    fn debug_format_includes_fields() {
+        let s = Status::corruption("test");
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("Corruption"), "Debug should contain code: {dbg}");
+        assert!(dbg.contains("test"), "Debug should contain message: {dbg}");
+    }
+
+    // ---- Default trait ----
+
+    #[test]
+    fn default_is_ok() {
+        let s: Status = Default::default();
+        assert!(s.is_ok());
+        assert_eq!(s.code, Code::Ok);
+        assert_eq!(s.subcode, SubCode::None);
+        assert_eq!(s.severity, Severity::NoError);
+        assert!(!s.retryable);
+        assert!(!s.data_loss);
+    }
+
+    // ---- Builder methods ----
+
+    #[test]
+    fn with_severity_builder() {
+        let s = Status::io_error("fail").with_severity(Severity::FatalError);
+        assert!(s.is_io_error());
+        assert_eq!(s.severity, Severity::FatalError);
+    }
+
+    #[test]
+    fn with_retryable_builder() {
+        let s = Status::io_error("transient").with_retryable(true);
+        assert!(s.retryable);
+    }
+
+    #[test]
+    fn with_data_loss_builder() {
+        let s = Status::corruption("permanent").with_data_loss(true);
+        assert!(s.data_loss);
+    }
+
+    // ---- From<io::Error> additional coverage ----
+
+    #[test]
+    fn from_io_error_timed_out() {
+        let io = std::io::Error::new(std::io::ErrorKind::TimedOut, "lock wait");
+        let s: Status = io.into();
+        assert!(s.is_io_error());
+        assert_eq!(s.subcode, SubCode::LockTimeout);
+    }
+
+    #[test]
+    fn from_io_error_other_kind() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let s: Status = io.into();
+        assert!(s.is_io_error());
+        assert_eq!(s.subcode, SubCode::None);
+        assert!(s.message.as_deref().unwrap().contains("denied"));
+    }
+
+    // ---- std::error::Error trait ----
+
+    #[test]
+    fn status_implements_error_trait() {
+        let s = Status::io_error("some error");
+        let e: &dyn std::error::Error = &s;
+        assert!(e.to_string().contains("IOError"));
+    }
+
+    // ---- Remaining factories ----
+
+    #[test]
+    fn merge_in_progress_constructor() {
+        let s = Status::merge_in_progress("merging");
+        assert_eq!(s.code, Code::MergeInProgress);
+    }
+
+    #[test]
+    fn expired_constructor() {
+        let s = Status::expired("ttl exceeded");
+        assert_eq!(s.code, Code::Expired);
+    }
+
+    #[test]
+    fn compaction_too_large_constructor() {
+        let s = Status::compaction_too_large("too big");
+        assert_eq!(s.code, Code::CompactionTooLarge);
+    }
+
+    // ---- with_subcode constructor ----
+
+    #[test]
+    fn with_subcode_constructor() {
+        let s = Status::with_subcode(Code::IoError, SubCode::IoFenced);
+        assert!(s.is_io_error());
+        assert_eq!(s.subcode, SubCode::IoFenced);
+        assert!(s.message.is_none());
+    }
+
+    // ---- new constructor ----
+
+    #[test]
+    fn new_constructor_sets_all_defaults() {
+        let s = Status::new(Code::Busy, "locked");
+        assert_eq!(s.code, Code::Busy);
+        assert_eq!(s.subcode, SubCode::None);
+        assert_eq!(s.severity, Severity::NoError);
+        assert!(!s.retryable);
+        assert!(!s.data_loss);
+        assert_eq!(s.scope, 0);
+        assert_eq!(s.message.as_deref(), Some("locked"));
+    }
 }

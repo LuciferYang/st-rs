@@ -171,4 +171,150 @@ mod tests {
         assert!(!it.valid());
         assert!(it.status().unwrap_err().is_corruption());
     }
+
+    // ---- EmptyIterator extended coverage ----
+
+    #[test]
+    fn empty_iterator_seek_to_last_stays_invalid() {
+        let mut it = EmptyIterator;
+        it.seek_to_last();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn empty_iterator_seek_for_prev_stays_invalid() {
+        let mut it = EmptyIterator;
+        it.seek_for_prev(b"target");
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn empty_iterator_status_is_ok() {
+        let it = EmptyIterator;
+        assert!(it.status().is_ok());
+    }
+
+    #[test]
+    fn empty_iterator_refresh_not_supported() {
+        let mut it = EmptyIterator;
+        let result = it.refresh();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_not_supported());
+    }
+
+    #[test]
+    #[should_panic(expected = "next() called on invalid iterator")]
+    fn empty_iterator_next_panics() {
+        let mut it = EmptyIterator;
+        it.next();
+    }
+
+    #[test]
+    #[should_panic(expected = "prev() called on invalid iterator")]
+    fn empty_iterator_prev_panics() {
+        let mut it = EmptyIterator;
+        it.prev();
+    }
+
+    #[test]
+    #[should_panic(expected = "key() called on invalid iterator")]
+    fn empty_iterator_key_panics() {
+        let it = EmptyIterator;
+        let _ = it.key();
+    }
+
+    #[test]
+    #[should_panic(expected = "value() called on invalid iterator")]
+    fn empty_iterator_value_panics() {
+        let it = EmptyIterator;
+        let _ = it.value();
+    }
+
+    // ---- ErrorIterator extended coverage ----
+
+    #[test]
+    fn error_iterator_seek_to_first_stays_invalid() {
+        let mut it = ErrorIterator::new(Status::io_error("disk fail"));
+        it.seek_to_first();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn error_iterator_seek_to_last_stays_invalid() {
+        let mut it = ErrorIterator::new(Status::io_error("disk fail"));
+        it.seek_to_last();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn error_iterator_seek_stays_invalid() {
+        let mut it = ErrorIterator::new(Status::io_error("disk fail"));
+        it.seek(b"any");
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn error_iterator_seek_for_prev_stays_invalid() {
+        let mut it = ErrorIterator::new(Status::io_error("disk fail"));
+        it.seek_for_prev(b"any");
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn error_iterator_status_preserves_error_details() {
+        let it = ErrorIterator::new(Status::not_found("key missing"));
+        let err = it.status().unwrap_err();
+        assert!(err.is_not_found());
+        assert_eq!(err.message.as_deref(), Some("key missing"));
+    }
+
+    #[test]
+    fn error_iterator_refresh_not_supported() {
+        let mut it = ErrorIterator::new(Status::corruption("bad"));
+        let result = it.refresh();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_not_supported());
+    }
+
+    #[test]
+    #[should_panic(expected = "next() called on error iterator")]
+    fn error_iterator_next_panics() {
+        let mut it = ErrorIterator::new(Status::corruption("bad"));
+        it.next();
+    }
+
+    #[test]
+    #[should_panic(expected = "prev() called on error iterator")]
+    fn error_iterator_prev_panics() {
+        let mut it = ErrorIterator::new(Status::corruption("bad"));
+        it.prev();
+    }
+
+    #[test]
+    #[should_panic(expected = "key() called on error iterator")]
+    fn error_iterator_key_panics() {
+        let it = ErrorIterator::new(Status::corruption("bad"));
+        let _ = it.key();
+    }
+
+    #[test]
+    #[should_panic(expected = "value() called on error iterator")]
+    fn error_iterator_value_panics() {
+        let it = ErrorIterator::new(Status::corruption("bad"));
+        let _ = it.value();
+    }
+
+    // ---- Send trait verification ----
+
+    #[test]
+    fn empty_iterator_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<EmptyIterator>();
+    }
+
+    #[test]
+    fn error_iterator_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ErrorIterator>();
+    }
 }

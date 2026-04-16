@@ -316,4 +316,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&db_dir);
         let _ = std::fs::remove_dir_all(&cp_dir);
     }
+
+    #[test]
+    fn checkpoint_with_multiple_cfs() {
+        let db_dir = temp_dir("src5");
+        let cp_dir = temp_dir("cp5");
+
+        let db = DbImpl::open(&opts(), &db_dir).unwrap();
+        let cf1 = db
+            .create_column_family(
+                "cf1",
+                &crate::api::options::ColumnFamilyOptions::default(),
+            )
+            .unwrap();
+        let cf2 = db
+            .create_column_family(
+                "cf2",
+                &crate::api::options::ColumnFamilyOptions::default(),
+            )
+            .unwrap();
+
+        // Write to default, cf1, and cf2.
+        db.put(b"dk", b"default-val").unwrap();
+        db.put_cf(&*cf1, b"c1k", b"cf1-val").unwrap();
+        db.put_cf(&*cf2, b"c2k", b"cf2-val").unwrap();
+
+        // Flush all CFs.
+        db.flush().unwrap();
+        db.flush_cf(&*cf1).unwrap();
+        db.flush_cf(&*cf2).unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        create_checkpoint(&db, &cp_dir).unwrap();
+
+        // Verify the checkpoint holds the default CF data after reopening.
+        // (Non-default CFs require cf handle reconstruction which lives
+        // in db_impl tests; here we focus on the checkpoint file copy.)
+        db.close().unwrap();
+
+        let cp = DbImpl::open(&opts(), &cp_dir).unwrap();
+        assert_eq!(cp.get(b"dk").unwrap(), Some(b"default-val".to_vec()));
+
+        // Verify the checkpoint directory contains expected files.
+        let cp_files: Vec<_> = std::fs::read_dir(&cp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            cp_files.iter().any(|f| f == "CURRENT"),
+            "checkpoint should contain CURRENT"
+        );
+        assert!(
+            cp_files.iter().any(|f| f.ends_with(".sst")),
+            "checkpoint should contain SST files"
+        );
+
+        cp.close().unwrap();
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&cp_dir);
+    }
+
+    #[test]
+    fn checkpoint_after_compaction() {
+        let db_dir = temp_dir("src6");
+        let cp_dir = temp_dir("cp6");
+
+        let db = DbImpl::open(&opts(), &db_dir).unwrap();
+
+        // Write enough data across multiple flushes to trigger compaction.
+        for batch in 0..5u32 {
+            for i in 0..5u32 {
+                let k = format!("key-{:03}", batch * 5 + i);
+                let v = format!("val-{}", batch * 5 + i);
+                db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            }
+            db.flush().unwrap();
+            db.wait_for_pending_work().unwrap();
+        }
+
+        // Take checkpoint after compaction has run.
+        create_checkpoint(&db, &cp_dir).unwrap();
+        db.close().unwrap();
+
+        // Open checkpoint and verify all 25 keys are present.
+        let cp = DbImpl::open(&opts(), &cp_dir).unwrap();
+        for i in 0..25u32 {
+            let k = format!("key-{i:03}");
+            let v = format!("val-{i}");
+            assert_eq!(
+                cp.get(k.as_bytes()).unwrap(),
+                Some(v.into_bytes()),
+                "missing key in post-compaction checkpoint: {k}"
+            );
+        }
+        cp.close().unwrap();
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&cp_dir);
+    }
+
+    #[test]
+    fn checkpoint_duplicate_target_fails() {
+        // Creating a checkpoint to the same directory twice should fail
+        // on the second call because the directory already exists.
+        let db_dir = temp_dir("src7");
+        let cp_dir = temp_dir("cp7");
+
+        let db = DbImpl::open(&opts(), &db_dir).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        // First checkpoint succeeds.
+        create_checkpoint(&db, &cp_dir).unwrap();
+
+        // Second checkpoint to the same path should fail.
+        let result = create_checkpoint(&db, &cp_dir);
+        assert!(
+            result.is_err(),
+            "checkpoint to existing dir should fail"
+        );
+        assert!(result.unwrap_err().is_invalid_argument());
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&cp_dir);
+    }
 }

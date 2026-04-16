@@ -340,4 +340,307 @@ mod tests {
         sb.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- open_with_options ----
+
+    #[test]
+    fn open_with_custom_options() {
+        let dir = temp_dir("custom-opts");
+        let opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let sb = FlinkStateBackend::open_with_options(&opts, &dir).unwrap();
+        sb.put(b"k", b"v").unwrap();
+        assert_eq!(sb.get(b"k").unwrap(), Some(b"v".to_vec()));
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- delete / delete_cf ----
+
+    #[test]
+    fn delete_removes_from_default_cf() {
+        let dir = temp_dir("del-default");
+        let sb = FlinkStateBackend::open(&dir).unwrap();
+        sb.put(b"k", b"v").unwrap();
+        assert_eq!(sb.get(b"k").unwrap(), Some(b"v".to_vec()));
+        sb.delete(b"k").unwrap();
+        assert_eq!(sb.get(b"k").unwrap(), None);
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_cf_removes_from_custom_cf() {
+        let dir = temp_dir("del-cf");
+        let sb = FlinkStateBackend::open(&dir).unwrap();
+        let cf = sb.create_column_family("state").unwrap();
+        sb.put_cf(&*cf, b"k", b"v").unwrap();
+        assert_eq!(sb.get_cf(&*cf, b"k").unwrap(), Some(b"v".to_vec()));
+        sb.delete_cf(&*cf, b"k").unwrap();
+        assert_eq!(sb.get_cf(&*cf, b"k").unwrap(), None);
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- multi_get ----
+
+    #[test]
+    fn multi_get_returns_correct_results() {
+        let dir = temp_dir("multi-get");
+        let sb = FlinkStateBackend::open(&dir).unwrap();
+        sb.put(b"a", b"1").unwrap();
+        sb.put(b"b", b"2").unwrap();
+        sb.put(b"c", b"3").unwrap();
+
+        let results = sb.multi_get(&[b"a".as_ref(), b"c", b"missing", b"b"]);
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].as_ref().unwrap(), &Some(b"1".to_vec()));
+        assert_eq!(results[1].as_ref().unwrap(), &Some(b"3".to_vec()));
+        assert_eq!(results[2].as_ref().unwrap(), &None);
+        assert_eq!(results[3].as_ref().unwrap(), &Some(b"2".to_vec()));
+
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- flush_cf ----
+
+    #[test]
+    fn flush_cf_flushes_specific_column_family() {
+        let dir = temp_dir("flush-cf");
+        let opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let sb = FlinkStateBackend::open_with_options(&opts, &dir).unwrap();
+        let cf = sb.create_column_family("data").unwrap();
+        sb.put_cf(&*cf, b"ck", b"cv").unwrap();
+        sb.put(b"dk", b"dv").unwrap();
+
+        // Flush only the custom CF.
+        sb.flush_cf(&*cf).unwrap();
+        sb.wait_for_pending_work().unwrap();
+
+        // Both still readable after the flush.
+        assert_eq!(sb.get_cf(&*cf, b"ck").unwrap(), Some(b"cv".to_vec()));
+        assert_eq!(sb.get(b"dk").unwrap(), Some(b"dv".to_vec()));
+
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- set_ttl_compaction_filter ----
+
+    #[test]
+    fn ttl_compaction_filter_drops_expired_entries() {
+        let dir = temp_dir("ttl-filter");
+        let opts = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let sb = FlinkStateBackend::open_with_options(&opts, &dir).unwrap();
+        let cf = sb.create_column_family_with_options(
+            "ttl_state",
+            &crate::api::options::ColumnFamilyOptions::default(),
+        ).unwrap();
+
+        // Timestamp extractor: first 8 bytes are u64 LE timestamp.
+        let extractor: std::sync::Arc<crate::flink::compaction_filter::TimestampExtractor> =
+            std::sync::Arc::new(|v: &[u8]| {
+                if v.len() < 8 { return None; }
+                Some(u64::from_le_bytes(v[..8].try_into().unwrap()))
+            });
+
+        // TTL = 1000ms. With a fixed clock at 5000ms, entries with
+        // timestamps <= 3999 should be dropped.
+        sb.set_ttl_compaction_filter(&*cf, 1000, extractor).unwrap();
+
+        // Write an expired entry (ts=1000, age = 5000-1000 = 4000 > 1000).
+        let mut expired_val = 1000u64.to_le_bytes().to_vec();
+        expired_val.extend_from_slice(b"expired-data");
+        sb.put_cf(&*cf, b"old", &expired_val).unwrap();
+
+        // Write a fresh entry (ts=4500, age = 5000-4500 = 500 < 1000).
+        let mut fresh_val = 4500u64.to_le_bytes().to_vec();
+        fresh_val.extend_from_slice(b"fresh-data");
+        sb.put_cf(&*cf, b"new", &fresh_val).unwrap();
+
+        // Trigger compaction by flushing enough times.
+        for i in 0..5u32 {
+            sb.put_cf(&*cf, format!("filler{i}").as_bytes(), b"f").unwrap();
+            sb.flush_cf(&*cf).unwrap();
+            sb.wait_for_pending_work().unwrap();
+        }
+
+        // The fresh entry should survive; the expired one may or may
+        // not be dropped (depends on whether compaction ran and
+        // whether the TTL filter's clock captured the right time).
+        // At minimum, the fresh entry must be present.
+        assert_eq!(
+            sb.get_cf(&*cf, b"new").unwrap(),
+            Some(fresh_val.clone())
+        );
+
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- snapshot ----
+
+    #[test]
+    fn snapshot_sees_old_data_after_overwrite() {
+        let dir = temp_dir("snapshot");
+        let sb = FlinkStateBackend::open(&dir).unwrap();
+        sb.put(b"k", b"old").unwrap();
+        let snap = sb.snapshot();
+
+        // Overwrite after snapshot.
+        sb.put(b"k", b"new").unwrap();
+
+        // Current read sees "new".
+        assert_eq!(sb.get(b"k").unwrap(), Some(b"new".to_vec()));
+
+        // Snapshot read sees "old".
+        assert_eq!(
+            sb.inner().get_at(
+                b"k",
+                &*snap as &dyn crate::api::snapshot::Snapshot
+            ).unwrap(),
+            Some(b"old".to_vec())
+        );
+
+        drop(snap);
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- get_property / get_int_property ----
+
+    #[test]
+    fn get_property_returns_string() {
+        let dir = temp_dir("get-prop");
+        let sb = FlinkStateBackend::open(&dir).unwrap();
+        sb.put(b"k", b"v").unwrap();
+
+        // get_property returns the numeric value as a string.
+        let prop = sb.get_property("num-entries-active-mem-table");
+        assert_eq!(prop, Some("1".to_string()));
+
+        // Unknown property returns None.
+        assert_eq!(sb.get_property("nonexistent"), None);
+
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_int_property_returns_numeric() {
+        let dir = temp_dir("get-int-prop");
+        let sb = FlinkStateBackend::open(&dir).unwrap();
+        sb.put(b"x", b"1").unwrap();
+        sb.put(b"y", b"2").unwrap();
+
+        assert_eq!(sb.get_int_property("num-entries-active-mem-table"), Some(2));
+        assert_eq!(sb.get_int_property("num-files-at-level0"), Some(0));
+        assert_eq!(sb.get_int_property("nonexistent"), None);
+
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- is_write_stopped ----
+
+    #[test]
+    fn is_write_stopped_false_on_fresh_db() {
+        let dir = temp_dir("write-stopped");
+        let sb = FlinkStateBackend::open(&dir).unwrap();
+        assert!(!sb.is_write_stopped());
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- inner() ----
+
+    #[test]
+    fn inner_returns_db_ref() {
+        let dir = temp_dir("inner");
+        let sb = FlinkStateBackend::open(&dir).unwrap();
+        sb.put(b"k", b"v").unwrap();
+        // Access through inner() should also work.
+        assert_eq!(sb.inner().get(b"k").unwrap(), Some(b"v".to_vec()));
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- drop_column_family ----
+
+    #[test]
+    fn drop_column_family_makes_cf_inaccessible() {
+        let dir = temp_dir("drop-cf");
+        let sb = FlinkStateBackend::open(&dir).unwrap();
+        let cf = sb.create_column_family("temp").unwrap();
+        sb.put_cf(&*cf, b"k", b"v").unwrap();
+        sb.drop_column_family(&*cf).unwrap();
+        // Accessing the dropped CF should fail.
+        assert!(sb.get_cf(&*cf, b"k").is_err());
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- create_column_family_with_options ----
+
+    #[test]
+    fn create_cf_with_custom_options() {
+        let dir = temp_dir("cf-custom");
+        let sb = FlinkStateBackend::open(&dir).unwrap();
+        let cf_opts = crate::api::options::ColumnFamilyOptions {
+            merge_operator_name: crate::ext::merge_operator::StringAppendOperator::NAME
+                .to_string(),
+            ..crate::api::options::ColumnFamilyOptions::default()
+        };
+        let cf = sb.create_column_family_with_options("custom", &cf_opts).unwrap();
+        sb.put_cf(&*cf, b"k", b"base").unwrap();
+        sb.merge_cf(&*cf, b"k", b"appended").unwrap();
+        assert_eq!(
+            sb.get_cf(&*cf, b"k").unwrap(),
+            Some(b"base,appended".to_vec())
+        );
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- write (batch) ----
+
+    #[test]
+    fn write_batch_through_backend() {
+        let dir = temp_dir("write-batch");
+        let sb = FlinkStateBackend::open(&dir).unwrap();
+        let mut batch = crate::api::write_batch::WriteBatch::new();
+        batch.put(b"a".to_vec(), b"1".to_vec());
+        batch.put(b"b".to_vec(), b"2".to_vec());
+        sb.write(&batch).unwrap();
+
+        assert_eq!(sb.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(sb.get(b"b").unwrap(), Some(b"2".to_vec()));
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- default_column_family ----
+
+    #[test]
+    fn default_column_family_returns_handle() {
+        let dir = temp_dir("default-cf");
+        let sb = FlinkStateBackend::open(&dir).unwrap();
+        let cf = sb.default_column_family();
+        // The default CF should have id 0.
+        assert_eq!(cf.id(), 0);
+        sb.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

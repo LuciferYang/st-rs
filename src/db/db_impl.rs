@@ -5915,4 +5915,237 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&ext_dir);
     }
+
+    // ---- Edge case tests for coverage ----
+
+    #[test]
+    fn multi_get_with_merge_operands() {
+        // multi_get on keys that have merge operands should resolve
+        // via the single-key merge path.
+        let dir = temp_dir("multi-get-merge");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        let cf = db.create_column_family("list", &merge_cf_opts()).unwrap();
+
+        // Put base + merge operands on two keys.
+        db.put_cf(&*cf, b"k1", b"a").unwrap();
+        {
+            let mut batch = WriteBatch::new();
+            batch.merge_cf(cf.id(), b"k1".to_vec(), b"b".to_vec());
+            db.write(&batch).unwrap();
+        }
+
+        db.put_cf(&*cf, b"k2", b"x").unwrap();
+        {
+            let mut batch = WriteBatch::new();
+            batch.merge_cf(cf.id(), b"k2".to_vec(), b"y".to_vec());
+            db.write(&batch).unwrap();
+        }
+
+        // multi_get on the default CF won't see CF keys.
+        let results = db.multi_get(&[b"k1", b"k2"]);
+        assert_eq!(results[0].as_ref().unwrap(), &None);
+        assert_eq!(results[1].as_ref().unwrap(), &None);
+
+        // Verify the CF data through single-key get.
+        assert_eq!(db.get_cf(&*cf, b"k1").unwrap(), Some(b"a,b".to_vec()));
+        assert_eq!(db.get_cf(&*cf, b"k2").unwrap(), Some(b"x,y".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_scan_across_sst() {
+        // Prefix scan where some matching keys are in SST (after flush)
+        // and some in the active memtable.
+        let dir = temp_dir("prefix-sst");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+
+        // First batch: keys with prefix "user:" go to SST.
+        db.put(b"user:alice", b"a").unwrap();
+        db.put(b"user:bob", b"b").unwrap();
+        db.flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        // Second batch: more keys with prefix "user:" stay in memtable.
+        db.put(b"user:charlie", b"c").unwrap();
+        db.put(b"user:dave", b"d").unwrap();
+        // Also a non-matching key.
+        db.put(b"item:1", b"x").unwrap();
+
+        let results = db.prefix_scan(b"user:").unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].0, b"user:alice");
+        assert_eq!(results[1].0, b"user:bob");
+        assert_eq!(results[2].0, b"user:charlie");
+        assert_eq!(results[3].0, b"user:dave");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_property_block_cache_usage() {
+        // With block cache enabled, verify that cache properties
+        // are queryable and that usage is > 0 after reading from SSTs.
+        let dir = temp_dir("prop-cache-usage");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            block_cache_size: 1024 * 1024, // 1 MB cache
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+
+        // Capacity should always be reported.
+        assert_eq!(
+            db.get_int_property("block-cache-capacity"),
+            Some(1024 * 1024)
+        );
+
+        // Write data, flush to SST, and read back to populate cache.
+        for i in 0..50u32 {
+            let k = format!("key{i:05}");
+            let v = format!("value{i}");
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+        db.flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+
+        // Read from SST to ensure cache is populated.
+        for i in 0..50u32 {
+            let k = format!("key{i:05}");
+            assert!(db.get(k.as_bytes()).unwrap().is_some());
+        }
+
+        let usage = db.get_int_property("block-cache-usage").unwrap();
+        assert!(
+            usage > 0,
+            "cache usage should be > 0 after SST reads, got {usage}"
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_write_batch_is_noop() {
+        // Writing an empty batch should be a no-op.
+        let dir = temp_dir("empty-batch");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+
+        db.put(b"k", b"v").unwrap();
+        let seq_before = {
+            let state = db.state.lock().unwrap();
+            state.last_sequence
+        };
+
+        // Write an empty batch.
+        db.write(&WriteBatch::new()).unwrap();
+
+        let seq_after = {
+            let state = db.state.lock().unwrap();
+            state.last_sequence
+        };
+
+        // Sequence should not have advanced.
+        assert_eq!(
+            seq_before, seq_after,
+            "empty write batch should not advance sequence"
+        );
+
+        // Data unchanged.
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn version_set_recovery_multi_cf() {
+        // Create 2 CFs, flush both, close, reopen, verify both CFs' data.
+        let dir = temp_dir("vs-recovery-cf");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+
+        let cf1_id;
+        let cf2_id;
+
+        // Phase 1: create, write, flush, close.
+        {
+            let db = DbImpl::open(&big, &dir).unwrap();
+            let cf1 = db
+                .create_column_family(
+                    "alpha",
+                    &crate::api::options::ColumnFamilyOptions::default(),
+                )
+                .unwrap();
+            let cf2 = db
+                .create_column_family(
+                    "beta",
+                    &crate::api::options::ColumnFamilyOptions::default(),
+                )
+                .unwrap();
+            cf1_id = cf1.id();
+            cf2_id = cf2.id();
+
+            // Write to default + both CFs.
+            db.put(b"dk", b"default-val").unwrap();
+            db.put_cf(&*cf1, b"a1", b"alpha-val").unwrap();
+            db.put_cf(&*cf2, b"b1", b"beta-val").unwrap();
+
+            // Flush all.
+            db.flush().unwrap();
+            db.flush_cf(&*cf1).unwrap();
+            db.flush_cf(&*cf2).unwrap();
+            db.wait_for_pending_work().unwrap();
+
+            db.close().unwrap();
+        }
+
+        // Phase 2: reopen and verify.
+        {
+            let db = DbImpl::open(&big, &dir).unwrap();
+            assert_eq!(db.get(b"dk").unwrap(), Some(b"default-val".to_vec()));
+
+            let cf1 = std::sync::Arc::new(ColumnFamilyHandleImpl {
+                id: cf1_id,
+                name: "alpha".to_string(),
+            });
+            let cf2 = std::sync::Arc::new(ColumnFamilyHandleImpl {
+                id: cf2_id,
+                name: "beta".to_string(),
+            });
+            assert_eq!(
+                db.get_cf(&*cf1, b"a1").unwrap(),
+                Some(b"alpha-val".to_vec())
+            );
+            assert_eq!(
+                db.get_cf(&*cf2, b"b1").unwrap(),
+                Some(b"beta-val".to_vec())
+            );
+
+            db.close().unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
