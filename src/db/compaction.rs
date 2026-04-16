@@ -117,6 +117,10 @@ pub struct CompactionJob<'a> {
     /// Optional compaction filter. Applied to each entry the
     /// retention rule would emit. Can drop, keep, or rewrite entries.
     compaction_filter: Option<Box<dyn CompactionFilter>>,
+    /// Optional merge operator. When set, merge chains are collapsed
+    /// during compaction into a single Put entry, improving read
+    /// performance.
+    merge_operator: Option<Arc<dyn crate::ext::merge_operator::MergeOperator>>,
 }
 
 impl<'a> CompactionJob<'a> {
@@ -135,6 +139,7 @@ impl<'a> CompactionJob<'a> {
             table_options,
             min_snap_seq: SequenceNumber::MAX,
             compaction_filter: None,
+            merge_operator: None,
         }
     }
 
@@ -143,6 +148,13 @@ impl<'a> CompactionJob<'a> {
     #[must_use]
     pub fn with_min_snap_seq(mut self, min_snap_seq: SequenceNumber) -> Self {
         self.min_snap_seq = min_snap_seq;
+        self
+    }
+
+    /// Builder: set the merge operator for collapsing merge chains.
+    #[must_use]
+    pub fn with_merge_operator(mut self, op: Arc<dyn crate::ext::merge_operator::MergeOperator>) -> Self {
+        self.merge_operator = Some(op);
         self
     }
 
@@ -236,19 +248,49 @@ impl<'a> CompactionJob<'a> {
         let mut last_user_key: Option<Vec<u8>> = None;
         let mut emitted_below_min = false;
         let drop_tombstones = self.min_snap_seq == SequenceNumber::MAX;
-        // When a compaction filter removes the newest version of a key,
-        // all older versions of the same key must also be suppressed
-        // to prevent the key from reverting to an older value.
         let mut filter_suppressed_key: Option<Vec<u8>> = None;
+        // Merge chain accumulator: when we have a merge operator,
+        // we collect consecutive Merge entries for the same user key
+        // and collapse them into a single Put.
+        let mut merge_operands: Vec<Vec<u8>> = Vec::new();
+        let mut merge_base: Option<Vec<u8>> = None;
+        let mut merge_ikey: Option<Vec<u8>> = None; // ikey of the newest merge entry
+
         for (ikey, value) in &entries {
             let parsed = ParsedInternalKey::parse(ikey)?;
             let new_user_key = last_user_key.as_deref() != Some(parsed.user_key);
+
+            // Flush any pending merge chain from the previous user key.
+            if new_user_key && !merge_operands.is_empty() {
+                if let Some(ref op) = self.merge_operator {
+                    let refs: Vec<&[u8]> = merge_operands.iter().map(|o| o.as_slice()).collect();
+                    let merged = op.full_merge(
+                        last_user_key.as_deref().unwrap_or(b""),
+                        merge_base.as_deref(),
+                        &refs,
+                    )?;
+                    if let Some(ref mk) = merge_ikey {
+                        // Rewrite as a Put with the merged value,
+                        // using the newest merge entry's internal key
+                        // but changing the type to Value.
+                        let p = ParsedInternalKey::parse(mk)?;
+                        let put_ikey = crate::db::dbformat::InternalKey::new(
+                            p.user_key, p.sequence, ValueType::Value,
+                        );
+                        tb.add(&put_ikey.into_bytes(), &merged)?;
+                        written += 1;
+                    }
+                }
+                merge_operands.clear();
+                merge_base = None;
+                merge_ikey = None;
+            }
 
             // Decide whether to emit this entry.
             let emit = if new_user_key {
                 last_user_key = Some(parsed.user_key.to_vec());
                 emitted_below_min = parsed.sequence <= self.min_snap_seq;
-                filter_suppressed_key = None; // reset for new user key
+                filter_suppressed_key = None;
                 true
             } else if parsed.sequence > self.min_snap_seq {
                 // Still above the oldest live snapshot — preserve.
@@ -277,9 +319,22 @@ impl<'a> CompactionJob<'a> {
             }
 
             match parsed.value_type {
+                ValueType::Merge if self.merge_operator.is_some() => {
+                    // Collect merge operand for later collapse.
+                    merge_operands.push(value.clone());
+                    if merge_ikey.is_none() {
+                        merge_ikey = Some(ikey.clone());
+                    }
+                }
+                ValueType::Value if self.merge_operator.is_some() && !merge_operands.is_empty() => {
+                    // Put terminates a merge chain — use as base value.
+                    merge_base = Some(value.clone());
+                    // The chain will be flushed when the next user key
+                    // is encountered (or at the end of the loop).
+                }
                 ValueType::Value | ValueType::Merge => {
-                    // Apply compaction filter if present. Merge entries
-                    // are only filtered if allow_merge() returns true.
+                    // No merge operator, or no pending merge chain —
+                    // apply compaction filter and emit directly.
                     let should_filter = self.compaction_filter.as_ref().is_some_and(|f| {
                         parsed.value_type != ValueType::Merge || f.allow_merge()
                     });
@@ -297,8 +352,6 @@ impl<'a> CompactionJob<'a> {
                                 written += 1;
                             }
                             CompactionDecision::Remove => {
-                                // Filtered out — suppress all older
-                                // versions of this key too.
                                 filter_suppressed_key =
                                     Some(parsed.user_key.to_vec());
                             }
@@ -308,9 +361,6 @@ impl<'a> CompactionJob<'a> {
                             }
                             CompactionDecision::RemoveAndSkipUntil(_skip_key) => {
                                 // TODO: implement skip-until semantics.
-                                // For now, treat as Remove (drops only this
-                                // entry, does NOT skip ahead). Flink's
-                                // FlinkCompactionFilter does not use this
                                 // variant, so the simplification is safe
                                 // for the Flink integration path.
                             }
@@ -326,9 +376,43 @@ impl<'a> CompactionJob<'a> {
                         written += 1;
                     }
                 }
+                ValueType::Deletion | ValueType::SingleDeletion
+                    if self.merge_operator.is_some() && !merge_operands.is_empty() =>
+                {
+                    // Tombstone terminates a merge chain — no base value.
+                    // Flush the chain with base=None.
+                    // (Don't write the tombstone itself if drop_tombstones.)
+                    if !drop_tombstones {
+                        tb.add(ikey, value)?;
+                        written += 1;
+                    }
+                    merge_operands.clear();
+                    merge_ikey = None;
+                }
                 _ => {}
             }
         }
+
+        // Flush any trailing merge chain at the end of the entries.
+        if !merge_operands.is_empty() {
+            if let Some(ref op) = self.merge_operator {
+                let refs: Vec<&[u8]> = merge_operands.iter().map(|o| o.as_slice()).collect();
+                let merged = op.full_merge(
+                    last_user_key.as_deref().unwrap_or(b""),
+                    merge_base.as_deref(),
+                    &refs,
+                )?;
+                if let Some(ref mk) = merge_ikey {
+                    let p = ParsedInternalKey::parse(mk)?;
+                    let put_ikey = crate::db::dbformat::InternalKey::new(
+                        p.user_key, p.sequence, ValueType::Value,
+                    );
+                    tb.add(&put_ikey.into_bytes(), &merged)?;
+                    written += 1;
+                }
+            }
+        }
+
         tb.finish()?;
         Ok(written)
     }

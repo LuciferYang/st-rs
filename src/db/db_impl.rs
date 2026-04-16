@@ -2510,7 +2510,7 @@ impl DbImpl {
     fn maybe_pick_compaction(&self, state: &mut DbState) -> Option<CompactionPlan> {
         // Collect everything we need from the immutable borrow of
         // the CF first, then do the mutable state updates.
-        let (inputs, input_numbers, input_levels, filter_factory) = {
+        let (inputs, input_numbers, input_levels, filter_factory, merge_operator) = {
             let cf = state.default_cf();
             if cf.pending_compaction.is_some() {
                 return None;
@@ -2544,7 +2544,8 @@ impl DbImpl {
                 }
             }
             let ff = cf.compaction_filter_factory.as_ref().map(Arc::clone);
-            (inputs, input_numbers, input_levels, ff)
+            let mo = cf.merge_operator.as_ref().map(Arc::clone);
+            (inputs, input_numbers, input_levels, ff, mo)
         };
         // Now safe to mutate state.
         let out_number = state.next_file_number;
@@ -2557,6 +2558,7 @@ impl DbImpl {
             input_levels,
             min_snap_seq,
             filter_factory,
+            merge_operator,
         })
     }
 
@@ -2612,6 +2614,8 @@ struct CompactionPlan {
     /// filter is created from this for each compaction run.
     filter_factory:
         Option<Arc<dyn crate::ext::compaction_filter::CompactionFilterFactory>>,
+    /// Merge operator from the CF, if any.
+    merge_operator: Option<Arc<dyn crate::ext::merge_operator::MergeOperator>>,
 }
 
 /// The engine's concrete snapshot type. Returned from
@@ -2781,11 +2785,11 @@ impl DbImpl {
         let input_levels = plan.input_levels;
         let min_snap_seq = plan.min_snap_seq;
         let filter_factory = plan.filter_factory;
+        let merge_operator = plan.merge_operator;
 
         let out_path = make_table_file_name(&self.path, out_number);
 
-        // Run the merge → output SST. CompactionJob borrows the
-        // file system; the inputs are owned via Arc.
+        // Run the merge → output SST.
         let mut job = CompactionJob::new(
             self.fs.as_ref(),
             inputs,
@@ -2794,10 +2798,12 @@ impl DbImpl {
         )
         .with_min_snap_seq(min_snap_seq);
 
-        // Create a fresh filter from the factory, if any.
         if let Some(factory) = &filter_factory {
             let filter = factory.create_compaction_filter(true, false);
             job = job.with_compaction_filter(filter);
+        }
+        if let Some(op) = merge_operator {
+            job = job.with_merge_operator(op);
         }
 
         let written = job.run()?;
