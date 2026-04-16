@@ -3174,10 +3174,16 @@ impl crate::api::db::Db for DbImpl {
 
     fn multi_get(
         &self,
-        _opts: &crate::api::options::ReadOptions,
+        opts: &crate::api::options::ReadOptions,
         keys: &[&[u8]],
     ) -> Vec<Result<Option<Vec<u8>>>> {
-        DbImpl::multi_get(self, keys)
+        match opts.snapshot {
+            Some(seq) => keys
+                .iter()
+                .map(|key| self.get_at_seq(key, seq))
+                .collect(),
+            None => DbImpl::multi_get(self, keys),
+        }
     }
 
     fn new_iterator(
