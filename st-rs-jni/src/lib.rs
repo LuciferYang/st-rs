@@ -568,7 +568,14 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getColumnFamilyByName(
         Err(_) => return 0,
     };
     match db.get_column_family_by_name(&cf_name) {
-        Some(cf) => to_handle(cf),
+        Some(cf) => {
+            // Set the StringAppendOperator on recovered CFs so that
+            // merge operands from SSTs are correctly combined on read.
+            let operator: Arc<dyn st_rs::MergeOperator> =
+                Arc::new(st_rs::StringAppendOperator::default());
+            let _ = db.set_merge_operator(&*cf, operator);
+            to_handle(cf)
+        }
         None => 0,
     }
 }

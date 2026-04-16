@@ -1008,6 +1008,18 @@ impl DbImpl {
 
     /// Create a new column family. Returns a handle that can be
     /// passed to `put_cf`, `get_cf`, etc.
+    /// Set the merge operator for an existing column family.
+    pub fn set_merge_operator(
+        &self,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
+        operator: Arc<dyn crate::ext::merge_operator::MergeOperator>,
+    ) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let cf_state = state.cf_mut(cf.id())?;
+        cf_state.merge_operator = Some(operator);
+        Ok(())
+    }
+
     /// Look up an existing column family by name. Returns the handle
     /// if found, or `None` if no CF with that name exists.
     pub fn get_column_family_by_name(
@@ -1382,34 +1394,86 @@ impl DbImpl {
         let (mut operands, mut base_value, mut base_found) = merge_state;
 
         // 4. SSTs (only if we haven't found a base yet).
-        //
-        //    KNOWN SIMPLIFICATION: seek_in_sst returns the value for
-        //    both Put and Merge entries. We treat them all as Put
-        //    (base value). This is correct for the common case (merge
-        //    operands in memtable, base Put in SST) but doesn't
-        //    handle merge operands spanning multiple SSTs. Full SST
-        //    merge collection would require walking the SST iterator
-        //    forward to collect additional operands.
+        //    Walk SST entries for this user key, collecting merge
+        //    operands until a Put or Delete terminates the chain.
+        let sst_operands_start = operands.len();
         if !base_found {
-            for table in &l0_ssts {
-                if let Some(result) = Self::seek_in_sst(table, key, &lookup)? {
-                    base_value = result; // Some(v) for Put/Merge, None for tombstone
-                    base_found = true;
-                    break;
+            for table in l0_ssts.iter() {
+                let mut it = table.iter();
+                it.seek(lookup.internal_key());
+                while it.valid() {
+                    let parsed = match ParsedInternalKey::parse(it.key()) {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    if parsed.user_key != key {
+                        break;
+                    }
+                    match parsed.value_type {
+                        ValueType::Merge => {
+                            operands.push(it.value().to_vec());
+                        }
+                        ValueType::Value => {
+                            base_value = Some(it.value().to_vec());
+                            base_found = true;
+                            break;
+                        }
+                        ValueType::Deletion | ValueType::SingleDeletion => {
+                            base_found = true;
+                            break;
+                        }
+                        _ => break,
+                    }
+                    it.next();
+                }
+                if base_found || !operands.is_empty() {
+                    break; // found something in this L0 SST
                 }
             }
         }
-        if !base_found {
+        if !base_found && operands.is_empty() {
             // L1 binary search.
             let idx = l1_ssts.partition_point(|(smallest, _, _)| smallest.as_slice() <= key);
             if idx > 0 {
                 let (_, largest, table) = &l1_ssts[idx - 1];
                 if key <= largest.as_slice() {
-                    if let Some(result) = Self::seek_in_sst(table, key, &lookup)? {
-                        base_value = result;
+                    let mut it = table.iter();
+                    it.seek(lookup.internal_key());
+                    while it.valid() {
+                        let parsed = match ParsedInternalKey::parse(it.key()) {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                        if parsed.user_key != key {
+                            break;
+                        }
+                        match parsed.value_type {
+                            ValueType::Merge => {
+                                operands.push(it.value().to_vec());
+                            }
+                            ValueType::Value => {
+                                base_value = Some(it.value().to_vec());
+                                break;
+                            }
+                            ValueType::Deletion | ValueType::SingleDeletion => {
+                                break;
+                            }
+                            _ => break,
+                        }
+                        it.next();
                     }
                 }
             }
+        }
+        // SST operands were collected newest-first (SST order is
+        // seq desc) and appended after memtable operands. But SST
+        // entries are OLDER than memtable entries. Fix ordering:
+        // reverse the SST portion, then rotate so SST operands
+        // come before memtable operands (oldest-first for full_merge).
+        if operands.len() > sst_operands_start {
+            operands[sst_operands_start..].reverse();
+            // Rotate: [mem_ops..., sst_ops...] → [sst_ops..., mem_ops...]
+            operands.rotate_left(sst_operands_start);
         }
 
         // 5. Check range tombstones. A range tombstone at seq S
