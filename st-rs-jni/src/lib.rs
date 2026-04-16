@@ -30,6 +30,8 @@
 //! Java calls the corresponding `disposeInternal` which does
 //! `Box::from_raw` to reclaim and drop the object.
 
+mod jni_fs_backend;
+
 use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring, JNI_TRUE};
 use jni::JNIEnv;
@@ -1286,4 +1288,61 @@ pub extern "system" fn Java_org_forstdb_Checkpoint_createCheckpoint0(
     if let Err(e) = st_rs::create_checkpoint(db, Path::new(&path_str)) {
         throw_rocks_exception(&mut env, &e.to_string());
     }
+}
+
+// ---------------------------------------------------------------------------
+// FlinkEnv (org.forstdb.FlinkEnv)
+// ---------------------------------------------------------------------------
+
+/// `FlinkEnv.createWithBackend(Object javaFsBackend) -> long`
+///
+/// Creates a `JniFsBackend` wrapping the given Java object. The Java
+/// object must implement these methods:
+/// - `boolean exists(String path)`
+/// - `boolean mkdirs(String path)`
+/// - `boolean renameFile(String src, String dst)`
+/// - `boolean deleteFile(String path, boolean recursive)`
+/// - `byte[] readFile(String path)`
+/// - `void writeFile(String path, byte[] data)`
+/// - `long[] getFileStatus(String path)` → {length, isDir, modTime}
+///
+/// Returns a handle to an `Arc<dyn FileSystem>` (a `FlinkFileSystem`
+/// backed by the `JniFsBackend`).
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlinkEnv_createWithBackend(
+    mut env: JNIEnv,
+    _class: JClass,
+    java_fs_backend: JObject,
+) -> jlong {
+    let jvm = match env.get_java_vm() {
+        Ok(vm) => Arc::new(vm),
+        Err(e) => {
+            throw_rocks_exception(&mut env, &format!("failed to get JavaVM: {e}"));
+            return 0;
+        }
+    };
+
+    let global_ref = match env.new_global_ref(java_fs_backend) {
+        Ok(r) => r,
+        Err(e) => {
+            throw_rocks_exception(&mut env, &format!("failed to create global ref: {e}"));
+            return 0;
+        }
+    };
+
+    let backend: Arc<dyn st_rs::FlinkFsBackend> =
+        Arc::new(jni_fs_backend::JniFsBackend::new(jvm, global_ref));
+    let flink_fs = st_rs::FlinkFileSystem::new(backend, "/".to_string());
+    let fs: Arc<dyn st_rs::FileSystem> = Arc::new(flink_fs);
+    to_handle(fs)
+}
+
+/// `FlinkEnv.disposeFlinkEnv(long handle)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlinkEnv_disposeFlinkEnv(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    unsafe { drop_handle::<Arc<dyn st_rs::FileSystem>>(handle) };
 }
