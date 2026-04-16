@@ -164,8 +164,18 @@ public class RocksDB extends RocksObject {
                 // which the JNI layer treats as "default CF".
                 cfHandles.add(new ColumnFamilyHandle(0));
             } else {
-                final ColumnFamilyHandle cfh = db.createColumnFamily(name);
-                cfHandles.add(cfh);
+                try {
+                    final ColumnFamilyHandle cfh = db.createColumnFamily(name);
+                    cfHandles.add(cfh);
+                } catch (RocksDBException e) {
+                    if (e.getMessage() != null && e.getMessage().contains("already exists")) {
+                        // CF was recovered from MANIFEST — return a
+                        // placeholder handle. The engine already has it.
+                        cfHandles.add(new ColumnFamilyHandle(0));
+                    } else {
+                        throw e;
+                    }
+                }
             }
         }
         return db;

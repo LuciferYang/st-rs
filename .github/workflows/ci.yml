@@ -42,7 +42,7 @@ jobs:
         run: cargo test -p st-rs --no-default-features
 
   java:
-    name: Java
+    name: Java compile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,3 +54,28 @@ jobs:
 
       - name: Compile Java
         run: cd java && mvn compile -q
+
+  integration:
+    name: JNI integration tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 11
+
+      - name: Build native library
+        run: cargo build -p st-rs-jni
+
+      - name: Run Java integration tests
+        run: cd java && mvn test -Djava.library.path=../target/debug
