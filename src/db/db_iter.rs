@@ -687,4 +687,87 @@ mod tests {
         it.prev();
         assert!(!it.valid());
     }
+
+    #[test]
+    fn db_iter_seek_to_last_returns_last_user_key() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        mt.add(1, ValueType::Value, b"alpha", b"v1").unwrap();
+        mt.add(2, ValueType::Value, b"beta", b"v2").unwrap();
+        mt.add(3, ValueType::Value, b"delta", b"v3").unwrap();
+        mt.add(4, ValueType::Value, b"gamma", b"v4").unwrap();
+        let mut it = DbIterator::from_snapshot(&mt, &empty_ssts()).unwrap();
+        it.seek_to_last();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"gamma"); // lexicographically last
+        assert_eq!(it.value(), b"v4");
+    }
+
+    #[test]
+    fn db_iter_prev_walks_backward_through_all() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        for (i, k) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            mt.add(i as u64 + 1, ValueType::Value, k.as_bytes(), b"v")
+                .unwrap();
+        }
+        let mut it = DbIterator::from_snapshot(&mt, &empty_ssts()).unwrap();
+        it.seek_to_last();
+        let mut backward_keys = Vec::new();
+        while it.valid() {
+            backward_keys.push(it.key().to_vec());
+            it.prev();
+        }
+        assert_eq!(
+            backward_keys,
+            vec![
+                b"e".to_vec(),
+                b"d".to_vec(),
+                b"c".to_vec(),
+                b"b".to_vec(),
+                b"a".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn db_iter_seek_for_prev_between_entries() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        mt.add(1, ValueType::Value, b"aa", b"1").unwrap();
+        mt.add(2, ValueType::Value, b"cc", b"3").unwrap();
+        mt.add(3, ValueType::Value, b"ee", b"5").unwrap();
+        mt.add(4, ValueType::Value, b"gg", b"7").unwrap();
+        let mut it = DbIterator::from_snapshot(&mt, &empty_ssts()).unwrap();
+        // seek_for_prev("dd") should land on "cc" (last key <= "dd")
+        it.seek_for_prev(b"dd");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"cc");
+        assert_eq!(it.value(), b"3");
+        // seek_for_prev at exact key should land on that key
+        it.seek_for_prev(b"ee");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"ee");
+        assert_eq!(it.value(), b"5");
+        // seek_for_prev before all keys -> invalid
+        it.seek_for_prev(b"a");
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn db_iter_seek_to_last_on_empty() {
+        let mt = MemTable::new(Arc::new(BytewiseComparator));
+        let mut it = DbIterator::from_snapshot(&mt, &empty_ssts()).unwrap();
+        it.seek_to_last();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn db_iter_prev_at_first_invalidates() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        mt.add(1, ValueType::Value, b"only", b"one").unwrap();
+        let mut it = DbIterator::from_snapshot(&mt, &empty_ssts()).unwrap();
+        it.seek_to_first();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"only");
+        it.prev();
+        assert!(!it.valid());
+    }
 }

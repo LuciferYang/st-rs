@@ -341,4 +341,135 @@ mod tests {
         let mut out = Vec::new();
         assert!(!reader.read_record(&mut out).unwrap());
     }
+
+    #[test]
+    fn read_record_skips_bad_checksum() {
+        // Write a valid record, then corrupt the CRC bytes.
+        // The reader should skip the corrupted record and return
+        // the next valid one.
+        let file = Arc::new(SharedFile::default());
+        {
+            let writer_file: Box<dyn FsWritableFile> = Box::new(WHandle {
+                file: Arc::clone(&file),
+            });
+            let writer = WritableFileWriter::new(writer_file);
+            let mut log_writer = LogWriter::new(writer);
+            log_writer.add_record(b"good-record-1").unwrap();
+            log_writer.add_record(b"good-record-2").unwrap();
+            log_writer.sync().unwrap();
+        }
+        // Corrupt the CRC of the first record (bytes 0..4 are the
+        // masked CRC in LE).
+        {
+            let mut bytes = file.bytes.lock().unwrap();
+            bytes[0] ^= 0xFF;
+            bytes[1] ^= 0xFF;
+        }
+        let r: Box<dyn FsSequentialFile> = Box::new(RHandle {
+            file: Arc::clone(&file),
+            pos: 0,
+        });
+        let r = SequentialFileReader::with_buffer_size(r, "wal", 16);
+        let mut reader = LogReader::new(r);
+        let mut out = Vec::new();
+        // The first record has a bad checksum — the reader should
+        // skip it and return the second record.
+        assert!(reader.read_record(&mut out).unwrap());
+        assert_eq!(out, b"good-record-2");
+        // No more records.
+        assert!(!reader.read_record(&mut out).unwrap());
+    }
+
+    #[test]
+    fn read_record_handles_truncated_block() {
+        // Write a valid record, then truncate the file mid-payload
+        // so the header's length field promises more bytes than exist.
+        let file = Arc::new(SharedFile::default());
+        {
+            let writer_file: Box<dyn FsWritableFile> = Box::new(WHandle {
+                file: Arc::clone(&file),
+            });
+            let writer = WritableFileWriter::new(writer_file);
+            let mut log_writer = LogWriter::new(writer);
+            // Write a record large enough to have a non-trivial payload.
+            log_writer.add_record(b"hello-world-data").unwrap();
+            log_writer.sync().unwrap();
+        }
+        // Truncate mid-payload: keep the header (7 bytes) plus only
+        // half the payload.
+        {
+            let mut bytes = file.bytes.lock().unwrap();
+            let truncated_len = crate::db::log_format::HEADER_SIZE + 5;
+            bytes.truncate(truncated_len);
+        }
+        let r: Box<dyn FsSequentialFile> = Box::new(RHandle {
+            file: Arc::clone(&file),
+            pos: 0,
+        });
+        let r = SequentialFileReader::with_buffer_size(r, "wal", 16);
+        let mut reader = LogReader::new(r);
+        let mut out = Vec::new();
+        // The truncated record should be detected as a bad header
+        // and skipped. Since there are no more records, we get EOF.
+        assert!(!reader.read_record(&mut out).unwrap());
+    }
+
+    #[test]
+    fn read_record_empty_file() {
+        // Read from a file with zero bytes — should return false
+        // immediately (no records).
+        let file = Arc::new(SharedFile::default());
+        let r: Box<dyn FsSequentialFile> = Box::new(RHandle {
+            file: Arc::clone(&file),
+            pos: 0,
+        });
+        let r = SequentialFileReader::with_buffer_size(r, "wal", 16);
+        let mut reader = LogReader::new(r);
+        let mut out = Vec::new();
+        assert!(!reader.read_record(&mut out).unwrap());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn read_record_survives_corruption_then_reads_next() {
+        // Write three records, corrupt the second one's CRC, and
+        // verify the reader skips it and reads the first and third.
+        let file = Arc::new(SharedFile::default());
+        let second_record_offset;
+        {
+            let writer_file: Box<dyn FsWritableFile> = Box::new(WHandle {
+                file: Arc::clone(&file),
+            });
+            let writer = WritableFileWriter::new(writer_file);
+            let mut log_writer = LogWriter::new(writer);
+            log_writer.add_record(b"first").unwrap();
+            // Sync to force data to the underlying SharedFile so we
+            // can measure the exact byte offset for record 2.
+            log_writer.sync().unwrap();
+            second_record_offset = file.bytes.lock().unwrap().len();
+            log_writer.add_record(b"second").unwrap();
+            log_writer.add_record(b"third").unwrap();
+            log_writer.sync().unwrap();
+        }
+        // Corrupt the CRC of the second record.
+        {
+            let mut bytes = file.bytes.lock().unwrap();
+            bytes[second_record_offset] ^= 0xFF;
+        }
+        let r: Box<dyn FsSequentialFile> = Box::new(RHandle {
+            file: Arc::clone(&file),
+            pos: 0,
+        });
+        let r = SequentialFileReader::with_buffer_size(r, "wal", 16);
+        let mut reader = LogReader::new(r);
+        let mut out = Vec::new();
+        // First record should be fine.
+        assert!(reader.read_record(&mut out).unwrap());
+        assert_eq!(out, b"first");
+        // Second record is corrupted — reader skips and returns third.
+        assert!(reader.read_record(&mut out).unwrap());
+        assert_eq!(out, b"third");
+        // No more records.
+        assert!(!reader.read_record(&mut out).unwrap());
+    }
 }

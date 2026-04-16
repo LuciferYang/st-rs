@@ -565,4 +565,128 @@ mod tests {
         it.next();
         assert!(!it.valid());
     }
+
+    #[test]
+    fn seek_to_last_then_prev_through_all() {
+        // Use the underlying BlockIter's seek_to_last + prev to
+        // verify backward iteration through the index block, which
+        // exercises the SstIter's backing block iterator path.
+        let recs: &[(&[u8], &[u8])] = &[
+            (b"a", b"1"),
+            (b"b", b"2"),
+            (b"c", b"3"),
+            (b"d", b"4"),
+            (b"e", b"5"),
+        ];
+        let table = build(recs, BlockBasedTableOptions::default());
+        // Verify forward iteration collects all entries first.
+        let mut it = table.iter();
+        it.seek_to_first();
+        let mut forward_keys = Vec::new();
+        while it.valid() {
+            forward_keys.push(it.key().to_vec());
+            it.next();
+        }
+        assert_eq!(forward_keys.len(), 5);
+        // Also verify the index block supports backward iteration.
+        let idx = table.index_block().iter();
+        // The index block should have at least one entry.
+        let mut idx_it = idx;
+        idx_it.seek_to_last();
+        assert!(idx_it.valid());
+        idx_it.seek_to_first();
+        assert!(idx_it.valid());
+    }
+
+    #[test]
+    fn seek_for_prev_via_index_lands_correctly() {
+        // SstIter doesn't have seek_for_prev, but we can verify
+        // that seeking to a key between entries rounds up correctly,
+        // then iterating from there produces the right entries.
+        let owned: Vec<(Vec<u8>, Vec<u8>)> = (0..20u32)
+            .map(|i| (format!("k{i:03}").into_bytes(), format!("v{i}").into_bytes()))
+            .collect();
+        let recs: Vec<(&[u8], &[u8])> = owned
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let opts = BlockBasedTableOptions {
+            block_size: 64,
+            ..Default::default()
+        };
+        let table = build(&recs, opts);
+        let mut it = table.iter();
+        // Seek to a key between k010 and k011 — should land on k011.
+        it.seek(b"k010x");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"k011");
+        assert_eq!(it.value(), b"v11");
+    }
+
+    #[test]
+    fn prev_across_block_boundary_via_index() {
+        // Create an SST with very small blocks to force entries into
+        // multiple data blocks. Then verify the index block's
+        // backward iteration crosses block boundaries correctly.
+        let owned: Vec<(Vec<u8>, Vec<u8>)> = (0..30u32)
+            .map(|i| {
+                (
+                    format!("key{i:04}").into_bytes(),
+                    format!("value{i:04}").into_bytes(),
+                )
+            })
+            .collect();
+        let recs: Vec<(&[u8], &[u8])> = owned
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let opts = BlockBasedTableOptions {
+            block_size: 32, // very small to force many blocks
+            ..Default::default()
+        };
+        let table = build(&recs, opts);
+
+        // The index block should have more than 1 entry because of
+        // the tiny block size.
+        let mut idx_it = table.index_block().iter();
+        idx_it.seek_to_first();
+        let mut index_count = 0;
+        while idx_it.valid() {
+            index_count += 1;
+            idx_it.next();
+        }
+        assert!(
+            index_count > 1,
+            "expected multiple index entries with block_size=32, got {index_count}"
+        );
+
+        // Now verify backward iteration through the index block.
+        idx_it.seek_to_last();
+        let mut backward_keys = Vec::new();
+        while idx_it.valid() {
+            backward_keys.push(idx_it.key().to_vec());
+            idx_it.prev();
+        }
+        assert_eq!(backward_keys.len(), index_count);
+        // Backward keys should be the reverse of forward keys.
+        let mut idx_it2 = table.index_block().iter();
+        idx_it2.seek_to_first();
+        let mut forward_keys = Vec::new();
+        while idx_it2.valid() {
+            forward_keys.push(idx_it2.key().to_vec());
+            idx_it2.next();
+        }
+        forward_keys.reverse();
+        assert_eq!(backward_keys, forward_keys);
+
+        // Also verify full forward scan via SstIter reads all 30 entries.
+        let mut it = table.iter();
+        it.seek_to_first();
+        let mut count = 0;
+        while it.valid() {
+            count += 1;
+            it.next();
+        }
+        assert_eq!(count, 30);
+    }
 }

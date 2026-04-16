@@ -6153,4 +6153,83 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn get_at_snapshot_after_flush() {
+        // put, snapshot, flush, put again, verify snapshot reads old
+        // value from SST rather than the newer memtable write.
+        let dir = temp_dir("snap-after-flush");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        db.put(b"k", b"old").unwrap();
+        let snap = db.snapshot();
+        db.flush().unwrap();
+        db.wait_for_pending_work().unwrap();
+        db.put(b"k", b"new").unwrap();
+        // Current read sees the new value.
+        assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
+        // Snapshot read should still see the old value (from SST).
+        assert_eq!(
+            db.get_at(b"k", &*snap as &dyn crate::api::snapshot::Snapshot)
+                .unwrap(),
+            Some(b"old".to_vec())
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn iter_at_snapshot_filters_by_sequence() {
+        // Verify iter_at only surfaces entries visible at the
+        // snapshot's sequence number.
+        let dir = temp_dir("iter-at-seq");
+        let big = DbOptions {
+            create_if_missing: true,
+            db_write_buffer_size: 64 * 1024,
+            ..DbOptions::default()
+        };
+        let db = DbImpl::open(&big, &dir).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        let snap = db.snapshot();
+        db.put(b"c", b"3").unwrap();
+        db.put(b"a", b"1-updated").unwrap();
+
+        // Snapshot iterator should see a=1, b=2 only.
+        let mut it = db
+            .iter_at(&*snap as &dyn crate::api::snapshot::Snapshot)
+            .unwrap();
+        it.seek_to_first();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        while it.valid() {
+            got.push((it.key().to_vec(), it.value().to_vec()));
+            it.next();
+        }
+        assert_eq!(
+            got,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+            ]
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn close_is_idempotent() {
+        // Calling close twice should not panic.
+        let dir = temp_dir("close-idem");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.close().unwrap();
+        // Second close should succeed without panic.
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

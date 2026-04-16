@@ -544,4 +544,137 @@ mod tests {
         assert!(it.valid());
         assert_eq!(it.key(), b"k0050");
     }
+
+    #[test]
+    fn prev_from_last_entry() {
+        // seek_to_last, then prev through all entries verifying
+        // correct keys and values in reverse order.
+        // Keys must be in sorted (ascending) order for BlockBuilder.
+        let records: Vec<(&[u8], &[u8])> = vec![
+            (b"alpha", b"v1"),
+            (b"beta", b"v2"),
+            (b"delta", b"v3"),
+            (b"gamma", b"v4"),
+        ];
+        let block = build_block(&records, 2);
+        let mut it = block.iter();
+        it.seek_to_last();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"gamma");
+        assert_eq!(it.value(), b"v4");
+        it.prev();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"delta");
+        assert_eq!(it.value(), b"v3");
+        it.prev();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"beta");
+        assert_eq!(it.value(), b"v2");
+        it.prev();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"alpha");
+        assert_eq!(it.value(), b"v1");
+        it.prev();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn seek_for_prev_between_entries() {
+        // seek to a key between two entries then walk backward using
+        // prev. BlockIter doesn't have seek_for_prev directly, so we
+        // use seek (which lands on key >= target) then prev to get
+        // the last key <= target.
+        let records: Vec<(&[u8], &[u8])> = vec![
+            (b"aa", b"1"),
+            (b"cc", b"3"),
+            (b"ee", b"5"),
+            (b"gg", b"7"),
+        ];
+        let block = build_block(&records, 2);
+        let mut it = block.iter();
+        // seek("dd") lands on "ee", prev should land on "cc"
+        it.seek(b"dd");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"ee");
+        it.prev();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"cc");
+        assert_eq!(it.value(), b"3");
+    }
+
+    #[test]
+    fn seek_before_first_then_prev_invalidates() {
+        // Seek to a key before all entries, then prev should
+        // invalidate the iterator since there's nothing before.
+        let records: Vec<(&[u8], &[u8])> = vec![
+            (b"bb", b"1"),
+            (b"cc", b"2"),
+        ];
+        let block = build_block(&records, 16);
+        let mut it = block.iter();
+        it.seek(b"aa");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"bb"); // seek rounds up
+        it.prev();
+        assert!(!it.valid()); // nothing before first
+    }
+
+    #[test]
+    fn seek_at_exact_key_then_prev() {
+        // Seek to an exact key, verify it lands on it, then prev.
+        let records: Vec<(&[u8], &[u8])> = vec![
+            (b"aa", b"1"),
+            (b"bb", b"2"),
+            (b"cc", b"3"),
+        ];
+        let block = build_block(&records, 2);
+        let mut it = block.iter();
+        it.seek(b"bb");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"bb");
+        assert_eq!(it.value(), b"2");
+        it.prev();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"aa");
+        assert_eq!(it.value(), b"1");
+    }
+
+    #[test]
+    fn prev_at_first_entry_invalidates() {
+        // Position at first entry, prev should invalidate.
+        let records: Vec<(&[u8], &[u8])> = vec![
+            (b"only", b"one"),
+        ];
+        let block = build_block(&records, 16);
+        let mut it = block.iter();
+        it.seek_to_first();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"only");
+        it.prev();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn prev_across_restart_boundaries() {
+        // Use a restart interval of 1 so every entry is a restart
+        // point. This exercises the restart_index decrement path in prev.
+        let records: Vec<(&[u8], &[u8])> = vec![
+            (b"a", b"1"),
+            (b"b", b"2"),
+            (b"c", b"3"),
+            (b"d", b"4"),
+            (b"e", b"5"),
+        ];
+        let block = build_block(&records, 1);
+        let mut it = block.iter();
+        it.seek_to_last();
+        let mut collected = Vec::new();
+        while it.valid() {
+            collected.push((it.key().to_vec(), it.value().to_vec()));
+            it.prev();
+        }
+        assert_eq!(collected.len(), 5);
+        assert_eq!(collected[0].0, b"e");
+        assert_eq!(collected[4].0, b"a");
+    }
 }
