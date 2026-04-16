@@ -59,15 +59,38 @@ cd java && mvn package -DskipTests
 
 ## Using with Flink
 
-Replace `forstjni.jar` + `libforstjni.so` with `st-rs-jni.jar` + `libst_rs_jni.so`:
+st-rs is a drop-in replacement for ForSt. No Flink code changes required.
 
-```bash
-cp java/target/st-rs-jni-0.0.1-SNAPSHOT.jar $FLINK_HOME/lib/
-export LD_LIBRARY_PATH=/path/to/st-rs/target/release:$LD_LIBRARY_PATH
-```
+The Java classes in `st-rs-jni.jar` use the same `org.forstdb` package
+as ForSt. Flink's `ForStKeyedStateBackend` calls the same API — the
+native calls go to the Rust engine instead of C++.
 
-Flink configuration is unchanged — the `org.forstdb.RocksDB` class in
-`st-rs-jni.jar` provides the same API, backed by the Rust engine.
+**Steps:**
+
+1. Remove `forstjni.jar` (or `rocksdbjni.jar`) from `$FLINK_HOME/lib/`.
+
+2. Copy the st-rs artifacts in its place:
+   ```bash
+   cp java/target/st-rs-jni-0.0.1-SNAPSHOT.jar $FLINK_HOME/lib/
+   cp target/release/libst_rs_jni.so $FLINK_HOME/lib/   # Linux
+   # or libst_rs_jni.dylib on macOS
+   ```
+
+3. Set the native library path:
+   ```bash
+   export LD_LIBRARY_PATH=$FLINK_HOME/lib:$LD_LIBRARY_PATH
+   ```
+
+4. Flink configuration is unchanged:
+   ```yaml
+   state.backend.type: forst   # works as-is — no new shortcut needed
+   ```
+
+The existing `forst` (or `rocksdb`) backend type works because
+`StateBackendLoader` maps it to `ForStStateBackendFactory`, which
+creates `ForStKeyedStateBackend`, which calls `org.forstdb.RocksDB`.
+Since `st-rs-jni.jar` provides that exact class, the entire chain
+works without any Flink-side changes.
 
 ## Architecture
 
