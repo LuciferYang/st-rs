@@ -51,6 +51,18 @@ public class WriteBatch extends RocksObject {
         merge(nativeHandle_, cf.getNativeHandle(), key, value);
     }
 
+    public void deleteRange(final ColumnFamilyHandle cf,
+            final byte[] beginKey, final byte[] endKey)
+            throws RocksDBException {
+        deleteRange(nativeHandle_, cf == null ? 0 : cf.getNativeHandle(),
+                beginKey, endKey);
+    }
+
+    public void deleteRange(final byte[] beginKey, final byte[] endKey)
+            throws RocksDBException {
+        deleteRange(nativeHandle_, 0, beginKey, endKey);
+    }
+
     public int count() {
         return count(nativeHandle_);
     }
@@ -77,6 +89,10 @@ public class WriteBatch extends RocksObject {
 
     private static native void merge(long batchHandle, long cfHandle,
             byte[] key, byte[] value)
+            throws RocksDBException;
+
+    private static native void deleteRange(long batchHandle, long cfHandle,
+            byte[] beginKey, byte[] endKey)
             throws RocksDBException;
 
     private static native int count(long batchHandle);

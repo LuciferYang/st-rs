@@ -717,6 +717,46 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_merge__JJ_3B_3B(
     }
 }
 
+/// `WriteBatch.deleteRange(long handle, long cfHandle, byte[] beginKey, byte[] endKey)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_WriteBatch_deleteRange(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    cf_handle: jlong,
+    begin_key: JByteArray,
+    end_key: JByteArray,
+) {
+    let batch = unsafe { &mut *(handle as *mut st_rs::WriteBatch) };
+    let begin = match env.convert_byte_array(&begin_key) {
+        Ok(b) => b,
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read begin key");
+            return;
+        }
+    };
+    let end = match env.convert_byte_array(&end_key) {
+        Ok(b) => b,
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read end key");
+            return;
+        }
+    };
+    if cf_handle == 0 {
+        batch.delete_range(begin, end);
+    } else {
+        let cf = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
+            Some(cf) => cf,
+            None => {
+                throw_rocks_exception(&mut env, "null CF handle");
+                return;
+            }
+        };
+        use st_rs::api::db::ColumnFamilyHandle;
+        batch.delete_range_cf(cf.id(), begin, end);
+    }
+}
+
 /// `WriteBatch.count(long handle) -> int`
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_WriteBatch_count(
