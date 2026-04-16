@@ -18,6 +18,9 @@
 
 package org.forstdb;
 
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
 /**
  * A RocksDB database instance backed by the st-rs Rust engine via JNI.
  *
@@ -26,9 +29,15 @@ package org.forstdb;
  */
 public class RocksDB extends RocksObject {
 
+    public static final byte[] DEFAULT_COLUMN_FAMILY =
+            "default".getBytes(StandardCharsets.UTF_8);
+
     static {
         NativeLibraryLoader.load();
     }
+
+    private WriteOptions defaultWriteOptions = null;
+    private ReadOptions defaultReadOptions = null;
 
     private RocksDB(final long nativeHandle) {
         super(nativeHandle);
@@ -129,12 +138,93 @@ public class RocksDB extends RocksObject {
         releaseSnapshot(nativeHandle_, snap.getNativeHandle());
     }
 
+    // --- Multi-CF Open ---
+
+    /**
+     * Opens a database with multiple column families.
+     *
+     * @param options   the database options
+     * @param path      the filesystem path for the database
+     * @param cfDescs   column family descriptors
+     * @param cfHandles output list populated with column family handles
+     * @return a new RocksDB instance
+     * @throws RocksDBException if the database cannot be opened
+     */
+    public static RocksDB open(final DBOptions options, final String path,
+            final List<ColumnFamilyDescriptor> cfDescs,
+            final List<ColumnFamilyHandle> cfHandles)
+            throws RocksDBException {
+        throw new RocksDBException("not yet implemented");
+    }
+
     // --- Column Families ---
 
     public ColumnFamilyHandle createColumnFamily(final String name)
             throws RocksDBException {
         final long cfHandle = createColumnFamily(nativeHandle_, name);
         return new ColumnFamilyHandle(cfHandle);
+    }
+
+    public void dropColumnFamily(final ColumnFamilyHandle cf)
+            throws RocksDBException {
+        throw new RocksDBException("not yet implemented");
+    }
+
+    // --- Iterators ---
+
+    public RocksIterator newIterator(final ColumnFamilyHandle cf) {
+        final long iterHandle = newIterator(nativeHandle_,
+                cf.getNativeHandle());
+        return new RocksIterator(iterHandle);
+    }
+
+    public RocksIterator newIterator(final ColumnFamilyHandle cf,
+            final ReadOptions opts) {
+        final long iterHandle = newIteratorCf(nativeHandle_,
+                cf.getNativeHandle(), opts.getNativeHandle());
+        return new RocksIterator(iterHandle);
+    }
+
+    // --- Metadata ---
+
+    public List<LiveFileMetaData> getLiveFilesMetaData()
+            throws RocksDBException {
+        throw new RocksDBException("not yet implemented");
+    }
+
+    // --- Range Operations ---
+
+    public void deleteRange(final ColumnFamilyHandle cf,
+            final byte[] begin, final byte[] end)
+            throws RocksDBException {
+        throw new RocksDBException("not yet implemented");
+    }
+
+    public void deleteFilesInRanges(final ColumnFamilyHandle cf,
+            final List<byte[]> ranges, final boolean force)
+            throws RocksDBException {
+        throw new RocksDBException("not yet implemented");
+    }
+
+    public void compactRange(final ColumnFamilyHandle cf)
+            throws RocksDBException {
+        throw new RocksDBException("not yet implemented");
+    }
+
+    // --- Default Options Accessors ---
+
+    public WriteOptions getWriteOptions() {
+        if (defaultWriteOptions == null) {
+            defaultWriteOptions = new WriteOptions();
+        }
+        return defaultWriteOptions;
+    }
+
+    public ReadOptions getReadOptions() {
+        if (defaultReadOptions == null) {
+            defaultReadOptions = new ReadOptions();
+        }
+        return defaultReadOptions;
     }
 
     // --- Close ---
@@ -193,6 +283,11 @@ public class RocksDB extends RocksObject {
 
     private static native long createColumnFamily(long dbHandle, String name)
             throws RocksDBException;
+
+    private static native long newIterator(long dbHandle, long cfHandle);
+
+    private static native long newIteratorCf(long dbHandle, long cfHandle,
+            long readOptsHandle);
 
     private static native void closeDatabase(long dbHandle);
 

@@ -18,6 +18,8 @@
 
 package org.forstdb;
 
+import java.util.List;
+
 /**
  * Options for a column family.
  *
@@ -28,6 +30,16 @@ public class ColumnFamilyOptions {
     private int writeBufferSize = 64 * 1024 * 1024; // 64 MB
     private int maxWriteBufferNumber = 2;
     private int minWriteBufferNumberToMerge = 1;
+    private CompactionStyle compactionStyle = CompactionStyle.LEVEL;
+    private List<CompressionType> compressionPerLevel = null;
+    private boolean levelCompactionDynamicLevelBytes = false;
+    private long targetFileSizeBase = 64 * 1024 * 1024;
+    private long maxBytesForLevelBase = 256 * 1024 * 1024;
+    private long periodicCompactionSeconds = 0;
+    private String mergeOperatorName = null;
+    private TableFormatConfig tableFormatConfig = null;
+    private FlinkCompactionFilter.FlinkCompactionFilterFactory
+            compactionFilterFactory = null;
 
     public ColumnFamilyOptions() {
     }
@@ -58,6 +70,61 @@ public class ColumnFamilyOptions {
     public ColumnFamilyOptions setMinWriteBufferNumberToMerge(
             final int minWriteBufferNumberToMerge) {
         this.minWriteBufferNumberToMerge = minWriteBufferNumberToMerge;
+        return this;
+    }
+
+    public ColumnFamilyOptions setCompactionStyle(
+            final CompactionStyle compactionStyle) {
+        this.compactionStyle = compactionStyle;
+        return this;
+    }
+
+    public ColumnFamilyOptions setCompressionPerLevel(
+            final List<CompressionType> compressionPerLevel) {
+        this.compressionPerLevel = compressionPerLevel;
+        return this;
+    }
+
+    public ColumnFamilyOptions setLevelCompactionDynamicLevelBytes(
+            final boolean flag) {
+        this.levelCompactionDynamicLevelBytes = flag;
+        return this;
+    }
+
+    public ColumnFamilyOptions setTargetFileSizeBase(
+            final long targetFileSizeBase) {
+        this.targetFileSizeBase = targetFileSizeBase;
+        return this;
+    }
+
+    public ColumnFamilyOptions setMaxBytesForLevelBase(
+            final long maxBytesForLevelBase) {
+        this.maxBytesForLevelBase = maxBytesForLevelBase;
+        return this;
+    }
+
+    public ColumnFamilyOptions setPeriodicCompactionSeconds(
+            final long periodicCompactionSeconds) {
+        this.periodicCompactionSeconds = periodicCompactionSeconds;
+        return this;
+    }
+
+    public ColumnFamilyOptions setMergeOperatorName(
+            final String mergeOperatorName) {
+        this.mergeOperatorName = mergeOperatorName;
+        return this;
+    }
+
+    public ColumnFamilyOptions setTableFormatConfig(
+            final TableFormatConfig tableFormatConfig) {
+        this.tableFormatConfig = tableFormatConfig;
+        return this;
+    }
+
+    public ColumnFamilyOptions setCompactionFilterFactory(
+            final FlinkCompactionFilter.FlinkCompactionFilterFactory
+                    compactionFilterFactory) {
+        this.compactionFilterFactory = compactionFilterFactory;
         return this;
     }
 }

@@ -19,45 +19,16 @@
 package org.forstdb;
 
 /**
- * Options controlling read operations.
+ * Combined database and column family options.
  */
-public class ReadOptions extends RocksObject {
+public class Options extends RocksObject {
 
-    static {
-        NativeLibraryLoader.load();
-    }
-
-    private Snapshot snapshot = null;
-    private boolean totalOrderSeek = false;
-    private byte[] iterateUpperBound = null;
-
-    public ReadOptions() {
-        super(newReadOptions());
-    }
-
-    public ReadOptions setSnapshot(final Snapshot snapshot) {
-        this.snapshot = snapshot;
-        return this;
-    }
-
-    public ReadOptions setTotalOrderSeek(final boolean flag) {
-        this.totalOrderSeek = flag;
-        return this;
-    }
-
-    public ReadOptions setIterateUpperBound(final byte[] upperBound) {
-        this.iterateUpperBound = upperBound;
-        return this;
+    public Options() {
+        super(0);
     }
 
     @Override
     protected void disposeInternal(final long handle) {
-        disposeReadOptions(handle);
+        // no native resource yet
     }
-
-    // ---- Native methods ----
-
-    private static native long newReadOptions();
-
-    private static native void disposeReadOptions(long handle);
 }

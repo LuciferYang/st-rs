@@ -19,45 +19,26 @@
 package org.forstdb;
 
 /**
- * Options controlling read operations.
+ * A Bloom filter policy.
  */
-public class ReadOptions extends RocksObject {
+public class BloomFilter extends Filter {
 
-    static {
-        NativeLibraryLoader.load();
+    private final double bitsPerKey;
+
+    public BloomFilter(final double bitsPerKey) {
+        this.bitsPerKey = bitsPerKey;
     }
 
-    private Snapshot snapshot = null;
-    private boolean totalOrderSeek = false;
-    private byte[] iterateUpperBound = null;
-
-    public ReadOptions() {
-        super(newReadOptions());
+    public BloomFilter() {
+        this(10.0);
     }
 
-    public ReadOptions setSnapshot(final Snapshot snapshot) {
-        this.snapshot = snapshot;
-        return this;
-    }
-
-    public ReadOptions setTotalOrderSeek(final boolean flag) {
-        this.totalOrderSeek = flag;
-        return this;
-    }
-
-    public ReadOptions setIterateUpperBound(final byte[] upperBound) {
-        this.iterateUpperBound = upperBound;
-        return this;
+    public static Filter newFilter() {
+        return new BloomFilter();
     }
 
     @Override
     protected void disposeInternal(final long handle) {
-        disposeReadOptions(handle);
+        // no native resource
     }
-
-    // ---- Native methods ----
-
-    private static native long newReadOptions();
-
-    private static native void disposeReadOptions(long handle);
 }

@@ -19,45 +19,20 @@
 package org.forstdb;
 
 /**
- * Options controlling read operations.
+ * Options for importing column families from exported metadata.
  */
-public class ReadOptions extends RocksObject {
+public class ImportColumnFamilyOptions extends RocksObject {
 
-    static {
-        NativeLibraryLoader.load();
+    public ImportColumnFamilyOptions() {
+        super(0);
     }
 
-    private Snapshot snapshot = null;
-    private boolean totalOrderSeek = false;
-    private byte[] iterateUpperBound = null;
-
-    public ReadOptions() {
-        super(newReadOptions());
-    }
-
-    public ReadOptions setSnapshot(final Snapshot snapshot) {
-        this.snapshot = snapshot;
-        return this;
-    }
-
-    public ReadOptions setTotalOrderSeek(final boolean flag) {
-        this.totalOrderSeek = flag;
-        return this;
-    }
-
-    public ReadOptions setIterateUpperBound(final byte[] upperBound) {
-        this.iterateUpperBound = upperBound;
+    public ImportColumnFamilyOptions setMoveFiles(final boolean flag) {
         return this;
     }
 
     @Override
     protected void disposeInternal(final long handle) {
-        disposeReadOptions(handle);
+        // no native resource yet
     }
-
-    // ---- Native methods ----
-
-    private static native long newReadOptions();
-
-    private static native void disposeReadOptions(long handle);
 }
