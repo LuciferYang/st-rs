@@ -127,10 +127,18 @@ pub trait ThreadPool: Send + Sync {
 /// Implementations compose the three pieces. The typical construction for
 /// ForSt is:
 ///
-/// ```ignore
-/// let flink_fs = Arc::new(FlinkFileSystem::new(/* … */));
-/// let env = CompositeEnv::new(flink_fs, Arc::new(SystemClockImpl), Arc::new(MyPool));
-/// db_options.env = Some(Arc::new(env));
+/// ```rust,no_run
+/// use st_rs::env::env_trait::{CompositeEnv, SystemClockImpl};
+/// use st_rs::env::thread_pool::StdThreadPool;
+/// use st_rs::env::posix::PosixFileSystem;
+/// use std::sync::Arc;
+///
+/// let fs = Arc::new(PosixFileSystem::new());
+/// let env = CompositeEnv::new(
+///     fs as Arc<dyn st_rs::FileSystem>,
+///     Arc::new(SystemClockImpl),
+///     Arc::new(StdThreadPool::new(1, 0, 0, 0)),
+/// );
 /// ```
 pub trait Env: Send + Sync {
     /// The underlying filesystem.

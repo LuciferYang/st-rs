@@ -1530,12 +1530,17 @@ impl DbImpl {
     /// writes (with higher sequences) are invisible to reads
     /// made through the snapshot.
     ///
-    /// ```ignore
+    /// ```rust,no_run
+    /// # use st_rs::{DbImpl, DbOptions};
+    /// # use std::path::Path;
+    /// # let opts = DbOptions { create_if_missing: true, ..Default::default() };
+    /// # let db = DbImpl::open(&opts, Path::new("/tmp/snap-example")).unwrap();
+    /// # db.put(b"k", b"old").unwrap();
     /// let snap = db.snapshot();
-    /// db.put(b"k", b"new")?;            // after snapshot
-    /// assert_eq!(db.get(b"k")?,
+    /// db.put(b"k", b"new").unwrap();
+    /// assert_eq!(db.get(b"k").unwrap(),
     ///            Some(b"new".to_vec()));        // current read
-    /// assert_eq!(db.get_at(b"k", &*snap)?,
+    /// assert_eq!(db.get_at(b"k", &*snap).unwrap(),
     ///            Some(b"old".to_vec()));        // snapshot read
     /// ```
     pub fn get_at(

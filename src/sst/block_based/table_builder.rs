@@ -52,13 +52,21 @@
 //! consumes itself in [`Self::finish`] so misuse-after-finish is a
 //! compile error:
 //!
-//! ```ignore
-//! let writer = fs.new_writable_file(&path, &Default::default())?;
-//! let writer = WritableFileWriter::new(writer);
-//! let mut tb = BlockBasedTableBuilder::new(writer, BlockBasedTableOptions::default());
-//! tb.add(b"k1", b"v1")?;
-//! tb.add(b"k2", b"v2")?;
-//! tb.finish()?;
+//! ```rust,no_run
+//! use st_rs::{BlockBasedTableBuilder, BlockBasedTableOptions, WritableFileWriter};
+//! use st_rs::env::posix::PosixFileSystem;
+//! use st_rs::FileSystem;
+//! use std::path::Path;
+//!
+//! let fs = PosixFileSystem::new();
+//! let file = fs.new_writable_file(Path::new("/tmp/test.sst"), &Default::default()).unwrap();
+//! let mut tb = BlockBasedTableBuilder::new(
+//!     WritableFileWriter::new(file),
+//!     BlockBasedTableOptions::default(),
+//! );
+//! tb.add(b"k1", b"v1").unwrap();
+//! tb.add(b"k2", b"v2").unwrap();
+//! tb.finish().unwrap();
 //! ```
 //!
 //! # Out of scope

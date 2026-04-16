@@ -35,18 +35,21 @@
 //!
 //! # API
 //!
-//! ```ignore
+//! ```rust,no_run
+//! use st_rs::{DbImpl, DbOptions};
 //! use st_rs::utilities::checkpoint::create_checkpoint;
+//! use std::path::Path;
 //!
-//! let db = DbImpl::open(&opts, Path::new("/data/mydb"))?;
-//! db.put(b"k", b"v")?;
+//! let opts = DbOptions { create_if_missing: true, ..Default::default() };
+//! let db = DbImpl::open(&opts, Path::new("/data/mydb")).unwrap();
+//! db.put(b"k", b"v").unwrap();
 //!
-//! // Create a checkpoint — hard-links SSTs, copies CURRENT + WAL.
-//! create_checkpoint(&db, Path::new("/backup/cp1"))?;
+//! // Create a checkpoint — hard-links SSTs, copies CURRENT + MANIFEST.
+//! create_checkpoint(&db, Path::new("/backup/cp1")).unwrap();
 //!
 //! // The checkpoint is a fully openable DB.
-//! let cp = DbImpl::open(&opts, Path::new("/backup/cp1"))?;
-//! assert_eq!(cp.get(b"k")?, Some(b"v".to_vec()));
+//! let cp = DbImpl::open(&opts, Path::new("/backup/cp1")).unwrap();
+//! assert_eq!(cp.get(b"k").unwrap(), Some(b"v".to_vec()));
 //! ```
 //!
 //! # Implementation

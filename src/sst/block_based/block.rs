@@ -20,12 +20,16 @@
 //!
 //! # Usage
 //!
-//! ```ignore
-//! let block = Block::new(encoded_bytes.to_vec())?;
+//! ```rust,no_run
+//! use st_rs::Block;
+//!
+//! # let encoded_bytes: &[u8] = &[];
+//! let block = Block::new(encoded_bytes.to_vec()).unwrap();
 //! let mut it = block.iter();
 //! it.seek_to_first();
 //! while it.valid() {
-//!     use_entry(it.key(), it.value());
+//!     let _key = it.key();
+//!     let _val = it.value();
 //!     it.next();
 //! }
 //! ```
