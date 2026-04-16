@@ -1489,6 +1489,16 @@ impl DbImpl {
     /// stall / back-pressure mechanism that prevents unbounded L0
     /// growth.
     pub fn write(&self, batch: &WriteBatch) -> Result<()> {
+        self.write_opt(batch, false)
+    }
+
+    /// Apply a [`WriteBatch`] atomically with optional WAL skip.
+    ///
+    /// When `disable_wal` is `true`, the batch is applied directly
+    /// to the memtable without writing to the WAL. This is Flink's
+    /// default mode — durability comes from Flink's distributed
+    /// checkpointing, not from the engine's WAL.
+    pub fn write_opt(&self, batch: &WriteBatch, disable_wal: bool) -> Result<()> {
         if batch.count() == 0 {
             return Ok(()); // nothing to do
         }
@@ -1501,12 +1511,15 @@ impl DbImpl {
 
         // Reserve a sequence range for this batch.
         let first_seq = state.last_sequence + 1;
-        let mut record_buf = Vec::new();
-        encode_batch_record(batch, first_seq, &mut record_buf);
 
-        // 1. WAL append + sync.
-        state.wal.add_record(&record_buf)?;
-        state.wal.sync()?;
+        if !disable_wal {
+            let mut record_buf = Vec::new();
+            encode_batch_record(batch, first_seq, &mut record_buf);
+
+            // 1. WAL append + sync.
+            state.wal.add_record(&record_buf)?;
+            state.wal.sync()?;
+        }
 
         // 2. Memtable insert.
         {
