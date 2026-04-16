@@ -110,6 +110,10 @@ public class RocksDB extends RocksObject {
         flush(nativeHandle_);
     }
 
+    public void flush(final ColumnFamilyHandle cf) throws RocksDBException {
+        flushCf(nativeHandle_, cf.getNativeHandle());
+    }
+
     // --- Property ---
 
     public String getProperty(final String name) throws RocksDBException {
@@ -154,28 +158,23 @@ public class RocksDB extends RocksObject {
             final List<ColumnFamilyDescriptor> cfDescs,
             final List<ColumnFamilyHandle> cfHandles)
             throws RocksDBException {
-        // Open the DB (creates default CF).
+        // Open the DB (recovers existing CFs from MANIFEST).
         final RocksDB db = open(options, path);
-        // Create each requested CF.
+        // For each requested CF, look up existing or create new.
         for (final ColumnFamilyDescriptor desc : cfDescs) {
             final String name = desc.getName();
-            if ("default".equals(name)) {
-                // Default CF already exists; return a handle with 0
-                // which the JNI layer treats as "default CF".
-                cfHandles.add(new ColumnFamilyHandle(0));
+            // Try to find an existing CF recovered from MANIFEST.
+            final long existingHandle = getColumnFamilyByName(
+                    db.nativeHandle_, name);
+            if (existingHandle != 0) {
+                cfHandles.add(new ColumnFamilyHandle(existingHandle));
+            } else if (!"default".equals(name)) {
+                // CF does not exist yet — create it.
+                final ColumnFamilyHandle cfh = db.createColumnFamily(name);
+                cfHandles.add(cfh);
             } else {
-                try {
-                    final ColumnFamilyHandle cfh = db.createColumnFamily(name);
-                    cfHandles.add(cfh);
-                } catch (RocksDBException e) {
-                    if (e.getMessage() != null && e.getMessage().contains("already exists")) {
-                        // CF was recovered from MANIFEST — return a
-                        // placeholder handle. The engine already has it.
-                        cfHandles.add(new ColumnFamilyHandle(0));
-                    } else {
-                        throw e;
-                    }
-                }
+                // Default CF always exists with handle convention 0.
+                cfHandles.add(new ColumnFamilyHandle(0));
             }
         }
         return db;
@@ -325,6 +324,7 @@ public class RocksDB extends RocksObject {
             long batchHandle) throws RocksDBException;
 
     private static native void flush(long dbHandle) throws RocksDBException;
+    private static native void flushCf(long dbHandle, long cfHandle) throws RocksDBException;
 
     private static native String getProperty(long dbHandle, String name)
             throws RocksDBException;
@@ -342,6 +342,8 @@ public class RocksDB extends RocksObject {
 
     private static native long createColumnFamily(long dbHandle, String name)
             throws RocksDBException;
+
+    private static native long getColumnFamilyByName(long dbHandle, String name);
 
     private static native long newIterator(long dbHandle, long cfHandle);
 

@@ -1008,6 +1008,26 @@ impl DbImpl {
 
     /// Create a new column family. Returns a handle that can be
     /// passed to `put_cf`, `get_cf`, etc.
+    /// Look up an existing column family by name. Returns the handle
+    /// if found, or `None` if no CF with that name exists.
+    pub fn get_column_family_by_name(
+        &self,
+        name: &str,
+    ) -> Option<Arc<ColumnFamilyHandleImpl>> {
+        let state = self.state.lock().unwrap();
+        for cf in state.column_families.values() {
+            if cf.name == name {
+                return Some(Arc::new(ColumnFamilyHandleImpl {
+                    id: cf.id,
+                    name: cf.name.clone(),
+                }));
+            }
+        }
+        None
+    }
+
+    /// Create a new column family. Returns a handle that can be
+    /// passed to `put_cf`, `get_cf`, etc.
     pub fn create_column_family(
         &self,
         name: &str,

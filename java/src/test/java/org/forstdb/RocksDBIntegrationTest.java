@@ -235,6 +235,47 @@ class RocksDBIntegrationTest {
     }
 
     @Test
+    void multiCfReopen() throws RocksDBException {
+        String dbPath = tempDir.resolve("test-multicf-reopen").toString();
+
+        // First open — create CF and write data.
+        try (DBOptions opts = new DBOptions().setCreateIfMissing(true);
+             RocksDB db = RocksDB.open(opts, dbPath)) {
+            ColumnFamilyHandle cf1 = db.createColumnFamily("state1");
+            try (WriteOptions wo = new WriteOptions()) {
+                db.put("dk".getBytes(), "default-data".getBytes());
+                db.put(cf1, wo, "sk".getBytes(), "state1-data".getBytes());
+            }
+            db.flush();       // flush default CF
+            db.flush(cf1);    // flush state1 CF
+        }
+
+        // Reopen with CF list — CFs should be recovered from MANIFEST.
+        List<ColumnFamilyDescriptor> cfDescs = new ArrayList<>();
+        cfDescs.add(new ColumnFamilyDescriptor("default", new ColumnFamilyOptions()));
+        cfDescs.add(new ColumnFamilyDescriptor("state1", new ColumnFamilyOptions()));
+
+        List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
+        try (DBOptions opts = new DBOptions().setCreateIfMissing(true);
+             RocksDB db = RocksDB.open(opts, dbPath, cfDescs, cfHandles)) {
+            assertEquals(2, cfHandles.size());
+
+            // Default CF data survives reopen.
+            assertArrayEquals("default-data".getBytes(),
+                    db.get("dk".getBytes()));
+
+            // state1 CF data survives reopen — the handle must route
+            // to the correct CF, not the default.
+            byte[] stateValue = db.get(cfHandles.get(1), "sk".getBytes());
+            assertNotNull(stateValue, "state1 CF data should survive reopen");
+            assertArrayEquals("state1-data".getBytes(), stateValue);
+
+            // Isolation: state1 key not visible in default CF.
+            assertNull(db.get("sk".getBytes()));
+        }
+    }
+
+    @Test
     void getLiveFilesMetaData() throws RocksDBException {
         String dbPath = tempDir.resolve("test-livemeta").toString();
         try (DBOptions opts = new DBOptions().setCreateIfMissing(true);

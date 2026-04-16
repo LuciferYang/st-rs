@@ -350,6 +350,39 @@ pub extern "system" fn Java_org_forstdb_RocksDB_flush__J(
     }
 }
 
+/// `RocksDB.flushCf(long dbHandle, long cfHandle)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_flushCf(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    cf_handle: jlong,
+) {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
+    if cf_handle == 0 {
+        if let Err(e) = db.flush() {
+            throw_rocks_exception(&mut env, &e.to_string());
+        }
+    } else {
+        let cf = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
+            Some(cf) => cf,
+            None => {
+                throw_rocks_exception(&mut env, "null CF handle");
+                return;
+            }
+        };
+        if let Err(e) = db.flush_cf(&**cf) {
+            throw_rocks_exception(&mut env, &e.to_string());
+        }
+    }
+}
+
 /// `RocksDB.getProperty(long handle, String name) -> String`
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_RocksDB_getProperty__JLjava_lang_String_2(
@@ -491,6 +524,33 @@ pub extern "system" fn Java_org_forstdb_RocksDB_createColumnFamily(
             throw_rocks_exception(&mut env, &e.to_string());
             0
         }
+    }
+}
+
+/// `RocksDB.getColumnFamilyByName(long handle, String name) -> long`
+///
+/// Returns a handle to an existing CF, or 0 if not found.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_getColumnFamilyByName(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    name: JString,
+) -> jlong {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return 0;
+        }
+    };
+    let cf_name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+    match db.get_column_family_by_name(&cf_name) {
+        Some(cf) => to_handle(cf),
+        None => 0,
     }
 }
 
