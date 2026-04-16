@@ -57,31 +57,37 @@ public class DBOptions extends RocksObject {
 
     public DBOptions setAvoidFlushDuringShutdown(final boolean flag) {
         this.avoidFlushDuringShutdown = flag;
+        setAvoidFlushDuringShutdown(nativeHandle_, flag);
         return this;
     }
 
     public DBOptions setMaxBackgroundJobs(final int maxBackgroundJobs) {
         this.maxBackgroundJobs = maxBackgroundJobs;
+        setMaxBackgroundJobs(nativeHandle_, maxBackgroundJobs);
         return this;
     }
 
     public DBOptions setMaxOpenFiles(final int maxOpenFiles) {
         this.maxOpenFiles = maxOpenFiles;
+        setMaxOpenFiles(nativeHandle_, maxOpenFiles);
         return this;
     }
 
     public DBOptions setInfoLogLevel(final InfoLogLevel level) {
         this.infoLogLevel = level;
+        setInfoLogLevel(nativeHandle_, level.ordinal());
         return this;
     }
 
     public DBOptions setUseFsync(final boolean flag) {
         this.useFsync = flag;
+        setUseFsync(nativeHandle_, flag);
         return this;
     }
 
     public DBOptions setStatsDumpPeriodSec(final int period) {
         this.statsDumpPeriodSec = period;
+        setStatsDumpPeriodSec(nativeHandle_, period);
         return this;
     }
 
@@ -103,16 +109,44 @@ public class DBOptions extends RocksObject {
 
     public DBOptions setDbLogDir(final String dbLogDir) {
         this.dbLogDir = dbLogDir;
+        setDbLogDir(nativeHandle_, dbLogDir);
         return this;
     }
 
     public DBOptions setMaxLogFileSize(final long maxLogFileSize) {
         this.maxLogFileSize = maxLogFileSize;
+        setMaxLogFileSize(nativeHandle_, maxLogFileSize);
         return this;
     }
 
     public DBOptions setKeepLogFileNum(final int keepLogFileNum) {
         this.keepLogFileNum = keepLogFileNum;
+        setKeepLogFileNum(nativeHandle_, keepLogFileNum);
+        return this;
+    }
+
+    /**
+     * Sets the total amount of RAM to use for memtables across all
+     * column families. Passed through to the Rust engine's
+     * {@code db_write_buffer_size}.
+     *
+     * @param size buffer size in bytes
+     * @return this instance for method chaining
+     */
+    public DBOptions setDbWriteBufferSize(final long size) {
+        setDbWriteBufferSize(nativeHandle_, size);
+        return this;
+    }
+
+    /**
+     * Sets the size of the shared block cache for SST data blocks.
+     * Passed through to the Rust engine's {@code block_cache_size}.
+     *
+     * @param size cache size in bytes
+     * @return this instance for method chaining
+     */
+    public DBOptions setBlockCacheSize(final long size) {
+        setBlockCacheSize(nativeHandle_, size);
         return this;
     }
 
@@ -126,6 +160,33 @@ public class DBOptions extends RocksObject {
     private static native long newDBOptions();
 
     private static native void setCreateIfMissing(long handle, boolean flag);
+
+    private static native void setMaxOpenFiles(long handle, int maxOpenFiles);
+
+    private static native void setUseFsync(long handle, boolean flag);
+
+    private static native void setDbWriteBufferSize(long handle, long size);
+
+    private static native void setBlockCacheSize(long handle, long size);
+
+    // No-op native methods — values stored in Java but not yet
+    // passed through to the Rust engine.
+
+    private static native void setAvoidFlushDuringShutdown(
+            long handle, boolean flag);
+
+    private static native void setMaxBackgroundJobs(
+            long handle, int maxBackgroundJobs);
+
+    private static native void setInfoLogLevel(long handle, int level);
+
+    private static native void setStatsDumpPeriodSec(long handle, int period);
+
+    private static native void setDbLogDir(long handle, String dir);
+
+    private static native void setMaxLogFileSize(long handle, long size);
+
+    private static native void setKeepLogFileNum(long handle, int num);
 
     private static native void disposeDBOptions(long handle);
 }

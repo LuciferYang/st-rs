@@ -239,7 +239,9 @@ class RocksDBIntegrationTest {
         String dbPath = tempDir.resolve("test-multicf-reopen").toString();
 
         // First open — create CF and write data.
-        try (DBOptions opts = new DBOptions().setCreateIfMissing(true);
+        try (DBOptions opts = new DBOptions()
+                .setCreateIfMissing(true)
+                .setDbWriteBufferSize(64 * 1024 * 1024);
              RocksDB db = RocksDB.open(opts, dbPath)) {
             ColumnFamilyHandle cf1 = db.createColumnFamily("state1");
             try (WriteOptions wo = new WriteOptions()) {
@@ -256,7 +258,9 @@ class RocksDBIntegrationTest {
         cfDescs.add(new ColumnFamilyDescriptor("state1", new ColumnFamilyOptions()));
 
         List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
-        try (DBOptions opts = new DBOptions().setCreateIfMissing(true);
+        try (DBOptions opts = new DBOptions()
+                .setCreateIfMissing(true)
+                .setDbWriteBufferSize(64 * 1024 * 1024);
              RocksDB db = RocksDB.open(opts, dbPath, cfDescs, cfHandles)) {
             assertEquals(2, cfHandles.size());
 

@@ -78,7 +78,7 @@ fn throw_rocks_exception(env: &mut JNIEnv, msg: &str) {
 pub extern "system" fn Java_org_forstdb_RocksDB_open(
     mut env: JNIEnv,
     _class: JClass,
-    _db_options_handle: jlong,
+    db_options_handle: jlong,
     path: JString,
 ) -> jlong {
     let path_str: String = match env.get_string(&path) {
@@ -88,10 +88,19 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open(
             return 0;
         }
     };
-    let opts = st_rs::DbOptions {
-        create_if_missing: true,
-        db_write_buffer_size: 64 * 1024 * 1024,
-        ..st_rs::DbOptions::default()
+    let opts = if db_options_handle != 0 {
+        match unsafe { from_handle::<st_rs::DbOptions>(db_options_handle) } {
+            Some(o) => o.clone(),
+            None => st_rs::DbOptions {
+                create_if_missing: true,
+                ..st_rs::DbOptions::default()
+            },
+        }
+    } else {
+        st_rs::DbOptions {
+            create_if_missing: true,
+            ..st_rs::DbOptions::default()
+        }
     };
     match st_rs::DbImpl::open(&opts, Path::new(&path_str)) {
         Ok(db) => to_handle(db),
@@ -837,6 +846,123 @@ pub extern "system" fn Java_org_forstdb_DBOptions_setCreateIfMissing(
     let opts = unsafe { &mut *(handle as *mut st_rs::DbOptions) };
     opts.create_if_missing = flag == JNI_TRUE;
     handle
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_setMaxOpenFiles(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    max_open_files: jint,
+) {
+    let opts = unsafe { &mut *(handle as *mut st_rs::DbOptions) };
+    opts.max_open_files = max_open_files;
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_setUseFsync(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    flag: jboolean,
+) {
+    let opts = unsafe { &mut *(handle as *mut st_rs::DbOptions) };
+    opts.use_fsync = flag == JNI_TRUE;
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_setDbWriteBufferSize(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    size: jlong,
+) {
+    let opts = unsafe { &mut *(handle as *mut st_rs::DbOptions) };
+    opts.db_write_buffer_size = size as usize;
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_setBlockCacheSize(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    size: jlong,
+) {
+    let opts = unsafe { &mut *(handle as *mut st_rs::DbOptions) };
+    opts.block_cache_size = size as usize;
+}
+
+// No-op setters for fields that have no Rust-side equivalent yet.
+// The Java side stores the value but it is not passed to the engine.
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_setAvoidFlushDuringShutdown(
+    _env: JNIEnv,
+    _this: JObject,
+    _handle: jlong,
+    _flag: jboolean,
+) {
+    // No-op: no Rust-side field.
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_setMaxBackgroundJobs(
+    _env: JNIEnv,
+    _this: JObject,
+    _handle: jlong,
+    _max_background_jobs: jint,
+) {
+    // No-op: Rust engine manages its own thread pool.
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_setInfoLogLevel(
+    _env: JNIEnv,
+    _this: JObject,
+    _handle: jlong,
+    _level: jint,
+) {
+    // No-op: log level is not wired to the Rust engine yet.
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_setStatsDumpPeriodSec(
+    _env: JNIEnv,
+    _this: JObject,
+    _handle: jlong,
+    _period: jint,
+) {
+    // No-op: stats dump is not supported yet.
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_setDbLogDir(
+    _env: JNIEnv,
+    _this: JObject,
+    _handle: jlong,
+    _dir: JString,
+) {
+    // No-op: log directory is not wired to the Rust engine yet.
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_setMaxLogFileSize(
+    _env: JNIEnv,
+    _this: JObject,
+    _handle: jlong,
+    _size: jlong,
+) {
+    // No-op: log file size is not wired to the Rust engine yet.
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_setKeepLogFileNum(
+    _env: JNIEnv,
+    _this: JObject,
+    _handle: jlong,
+    _num: jint,
+) {
+    // No-op: log file count is not wired to the Rust engine yet.
 }
 
 #[no_mangle]
