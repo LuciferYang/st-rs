@@ -154,7 +154,21 @@ public class RocksDB extends RocksObject {
             final List<ColumnFamilyDescriptor> cfDescs,
             final List<ColumnFamilyHandle> cfHandles)
             throws RocksDBException {
-        throw new RocksDBException("not yet implemented");
+        // Open the DB (creates default CF).
+        final RocksDB db = open(options, path);
+        // Create each requested CF.
+        for (final ColumnFamilyDescriptor desc : cfDescs) {
+            final String name = desc.getName();
+            if ("default".equals(name)) {
+                // Default CF already exists; return a handle with 0
+                // which the JNI layer treats as "default CF".
+                cfHandles.add(new ColumnFamilyHandle(0));
+            } else {
+                final ColumnFamilyHandle cfh = db.createColumnFamily(name);
+                cfHandles.add(cfh);
+            }
+        }
+        return db;
     }
 
     // --- Column Families ---
@@ -167,7 +181,7 @@ public class RocksDB extends RocksObject {
 
     public void dropColumnFamily(final ColumnFamilyHandle cf)
             throws RocksDBException {
-        throw new RocksDBException("not yet implemented");
+        dropColumnFamily0(nativeHandle_, cf.getNativeHandle());
     }
 
     // --- Iterators ---
@@ -189,7 +203,40 @@ public class RocksDB extends RocksObject {
 
     public List<LiveFileMetaData> getLiveFilesMetaData()
             throws RocksDBException {
-        throw new RocksDBException("not yet implemented");
+        final byte[] raw = getLiveFilesMetaData0(nativeHandle_);
+        if (raw == null || raw.length == 0) {
+            return java.util.Collections.emptyList();
+        }
+        return parseLiveFilesMetaData(raw);
+    }
+
+    private static List<LiveFileMetaData> parseLiveFilesMetaData(
+            final byte[] raw) {
+        final java.nio.ByteBuffer buf =
+                java.nio.ByteBuffer.wrap(raw);
+        final int count = buf.getInt();
+        final List<LiveFileMetaData> result =
+                new java.util.ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            final int cfNameLen = buf.getInt();
+            final byte[] cfNameBytes = new byte[cfNameLen];
+            buf.get(cfNameBytes);
+            final String cfName = new String(cfNameBytes,
+                    StandardCharsets.UTF_8);
+            final long fileNumber = buf.getLong();
+            final int level = buf.getInt();
+            final long fileSize = buf.getLong();
+            final int smallestLen = buf.getInt();
+            final byte[] smallest = new byte[smallestLen];
+            buf.get(smallest);
+            final int largestLen = buf.getInt();
+            final byte[] largest = new byte[largestLen];
+            buf.get(largest);
+            final String fileName = String.valueOf(fileNumber) + ".sst";
+            result.add(new LiveFileMetaData(cfName, fileName, level,
+                    fileSize, smallest, largest));
+        }
+        return result;
     }
 
     // --- Range Operations ---
@@ -197,18 +244,20 @@ public class RocksDB extends RocksObject {
     public void deleteRange(final ColumnFamilyHandle cf,
             final byte[] begin, final byte[] end)
             throws RocksDBException {
-        throw new RocksDBException("not yet implemented");
+        deleteRange0(nativeHandle_, cf.getNativeHandle(), begin, end);
     }
 
     public void deleteFilesInRanges(final ColumnFamilyHandle cf,
             final List<byte[]> ranges, final boolean force)
             throws RocksDBException {
-        throw new RocksDBException("not yet implemented");
+        final byte[][] rangeArray = ranges.toArray(new byte[0][]);
+        deleteFilesInRanges0(nativeHandle_, cf.getNativeHandle(),
+                rangeArray);
     }
 
     public void compactRange(final ColumnFamilyHandle cf)
             throws RocksDBException {
-        throw new RocksDBException("not yet implemented");
+        compactRange0(nativeHandle_, cf.getNativeHandle());
     }
 
     // --- Default Options Accessors ---
@@ -288,6 +337,21 @@ public class RocksDB extends RocksObject {
 
     private static native long newIteratorCf(long dbHandle, long cfHandle,
             long readOptsHandle);
+
+    private static native void deleteRange0(long dbHandle, long cfHandle,
+            byte[] begin, byte[] end) throws RocksDBException;
+
+    private static native void dropColumnFamily0(long dbHandle,
+            long cfHandle) throws RocksDBException;
+
+    private static native void compactRange0(long dbHandle, long cfHandle)
+            throws RocksDBException;
+
+    private static native void deleteFilesInRanges0(long dbHandle,
+            long cfHandle, byte[][] ranges) throws RocksDBException;
+
+    private static native byte[] getLiveFilesMetaData0(long dbHandle)
+            throws RocksDBException;
 
     private static native void closeDatabase(long dbHandle);
 

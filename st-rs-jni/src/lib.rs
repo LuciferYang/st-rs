@@ -815,3 +815,444 @@ pub extern "system" fn Java_org_forstdb_RocksDB_releaseSnapshot(
 ) {
     unsafe { drop_handle::<Arc<st_rs::DbSnapshot>>(snap_handle) };
 }
+
+// ---------------------------------------------------------------------------
+// RocksDB.newIterator / newIteratorCf
+// ---------------------------------------------------------------------------
+
+/// `RocksDB.newIterator(long dbHandle, long cfHandle) -> long`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_newIterator(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    cf_handle: jlong,
+) -> jlong {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return 0;
+        }
+    };
+
+    let result = if cf_handle == 0 {
+        db.iter()
+    } else {
+        let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
+            Some(cf) => cf,
+            None => {
+                throw_rocks_exception(&mut env, "null column family handle");
+                return 0;
+            }
+        };
+        db.iter_cf(&**cf_arc)
+    };
+
+    match result {
+        Ok(iter) => to_handle(iter),
+        Err(e) => {
+            throw_rocks_exception(&mut env, &e.to_string());
+            0
+        }
+    }
+}
+
+/// `RocksDB.newIteratorCf(long dbHandle, long cfHandle, long readOptsHandle) -> long`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_newIteratorCf(
+    env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    cf_handle: jlong,
+    _read_opts_handle: jlong,
+) -> jlong {
+    // ReadOptions are currently a no-op; delegate to newIterator.
+    Java_org_forstdb_RocksDB_newIterator(env, _this, handle, cf_handle)
+}
+
+// ---------------------------------------------------------------------------
+// RocksIterator (org.forstdb.RocksIterator)
+// ---------------------------------------------------------------------------
+
+/// `RocksIterator.isValid0(long handle) -> boolean`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksIterator_isValid0(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jboolean {
+    let iter = match unsafe { from_handle::<st_rs::DbIterator>(handle) } {
+        Some(it) => it,
+        None => return 0,
+    };
+    if iter.valid() { 1 } else { 0 }
+}
+
+/// `RocksIterator.seekToFirst0(long handle)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksIterator_seekToFirst0(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    let iter = unsafe { &mut *(handle as *mut st_rs::DbIterator) };
+    iter.seek_to_first();
+}
+
+/// `RocksIterator.seekToLast0(long handle)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksIterator_seekToLast0(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    let iter = unsafe { &mut *(handle as *mut st_rs::DbIterator) };
+    iter.seek_to_last();
+}
+
+/// `RocksIterator.seek0(long handle, byte[] target)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksIterator_seek0(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    target: JByteArray,
+) {
+    if handle == 0 {
+        return;
+    }
+    let target_bytes = match env.convert_byte_array(&target) {
+        Ok(b) => b,
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read target bytes");
+            return;
+        }
+    };
+    let iter = unsafe { &mut *(handle as *mut st_rs::DbIterator) };
+    iter.seek(&target_bytes);
+}
+
+/// `RocksIterator.next0(long handle)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksIterator_next0(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    let iter = unsafe { &mut *(handle as *mut st_rs::DbIterator) };
+    iter.next();
+}
+
+/// `RocksIterator.prev0(long handle)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksIterator_prev0(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    let iter = unsafe { &mut *(handle as *mut st_rs::DbIterator) };
+    iter.prev();
+}
+
+/// `RocksIterator.key0(long handle) -> byte[]`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksIterator_key0(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jbyteArray {
+    let iter = match unsafe { from_handle::<st_rs::DbIterator>(handle) } {
+        Some(it) => it,
+        None => return std::ptr::null_mut(),
+    };
+    if !iter.valid() {
+        return std::ptr::null_mut();
+    }
+    match env.byte_array_from_slice(iter.key()) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to create key byte array");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// `RocksIterator.value0(long handle) -> byte[]`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksIterator_value0(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jbyteArray {
+    let iter = match unsafe { from_handle::<st_rs::DbIterator>(handle) } {
+        Some(it) => it,
+        None => return std::ptr::null_mut(),
+    };
+    if !iter.valid() {
+        return std::ptr::null_mut();
+    }
+    match env.byte_array_from_slice(iter.value()) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to create value byte array");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// `RocksIterator.disposeIterator(long handle)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksIterator_disposeIterator(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    unsafe { drop_handle::<st_rs::DbIterator>(handle) };
+}
+
+// ---------------------------------------------------------------------------
+// RocksDB — deleteRange, dropColumnFamily, compactRange,
+//            deleteFilesInRanges, getLiveFilesMetaData
+// ---------------------------------------------------------------------------
+
+/// `RocksDB.deleteRange0(long dbHandle, long cfHandle, byte[] begin, byte[] end)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_deleteRange0(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    cf_handle: jlong,
+    begin: JByteArray,
+    end: JByteArray,
+) {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
+    let begin_bytes = match env.convert_byte_array(&begin) {
+        Ok(b) => b,
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read begin bytes");
+            return;
+        }
+    };
+    let end_bytes = match env.convert_byte_array(&end) {
+        Ok(b) => b,
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read end bytes");
+            return;
+        }
+    };
+
+    let result = if cf_handle == 0 {
+        db.delete_range(&begin_bytes, &end_bytes)
+    } else {
+        let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
+            Some(cf) => cf,
+            None => {
+                throw_rocks_exception(&mut env, "null column family handle");
+                return;
+            }
+        };
+        db.delete_range_cf(&**cf_arc, &begin_bytes, &end_bytes)
+    };
+
+    if let Err(e) = result {
+        throw_rocks_exception(&mut env, &e.to_string());
+    }
+}
+
+/// `RocksDB.dropColumnFamily0(long dbHandle, long cfHandle)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_dropColumnFamily0(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    cf_handle: jlong,
+) {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
+    let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
+        Some(cf) => cf,
+        None => {
+            throw_rocks_exception(&mut env, "null column family handle");
+            return;
+        }
+    };
+    if let Err(e) = db.drop_column_family(&**cf_arc) {
+        throw_rocks_exception(&mut env, &e.to_string());
+    }
+}
+
+/// `RocksDB.compactRange0(long dbHandle, long cfHandle)` — no-op stub.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_compactRange0(
+    _env: JNIEnv,
+    _this: JObject,
+    _handle: jlong,
+    _cf_handle: jlong,
+) {
+    // Manual compaction not yet implemented. No-op.
+}
+
+/// `RocksDB.deleteFilesInRanges0(long dbHandle, long cfHandle, byte[][] ranges)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_deleteFilesInRanges0(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    cf_handle: jlong,
+    ranges: JByteArray, // Actually a byte[][] but received as jobjectArray
+) {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
+    let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
+        Some(cf) => cf,
+        None => {
+            throw_rocks_exception(&mut env, "null column family handle");
+            return;
+        }
+    };
+
+    // The ranges parameter is a byte[][] with alternating begin/end pairs.
+    // Parse it from the jobjectArray.
+    let ranges_obj = unsafe { jni::objects::JObjectArray::from_raw(ranges.into_raw()) };
+    let len = match env.get_array_length(&ranges_obj) {
+        Ok(l) => l as usize,
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read ranges array length");
+            return;
+        }
+    };
+    if len % 2 != 0 {
+        throw_rocks_exception(&mut env, "ranges array must have even length");
+        return;
+    }
+
+    let mut range_vecs: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(len / 2);
+    let mut i = 0;
+    while i < len {
+        let begin_obj = match env.get_object_array_element(&ranges_obj, i as i32) {
+            Ok(o) => o,
+            Err(_) => {
+                throw_rocks_exception(&mut env, "failed to read range begin");
+                return;
+            }
+        };
+        let end_obj = match env.get_object_array_element(&ranges_obj, (i + 1) as i32) {
+            Ok(o) => o,
+            Err(_) => {
+                throw_rocks_exception(&mut env, "failed to read range end");
+                return;
+            }
+        };
+        let begin_arr: JByteArray = begin_obj.into();
+        let end_arr: JByteArray = end_obj.into();
+        let begin_bytes = match env.convert_byte_array(&begin_arr) {
+            Ok(b) => b,
+            Err(_) => {
+                throw_rocks_exception(&mut env, "failed to convert range begin bytes");
+                return;
+            }
+        };
+        let end_bytes = match env.convert_byte_array(&end_arr) {
+            Ok(b) => b,
+            Err(_) => {
+                throw_rocks_exception(&mut env, "failed to convert range end bytes");
+                return;
+            }
+        };
+        range_vecs.push((begin_bytes, end_bytes));
+        i += 2;
+    }
+
+    let range_refs: Vec<(&[u8], &[u8])> = range_vecs
+        .iter()
+        .map(|(b, e)| (b.as_slice(), e.as_slice()))
+        .collect();
+    if let Err(e) = db.delete_files_in_ranges(&**cf_arc, &range_refs) {
+        throw_rocks_exception(&mut env, &e.to_string());
+    }
+}
+
+/// `RocksDB.getLiveFilesMetaData0(long dbHandle) -> long[]`
+///
+/// Returns a flat array of handles to `LiveFileMetaData` objects.
+/// Each handle is a boxed `LiveFileMetaData` that Java unpacks
+/// via the `LiveFileMetaData_*` accessors below.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesMetaData0(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jbyteArray {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return std::ptr::null_mut();
+        }
+    };
+    let metas = db.get_live_files_metadata();
+
+    // Serialise all metadata into a single byte[]:
+    //   For each entry:
+    //     4 bytes: cfName length (N)
+    //     N bytes: cfName (UTF-8)
+    //     8 bytes: fileNumber
+    //     4 bytes: level
+    //     8 bytes: fileSize
+    //     4 bytes: smallestKey length (S)
+    //     S bytes: smallestKey
+    //     4 bytes: largestKey length (L)
+    //     L bytes: largestKey
+    let mut buf: Vec<u8> = Vec::new();
+    // 4 bytes: entry count
+    buf.extend_from_slice(&(metas.len() as u32).to_be_bytes());
+    for m in &metas {
+        let cf_bytes = m.column_family_name.as_bytes();
+        buf.extend_from_slice(&(cf_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(cf_bytes);
+        buf.extend_from_slice(&m.file_number.to_be_bytes());
+        buf.extend_from_slice(&m.level.to_be_bytes());
+        buf.extend_from_slice(&m.file_size.to_be_bytes());
+        buf.extend_from_slice(&(m.smallest_key.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&m.smallest_key);
+        buf.extend_from_slice(&(m.largest_key.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&m.largest_key);
+    }
+
+    match env.byte_array_from_slice(&buf) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to create metadata byte array");
+            std::ptr::null_mut()
+        }
+    }
+}
