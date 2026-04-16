@@ -35,6 +35,9 @@ public class Checkpoint {
 
     public void createCheckpoint(final String path)
             throws RocksDBException {
-        throw new RocksDBException("not yet implemented");
+        createCheckpoint0(db.getNativeHandle(), path);
     }
+
+    private static native void createCheckpoint0(long dbHandle, String path)
+            throws RocksDBException;
 }

@@ -1256,3 +1256,34 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesMetaData0(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Checkpoint (org.forstdb.Checkpoint)
+// ---------------------------------------------------------------------------
+
+/// `Checkpoint.createCheckpoint0(long dbHandle, String path)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Checkpoint_createCheckpoint0(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    path: JString,
+) {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
+    let path_str: String = match env.get_string(&path) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read path string");
+            return;
+        }
+    };
+    if let Err(e) = st_rs::create_checkpoint(db, Path::new(&path_str)) {
+        throw_rocks_exception(&mut env, &e.to_string());
+    }
+}

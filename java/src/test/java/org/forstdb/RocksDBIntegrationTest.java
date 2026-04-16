@@ -251,4 +251,27 @@ class RocksDBIntegrationTest {
             assertTrue(first.size() > 0);
         }
     }
+
+    @Test
+    void checkpointCreateAndReopen() throws RocksDBException {
+        String dbPath = tempDir.resolve("test-cp-db").toString();
+        String cpPath = tempDir.resolve("test-cp-out").toString();
+        try (DBOptions opts = new DBOptions().setCreateIfMissing(true);
+             RocksDB db = RocksDB.open(opts, dbPath)) {
+            db.put("k1".getBytes(), "v1".getBytes());
+            db.put("k2".getBytes(), "v2".getBytes());
+            db.flush();
+
+            Checkpoint cp = Checkpoint.create(db);
+            cp.createCheckpoint(cpPath);
+        }
+
+        // Reopen the checkpoint as an independent DB.
+        try (DBOptions opts = new DBOptions().setCreateIfMissing(false);
+             RocksDB cp = RocksDB.open(opts, cpPath)) {
+            assertArrayEquals("v1".getBytes(), cp.get("k1".getBytes()));
+            assertArrayEquals("v2".getBytes(), cp.get("k2".getBytes()));
+            assertNull(cp.get("missing".getBytes()));
+        }
+    }
 }
