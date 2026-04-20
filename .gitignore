@@ -1,7 +1,9 @@
 /target
 **/*.rs.bk
 java/target/
+java-flink-it/target/
 FLINK-INTEGRATION-PLAN.md
 FLINK-FULL-INTEGRATION-ANALYSIS.md
+FLINK-INTEGRATION-STATUS.md
 VECTORIZED-STATE-DESIGN.md
 java/src/main/resources/org/forstdb/native/
