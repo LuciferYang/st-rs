@@ -375,19 +375,13 @@ impl<'a> CompactionJob<'a> {
                         tb.add(ikey, value)?;
                         written += 1;
                     }
-                }
-                ValueType::Deletion | ValueType::SingleDeletion
-                    if self.merge_operator.is_some() && !merge_operands.is_empty() =>
-                {
-                    // Tombstone terminates a merge chain — no base value.
-                    // Flush the chain with base=None.
-                    // (Don't write the tombstone itself if drop_tombstones.)
-                    if !drop_tombstones {
-                        tb.add(ikey, value)?;
-                        written += 1;
+                    // A tombstone terminates any active merge chain — drop
+                    // pending operands so they don't get applied to a key
+                    // we just deleted.
+                    if !merge_operands.is_empty() {
+                        merge_operands.clear();
+                        merge_ikey = None;
                     }
-                    merge_operands.clear();
-                    merge_ikey = None;
                 }
                 _ => {}
             }
