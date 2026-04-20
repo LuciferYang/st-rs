@@ -476,7 +476,7 @@ impl DbImpl {
                 });
             }
             // Newest first (highest number) for L0.
-            l0.sort_by(|a, b| b.number.cmp(&a.number));
+            l0.sort_by_key(|b| std::cmp::Reverse(b.number));
 
             l1 = Vec::with_capacity(cf_files.l1.len());
             for meta in &cf_files.l1 {
@@ -516,7 +516,7 @@ impl DbImpl {
                 });
             }
             // Newest first (highest number) for L0.
-            l0.sort_by(|a, b| b.number.cmp(&a.number));
+            l0.sort_by_key(|b| std::cmp::Reverse(b.number));
 
             // Initialise `last_sequence` from the existing SSTs.
             last_sequence = 0u64;
@@ -621,7 +621,7 @@ impl DbImpl {
                         level: 0,
                     });
                 }
-                cf_l0.sort_by(|a, b| b.number.cmp(&a.number));
+                cf_l0.sort_by_key(|b| std::cmp::Reverse(b.number));
 
                 let mut cf_l1 = Vec::with_capacity(cf_file_state.l1.len());
                 for meta in &cf_file_state.l1 {
