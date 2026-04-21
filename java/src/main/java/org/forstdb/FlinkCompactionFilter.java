@@ -19,14 +19,117 @@
 package org.forstdb;
 
 /**
- * Compaction filter used by Flink state backends.
+ * Compatibility surface for Flink's TTL compaction filter API. The native
+ * filter logic is not yet wired into the st-rs engine — this class exists
+ * primarily so Flink's {@code ForStDBTtlCompactFiltersManager} can build
+ * its {@link Config} objects without {@code NoClassDefFoundError}s during
+ * keyed-state-backend init.
+ *
+ * <p>Once the JNI bridge for compaction filters is implemented (gap M2 in
+ * FLINK-INTEGRATION-STATUS.md), the filter will actually expire TTL'd
+ * state on compaction. Today, configs are accepted but ignored.
  */
 public class FlinkCompactionFilter {
 
     /**
-     * Factory for creating Flink compaction filters.
-     *
-     * <p>Flink creates instances of this factory via its own mechanism.</p>
+     * Order matches upstream's JNI translation — do not reorder.
+     */
+    public enum StateType {
+        Disabled,
+        Value,
+        List
+    }
+
+    /** Provides current timestamp for TTL checks. Must be thread-safe. */
+    public interface TimeProvider {
+        long currentTimestamp();
+    }
+
+    /**
+     * Returns the offset of the first unexpired list element. Used for
+     * variable-length list serializations where Flink's serializer must
+     * compute element boundaries.
+     */
+    public interface ListElementFilter {
+        int nextUnexpiredOffset(byte[] list, long ttl, long currentTimestamp);
+    }
+
+    /** Factory for {@link ListElementFilter} instances. */
+    public interface ListElementFilterFactory {
+        ListElementFilter createListElementFilter();
+    }
+
+    /**
+     * TTL compaction filter configuration. Mirrors upstream's static
+     * factories so Flink's call sites compile and run; values are stored
+     * but not yet handed to the engine.
+     */
+    public static class Config {
+        public final StateType stateType;
+        public final int timestampOffset;
+        public final long ttl;
+        public final long queryTimeAfterNumEntries;
+        public final int fixedElementLength;
+        public final ListElementFilterFactory listElementFilterFactory;
+
+        private Config(
+                final StateType stateType,
+                final int timestampOffset,
+                final long ttl,
+                final long queryTimeAfterNumEntries,
+                final int fixedElementLength,
+                final ListElementFilterFactory listElementFilterFactory) {
+            this.stateType = stateType;
+            this.timestampOffset = timestampOffset;
+            this.ttl = ttl;
+            this.queryTimeAfterNumEntries = queryTimeAfterNumEntries;
+            this.fixedElementLength = fixedElementLength;
+            this.listElementFilterFactory = listElementFilterFactory;
+        }
+
+        public static Config createNotList(
+                final StateType stateType,
+                final int timestampOffset,
+                final long ttl,
+                final long queryTimeAfterNumEntries) {
+            return new Config(
+                    stateType, timestampOffset, ttl, queryTimeAfterNumEntries, -1, null);
+        }
+
+        public static Config createForValue(
+                final long ttl, final long queryTimeAfterNumEntries) {
+            return createNotList(StateType.Value, 0, ttl, queryTimeAfterNumEntries);
+        }
+
+        public static Config createForMap(
+                final long ttl, final long queryTimeAfterNumEntries) {
+            return createNotList(StateType.Value, 1, ttl, queryTimeAfterNumEntries);
+        }
+
+        public static Config createForFixedElementList(
+                final long ttl,
+                final long queryTimeAfterNumEntries,
+                final int fixedElementLength) {
+            return new Config(
+                    StateType.List, 0, ttl, queryTimeAfterNumEntries,
+                    fixedElementLength, null);
+        }
+
+        public static Config createForList(
+                final long ttl,
+                final long queryTimeAfterNumEntries,
+                final ListElementFilterFactory listElementFilterFactory) {
+            return new Config(
+                    StateType.List, 0, ttl, queryTimeAfterNumEntries, -1,
+                    listElementFilterFactory);
+        }
+    }
+
+    /**
+     * Factory used by Flink's {@code ForStDBTtlCompactFiltersManager} to
+     * register a per-CF compaction filter. The Java surface is in place;
+     * the native binding is the next milestone (M2 in
+     * FLINK-INTEGRATION-STATUS.md).
      */
     public static class FlinkCompactionFilterFactory {
     }
