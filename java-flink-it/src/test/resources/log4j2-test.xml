@@ -30,7 +30,9 @@
     <Loggers>
         <Logger name="org.apache.flink" level="INFO"/>
         <Logger name="org.apache.flink.runtime.checkpoint" level="INFO"/>
-        <Logger name="org.apache.flink.state.forst" level="DEBUG"/>
+        <Logger name="org.apache.flink.state.forst" level="TRACE"/>
+        <Logger name="org.apache.flink.state.forst.datatransfer" level="TRACE"/>
+        <Logger name="org.apache.flink.runtime.state" level="DEBUG"/>
         <Logger name="org.forstdb" level="DEBUG"/>
         <!-- Akka / pekko + zookeeper get noisy fast. -->
         <Logger name="org.apache.pekko" level="WARN"/>
