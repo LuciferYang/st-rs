@@ -116,7 +116,7 @@
                          NativeLibraryLoader.System.loadLibrary("st_rs_jni")
                          finds libst_rs_jni.{so,dylib}. CI sets this; locally
                          override with -Djava.library.path=... if needed. -->
-                    <argLine>-Djava.library.path=${project.basedir}/../target/debug --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED</argLine>
+                    <argLine>-Djava.library.path=${project.basedir}/../target/debug -Dlog4j2.configurationFile=log4j2-test.xml -Dlog4j2.debug=false --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED</argLine>
                     <!-- Include *IT.java since this module is integration
                          tests; surefire's default pattern excludes them. -->
                     <includes>
