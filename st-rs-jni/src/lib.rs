@@ -1684,11 +1684,24 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesNative(
     }
 
     let metas = db.get_live_files_metadata();
+    let manifest_num = db.manifest_file_number();
     // Upstream encodes the MANIFEST byte length here so Flink can
     // truncate/upload exactly that many bytes. st-rs has no partial
     // MANIFEST snapshot yet — 0 means "no truncation hint", which is
     // the same as upstream's default when truncation isn't needed.
     let manifest_size: u64 = 0;
+
+    // Build the file list: all SSTs + the active MANIFEST file +
+    // CURRENT. Flink's snapshot strategy filters CURRENT out but
+    // requires exactly one entry starting with "MANIFEST-".
+    let mut file_names: Vec<String> = metas
+        .iter()
+        .map(|m| format!("/{:06}.sst", m.file_number))
+        .collect();
+    if manifest_num > 0 {
+        file_names.push(format!("/MANIFEST-{:06}", manifest_num));
+    }
+    file_names.push("/CURRENT".to_string());
 
     let str_class = match env.find_class("java/lang/String") {
         Ok(c) => c,
@@ -1697,8 +1710,9 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesNative(
             return std::ptr::null_mut();
         }
     };
+    // +1 for the trailing manifestFileSize-as-decimal element.
     let arr = match env.new_object_array(
-        (metas.len() + 1) as i32,
+        (file_names.len() + 1) as i32,
         &str_class,
         JObject::null(),
     ) {
@@ -1708,9 +1722,8 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesNative(
             return std::ptr::null_mut();
         }
     };
-    for (i, m) in metas.iter().enumerate() {
-        let name = format!("/{:06}.sst", m.file_number);
-        let jstr = match env.new_string(&name) {
+    for (i, name) in file_names.iter().enumerate() {
+        let jstr = match env.new_string(name) {
             Ok(s) => s,
             Err(e) => {
                 throw_rocks_exception(&mut env, &format!("new String: {e}"));
@@ -1729,7 +1742,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesNative(
             return std::ptr::null_mut();
         }
     };
-    if let Err(e) = env.set_object_array_element(&arr, metas.len() as i32, manifest_str) {
+    if let Err(e) = env.set_object_array_element(&arr, file_names.len() as i32, manifest_str) {
         throw_rocks_exception(&mut env, &format!("set manifest elem: {e}"));
         return std::ptr::null_mut();
     }
