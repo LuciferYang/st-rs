@@ -198,6 +198,20 @@ public class RocksDB extends RocksObject {
         return new ColumnFamilyHandle(cfHandle);
     }
 
+    /**
+     * Create a column family from a descriptor. The descriptor's options
+     * are stored on the returned handle (via {@link ColumnFamilyHandle#getDescriptor})
+     * but are not yet handed to the engine — that's a follow-up. The
+     * native engine still uses defaults; this overload exists so Flink's
+     * {@code ForStOperationUtils.createColumnFamily} can register CFs.
+     */
+    public ColumnFamilyHandle createColumnFamily(final ColumnFamilyDescriptor desc)
+            throws RocksDBException {
+        final long cfHandle = createColumnFamily(
+                nativeHandle_, desc.getNameAsString());
+        return new ColumnFamilyHandle(cfHandle, desc);
+    }
+
     public void dropColumnFamily(final ColumnFamilyHandle cf)
             throws RocksDBException {
         dropColumnFamily0(nativeHandle_, cf.getNativeHandle());
