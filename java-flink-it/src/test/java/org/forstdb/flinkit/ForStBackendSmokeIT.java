@@ -19,6 +19,7 @@
 package org.forstdb.flinkit;
 
 import org.apache.flink.api.common.JobExecutionResult;
+import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
@@ -91,12 +92,34 @@ class ForStBackendSmokeIT {
         final JobClient client = env.executeAsync("st-rs ForSt smoke");
         System.out.println("[IT] step=executeAsync.after jobId=" + client.getJobID());
 
-        // Block on terminal status. If the ForSt backend fails during init,
-        // get() throws ExecutionException with the underlying Flink failure
-        // — full stack trace, not a silent collect-poll hang.
-        final JobExecutionResult result =
-                client.getJobExecutionResult().get(60, TimeUnit.SECONDS);
-        System.out.println("[IT] step=jobFinished runtimeMs=" + result.getNetRuntime());
+        // Poll status until terminal — much more diagnostic than a single
+        // getJobExecutionResult.get(timeout): we see whether the job ever
+        // transitioned past CREATED (init failure) and what state it ends in.
+        JobStatus last = null;
+        final long deadline = System.currentTimeMillis() + 60_000;
+        while (System.currentTimeMillis() < deadline) {
+            final JobStatus status = client.getJobStatus().get(5, TimeUnit.SECONDS);
+            if (status != last) {
+                System.out.println("[IT] jobStatus=" + status);
+                last = status;
+            }
+            if (status.isGloballyTerminalState()) {
+                break;
+            }
+            Thread.sleep(500);
+        }
+
+        // Now collect the actual result. If the job FAILED, the
+        // ExecutionException unwrap surfaces the original Flink/JNI cause.
+        try {
+            final JobExecutionResult result =
+                    client.getJobExecutionResult().get(5, TimeUnit.SECONDS);
+            System.out.println("[IT] step=jobFinished runtimeMs=" + result.getNetRuntime());
+        } catch (final java.util.concurrent.ExecutionException e) {
+            System.out.println("[IT] jobFailed cause=");
+            e.getCause().printStackTrace(System.out);
+            throw e;
+        }
     }
 
     /**
