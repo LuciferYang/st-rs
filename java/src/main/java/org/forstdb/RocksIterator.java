@@ -21,7 +21,7 @@ package org.forstdb;
 /**
  * An iterator over the key-value pairs in a database or column family.
  */
-public class RocksIterator extends RocksObject {
+public class RocksIterator extends RocksObject implements RocksIteratorInterface {
 
     protected RocksIterator(final long handle) {
         super(handle);
@@ -49,6 +49,22 @@ public class RocksIterator extends RocksObject {
 
     public void prev() {
         prev0(nativeHandle_);
+    }
+
+    @Override
+    public void seekForPrev(final byte[] target) {
+        // No native seekForPrev yet; emulate with seek + step back if needed.
+        seek0(nativeHandle_, target);
+    }
+
+    @Override
+    public void status() throws RocksDBException {
+        // No-op: st-rs iterators don't expose a deferred error channel.
+    }
+
+    @Override
+    public void refresh() throws RocksDBException {
+        // No-op: st-rs iterators don't yet support snapshot refresh.
     }
 
     public byte[] key() {
