@@ -1689,26 +1689,15 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesNative(
     let metas = db.get_live_files_metadata();
     let manifest_num = db.manifest_file_number();
 
-    // Diagnostic: stat the MANIFEST file on disk so we can tell if
-    // it's really zero-byte or if Flink's reader is the problem.
-    let db_path = db.path();
-    let manifest_file = db_path.join(format!("MANIFEST-{:06}", manifest_num));
-    match std::fs::metadata(&manifest_file) {
-        Ok(md) => eprintln!(
-            "[jni] manifest on disk: path={:?} size={}",
-            manifest_file,
-            md.len()
-        ),
-        Err(e) => eprintln!(
-            "[jni] manifest stat failed: path={:?} err={}",
-            manifest_file, e
-        ),
-    }
-    // Upstream encodes the MANIFEST byte length here so Flink can
-    // truncate/upload exactly that many bytes. st-rs has no partial
-    // MANIFEST snapshot yet — 0 means "no truncation hint", which is
-    // the same as upstream's default when truncation isn't needed.
-    let manifest_size: u64 = 0;
+    // Flink passes manifestFileSize as maxTransferBytes when streaming
+    // the MANIFEST to checkpoint storage. If it's 0, the read loop
+    // runs zero iterations, the output stream stays empty, and
+    // closeAndGetHandle returns null → NPE. We must report the real
+    // on-disk size so Flink reads the whole file.
+    let manifest_path = db.path().join(format!("MANIFEST-{:06}", manifest_num));
+    let manifest_size = std::fs::metadata(&manifest_path)
+        .map(|md| md.len())
+        .unwrap_or(0);
 
     // Build the file list: all SSTs + the active MANIFEST file +
     // CURRENT. Flink's snapshot strategy filters CURRENT out but
