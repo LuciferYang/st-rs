@@ -172,7 +172,7 @@ public class RocksDB extends RocksObject {
         final RocksDB db = open(options, path);
         // For each requested CF, look up existing or create new.
         for (final ColumnFamilyDescriptor desc : cfDescs) {
-            final String name = desc.getName();
+            final String name = desc.getNameAsString();
             // Try to find an existing CF recovered from MANIFEST.
             final long existingHandle = getColumnFamilyByName(
                     db.nativeHandle_, name);

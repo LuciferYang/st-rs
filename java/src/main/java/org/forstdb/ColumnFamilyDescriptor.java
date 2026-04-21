@@ -18,28 +18,53 @@
 
 package org.forstdb;
 
+import java.nio.charset.StandardCharsets;
+
 /**
  * Describes a column family by name and options.
  *
- * <p>This is a pure-Java descriptor with no native handle.</p>
+ * <p>Pure-Java descriptor with no native handle. Internally stores the
+ * name as {@code byte[]} to match upstream's RocksDB / ForSt API
+ * (Flink's ForSt backend constructs descriptors with {@code byte[]} keys).
  */
 public class ColumnFamilyDescriptor {
 
-    private final String name;
+    private final byte[] name;
     private final ColumnFamilyOptions options;
 
-    public ColumnFamilyDescriptor(final String name,
+    public ColumnFamilyDescriptor(final byte[] name,
             final ColumnFamilyOptions options) {
         this.name = name;
         this.options = options;
+    }
+
+    public ColumnFamilyDescriptor(final byte[] name) {
+        this(name, new ColumnFamilyOptions());
+    }
+
+    public ColumnFamilyDescriptor(final String name,
+            final ColumnFamilyOptions options) {
+        this(name.getBytes(StandardCharsets.UTF_8), options);
     }
 
     public ColumnFamilyDescriptor(final String name) {
         this(name, new ColumnFamilyOptions());
     }
 
-    public String getName() {
+    /**
+     * Returns the raw column-family name. Mirrors upstream's
+     * {@code byte[]}-typed accessor.
+     */
+    public byte[] getName() {
         return name;
+    }
+
+    /**
+     * Convenience accessor that decodes the CF name as UTF-8. Used by
+     * call sites that historically passed a String.
+     */
+    public String getNameAsString() {
+        return new String(name, StandardCharsets.UTF_8);
     }
 
     public ColumnFamilyOptions getOptions() {
