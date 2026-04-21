@@ -145,10 +145,23 @@ class ForStBackendSmokeIT {
         @Override
         public void processElement(String value, Context ctx, Collector<String> out)
                 throws Exception {
-            final Long current = counter.value();
-            final long next = (current == null ? 0L : current) + 1L;
-            counter.update(next);
-            out.collect(ctx.getCurrentKey() + ":" + next);
+            final String key = ctx.getCurrentKey();
+            System.out.println("[IT] CountingFn.processElement.enter key=" + key
+                    + " value=" + value);
+            try {
+                final Long current = counter.value();
+                System.out.println("[IT] CountingFn.processElement.afterRead key="
+                        + key + " current=" + current);
+                final long next = (current == null ? 0L : current) + 1L;
+                counter.update(next);
+                System.out.println("[IT] CountingFn.processElement.afterWrite key="
+                        + key + " next=" + next);
+                out.collect(key + ":" + next);
+            } catch (final Throwable t) {
+                System.out.println("[IT] CountingFn.processElement.threw key=" + key);
+                t.printStackTrace(System.out);
+                throw t;
+            }
         }
     }
 }
