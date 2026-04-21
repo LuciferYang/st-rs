@@ -27,7 +27,7 @@ import java.util.List;
  */
 public class ColumnFamilyOptions {
 
-    private int writeBufferSize = 64 * 1024 * 1024; // 64 MB
+    private long writeBufferSize = 64L * 1024 * 1024; // 64 MB
     private int maxWriteBufferNumber = 2;
     private int minWriteBufferNumberToMerge = 1;
     private CompactionStyle compactionStyle = CompactionStyle.LEVEL;
@@ -44,11 +44,11 @@ public class ColumnFamilyOptions {
     public ColumnFamilyOptions() {
     }
 
-    public int getWriteBufferSize() {
+    public long getWriteBufferSize() {
         return writeBufferSize;
     }
 
-    public ColumnFamilyOptions setWriteBufferSize(final int writeBufferSize) {
+    public ColumnFamilyOptions setWriteBufferSize(final long writeBufferSize) {
         this.writeBufferSize = writeBufferSize;
         return this;
     }
@@ -119,6 +119,16 @@ public class ColumnFamilyOptions {
             final TableFormatConfig tableFormatConfig) {
         this.tableFormatConfig = tableFormatConfig;
         return this;
+    }
+
+    /**
+     * Returns the configured table format, or {@code null} if none has been
+     * set. Mirrors upstream's accessor name (no {@code get} prefix); Flink's
+     * {@code ForStResourceContainer} reads it back to compose the
+     * {@link BlockBasedTableConfig}.
+     */
+    public TableFormatConfig tableFormatConfig() {
+        return tableFormatConfig;
     }
 
     public ColumnFamilyOptions setCompactionFilterFactory(
