@@ -31,6 +31,15 @@ public class WriteBatch extends RocksObject {
         super(newWriteBatch());
     }
 
+    /**
+     * Compatibility constructor — Flink's ForSt backend allocates a
+     * pre-sized batch via {@code new WriteBatch(reservedBytes)}. The hint
+     * is accepted but ignored: st-rs's batch grows on demand.
+     */
+    public WriteBatch(final int reservedBytes) {
+        super(newWriteBatch());
+    }
+
     public void put(final ColumnFamilyHandle cf, final byte[] key,
             final byte[] value) throws RocksDBException {
         put(nativeHandle_, cf.getNativeHandle(), key, value);
