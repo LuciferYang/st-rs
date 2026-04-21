@@ -1688,6 +1688,22 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesNative(
 
     let metas = db.get_live_files_metadata();
     let manifest_num = db.manifest_file_number();
+
+    // Diagnostic: stat the MANIFEST file on disk so we can tell if
+    // it's really zero-byte or if Flink's reader is the problem.
+    let db_path = db.path();
+    let manifest_file = db_path.join(format!("MANIFEST-{:06}", manifest_num));
+    match std::fs::metadata(&manifest_file) {
+        Ok(md) => eprintln!(
+            "[jni] manifest on disk: path={:?} size={}",
+            manifest_file,
+            md.len()
+        ),
+        Err(e) => eprintln!(
+            "[jni] manifest stat failed: path={:?} err={}",
+            manifest_file, e
+        ),
+    }
     // Upstream encodes the MANIFEST byte length here so Flink can
     // truncate/upload exactly that many bytes. st-rs has no partial
     // MANIFEST snapshot yet — 0 means "no truncation hint", which is

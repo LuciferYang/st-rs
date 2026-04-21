@@ -859,6 +859,12 @@ impl DbImpl {
     /// Return the file number of the active MANIFEST, or 0 if no
     /// MANIFEST has been created yet. Used by checkpoint to know
     /// which MANIFEST file to copy.
+    /// Absolute path of the DB directory. Used by the JNI layer for
+    /// file-system introspection around checkpoints.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn manifest_file_number(&self) -> u64 {
         let state = self.state.lock().unwrap();
         state.version_set.manifest_file_number()
