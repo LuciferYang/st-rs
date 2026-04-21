@@ -71,6 +71,9 @@ class ForStBackendSmokeIT {
         jobConfig.set(StateBackendOptions.STATE_BACKEND, "forst");
         jobConfig.setString("execution.checkpointing.dir",
                 checkpointDir.toUri().toString());
+        // Without this, a task failure puts the job in RESTARTING forever
+        // and we never see the underlying cause.
+        jobConfig.setString("restart-strategy.type", "none");
 
         System.out.println("[IT] step=env.create");
         final StreamExecutionEnvironment env =
