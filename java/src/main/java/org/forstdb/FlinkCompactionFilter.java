@@ -29,7 +29,17 @@ package org.forstdb;
  * FLINK-INTEGRATION-STATUS.md), the filter will actually expire TTL'd
  * state on compaction. Today, configs are accepted but ignored.
  */
-public class FlinkCompactionFilter {
+public class FlinkCompactionFilter extends AbstractCompactionFilter<Slice> {
+
+    protected FlinkCompactionFilter() {
+        super(0L);
+    }
+
+    @Override
+    protected void disposeInternal(final long handle) {
+        // no native resource yet
+    }
+
 
     /**
      * Order matches upstream's JNI translation — do not reorder.
@@ -131,6 +141,31 @@ public class FlinkCompactionFilter {
      * the native binding is the next milestone (M2 in
      * FLINK-INTEGRATION-STATUS.md).
      */
-    public static class FlinkCompactionFilterFactory {
+    public static class FlinkCompactionFilterFactory
+            extends AbstractCompactionFilterFactory<FlinkCompactionFilter> {
+
+        private final TimeProvider timeProvider;
+        private final Logger logger;
+
+        public FlinkCompactionFilterFactory(
+                final TimeProvider timeProvider, final Logger logger) {
+            this.timeProvider = timeProvider;
+            this.logger = logger;
+        }
+
+        public void configure(final Config config) {
+            // Accepted for API compatibility — engine wiring lands in M2.
+        }
+
+        @Override
+        public FlinkCompactionFilter createCompactionFilter(
+                final AbstractCompactionFilter.Context context) {
+            return new FlinkCompactionFilter();
+        }
+
+        @Override
+        public String name() {
+            return "FlinkCompactionFilterFactory";
+        }
     }
 }
