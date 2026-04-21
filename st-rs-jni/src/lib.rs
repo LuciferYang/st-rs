@@ -1655,6 +1655,87 @@ pub extern "system" fn Java_org_forstdb_FlinkCompactionFilter_00024FlinkCompacti
     unsafe { drop_handle::<Arc<dyn st_rs::CompactionFilterFactory>>(handle) };
 }
 
+/// `RocksDB.getLiveFilesNative(long dbHandle, boolean flushMemtable) -> String[]`
+///
+/// Returns SST file names + a final entry holding the MANIFEST file size
+/// as a decimal string (matches upstream's marshalling convention so
+/// `RocksDB.LiveFiles` can be reconstructed Java-side without a second JNI
+/// call). File names use the upstream "/000007.sst" shape — relative to
+/// the DB dir but with a leading slash.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesNative(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    flush_memtable: jni::sys::jboolean,
+) -> jni::sys::jobjectArray {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return std::ptr::null_mut();
+        }
+    };
+    if flush_memtable != 0 {
+        if let Err(e) = db.flush() {
+            throw_rocks_exception(&mut env, &e.to_string());
+            return std::ptr::null_mut();
+        }
+    }
+
+    let metas = db.get_live_files_metadata();
+    // Upstream encodes the MANIFEST byte length here so Flink can
+    // truncate/upload exactly that many bytes. st-rs has no partial
+    // MANIFEST snapshot yet — 0 means "no truncation hint", which is
+    // the same as upstream's default when truncation isn't needed.
+    let manifest_size: u64 = 0;
+
+    let str_class = match env.find_class("java/lang/String") {
+        Ok(c) => c,
+        Err(e) => {
+            throw_rocks_exception(&mut env, &format!("find String: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    let arr = match env.new_object_array(
+        (metas.len() + 1) as i32,
+        &str_class,
+        JObject::null(),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            throw_rocks_exception(&mut env, &format!("new String[]: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    for (i, m) in metas.iter().enumerate() {
+        let name = format!("/{:06}.sst", m.file_number);
+        let jstr = match env.new_string(&name) {
+            Ok(s) => s,
+            Err(e) => {
+                throw_rocks_exception(&mut env, &format!("new String: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        if let Err(e) = env.set_object_array_element(&arr, i as i32, jstr) {
+            throw_rocks_exception(&mut env, &format!("set elem {i}: {e}"));
+            return std::ptr::null_mut();
+        }
+    }
+    let manifest_str = match env.new_string(manifest_size.to_string()) {
+        Ok(s) => s,
+        Err(e) => {
+            throw_rocks_exception(&mut env, &format!("new manifest size string: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    if let Err(e) = env.set_object_array_element(&arr, metas.len() as i32, manifest_str) {
+        throw_rocks_exception(&mut env, &format!("set manifest elem: {e}"));
+        return std::ptr::null_mut();
+    }
+    arr.into_raw()
+}
+
 /// `RocksDB.getDefaultColumnFamily(long dbHandle) -> long`
 ///
 /// Returns a handle to the always-present default CF. Tests use this

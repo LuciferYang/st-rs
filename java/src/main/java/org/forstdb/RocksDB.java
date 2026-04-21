@@ -456,6 +456,47 @@ public class RocksDB extends RocksObject {
     private static native long createColumnFamilyWithImport(long dbHandle,
             String name, String[] paths, boolean moveFiles);
 
+    private static native String[] getLiveFilesNative(long dbHandle,
+            boolean flushMemtable);
+
+    /**
+     * The snapshot of live SST file names at a point in time, used by
+     * Flink's native snapshot strategy to build a checkpoint.
+     *
+     * <p>File names are relative to the DB directory but begin with a
+     * leading "/" — matches upstream's odd-but-documented convention.
+     */
+    public static class LiveFiles {
+        public final long manifestFileSize;
+        public final java.util.List<String> files;
+
+        LiveFiles(final long manifestFileSize,
+                final java.util.List<String> files) {
+            this.manifestFileSize = manifestFileSize;
+            this.files = files;
+        }
+    }
+
+    /**
+     * Returns the snapshot of live SST files in the database. Flushes
+     * the active memtable first when {@code flushMemtable} is true.
+     * Used by Flink's {@code ForStNativeFullSnapshotStrategy}.
+     */
+    public LiveFiles getLiveFiles(final boolean flushMemtable)
+            throws RocksDBException {
+        final String[] raw = getLiveFilesNative(nativeHandle_, flushMemtable);
+        if (raw == null) {
+            return null;
+        }
+        final String[] files = java.util.Arrays.copyOf(raw, raw.length - 1);
+        final long manifestFileSize = Long.parseLong(raw[raw.length - 1]);
+        return new LiveFiles(manifestFileSize, java.util.Arrays.asList(files));
+    }
+
+    public LiveFiles getLiveFiles() throws RocksDBException {
+        return getLiveFiles(true);
+    }
+
     private static native void waitForPendingWork(long dbHandle);
 
     /**
