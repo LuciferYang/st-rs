@@ -23,13 +23,31 @@ package org.forstdb;
  */
 public class ColumnFamilyHandle extends RocksObject {
 
+    private final ColumnFamilyDescriptor descriptor;
+
     ColumnFamilyHandle(final long nativeHandle) {
+        this(nativeHandle, null);
+    }
+
+    ColumnFamilyHandle(final long nativeHandle,
+            final ColumnFamilyDescriptor descriptor) {
         super(nativeHandle);
+        this.descriptor = descriptor;
     }
 
     @Override
     public long getNativeHandle() {
         return nativeHandle_;
+    }
+
+    /**
+     * Returns the descriptor used to create this CF, or {@code null} if
+     * this handle was recovered from MANIFEST without one. Mirrors
+     * upstream's accessor; Flink's {@code ForStOperationUtils} reads
+     * options off the descriptor and is null-tolerant.
+     */
+    public ColumnFamilyDescriptor getDescriptor() throws RocksDBException {
+        return descriptor;
     }
 
     @Override
