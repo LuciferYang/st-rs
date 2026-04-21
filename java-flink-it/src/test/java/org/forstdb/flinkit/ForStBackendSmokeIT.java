@@ -79,12 +79,10 @@ class ForStBackendSmokeIT {
         final StreamExecutionEnvironment env =
                 StreamExecutionEnvironment.getExecutionEnvironment(jobConfig);
         env.setParallelism(2);
-        // M4: re-enable checkpointing now that read/write is green and we
-        // want the checkpoint code path exercised in CI. 1s interval is
-        // long enough that the bounded source likely emits everything
-        // before the first checkpoint fires, but short enough that long
-        // runs do trigger one.
-        env.enableCheckpointing(1000);
+        // 500ms interval + ~1.8s job lifetime (6 records × 300ms sleep in
+        // processElement) guarantees at least one checkpoint fires and
+        // completes during the job.
+        env.enableCheckpointing(500);
 
         final List<String> inputs = Arrays.asList(
                 "a", "a", "a",
@@ -151,17 +149,17 @@ class ForStBackendSmokeIT {
         public void processElement(String value, Context ctx, Collector<String> out)
                 throws Exception {
             final String key = ctx.getCurrentKey();
-            System.out.println("[IT] CountingFn.processElement.enter key=" + key
-                    + " value=" + value);
             try {
                 final Long current = counter.value();
-                System.out.println("[IT] CountingFn.processElement.afterRead key="
-                        + key + " current=" + current);
                 final long next = (current == null ? 0L : current) + 1L;
                 counter.update(next);
-                System.out.println("[IT] CountingFn.processElement.afterWrite key="
-                        + key + " next=" + next);
                 out.collect(key + ":" + next);
+                // Slow the source down so a checkpoint cycle can actually
+                // complete before the bounded job finishes. Without this
+                // the 6 records emit in milliseconds and Flink's
+                // closeable-registry races with job shutdown during
+                // snapshot upload.
+                Thread.sleep(300);
             } catch (final Throwable t) {
                 System.out.println("[IT] CountingFn.processElement.threw key=" + key);
                 t.printStackTrace(System.out);
