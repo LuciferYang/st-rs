@@ -56,6 +56,16 @@ public class ColumnFamilyOptions implements AutoCloseable {
         return writeBufferSize;
     }
 
+    /**
+     * Arena block size in bytes used by the memtable allocator. Flink's
+     * {@code sanityCheckArenaBlockSize} reads this. Returning 0 means
+     * "use the default", which is what st-rs does today (we don't expose
+     * arena tuning yet).
+     */
+    public long arenaBlockSize() {
+        return 0L;
+    }
+
     public ColumnFamilyOptions setWriteBufferSize(final long writeBufferSize) {
         this.writeBufferSize = writeBufferSize;
         return this;
