@@ -126,6 +126,19 @@ public class DBOptions extends RocksObject {
     }
 
     /**
+     * Compatibility overload — Flink's ForSt resource container calls
+     * {@code setKeepLogFileNum(long)}. Narrowed to int internally; values
+     * larger than Integer.MAX_VALUE are clamped (log retention counts in
+     * the millions+ are nonsensical anyway).
+     */
+    public DBOptions setKeepLogFileNum(final long keepLogFileNum) {
+        final int clamped = keepLogFileNum > Integer.MAX_VALUE
+                ? Integer.MAX_VALUE
+                : (int) keepLogFileNum;
+        return setKeepLogFileNum(clamped);
+    }
+
+    /**
      * Sets the total amount of RAM to use for memtables across all
      * column families. Passed through to the Rust engine's
      * {@code db_write_buffer_size}.
