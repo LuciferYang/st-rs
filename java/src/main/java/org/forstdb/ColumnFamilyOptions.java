@@ -25,7 +25,7 @@ import java.util.List;
  *
  * <p>Pure Java for now -- fields will be expanded as Flink usage requires.</p>
  */
-public class ColumnFamilyOptions {
+public class ColumnFamilyOptions implements AutoCloseable {
 
     private long writeBufferSize = 64L * 1024 * 1024; // 64 MB
     private int maxWriteBufferNumber = 2;
@@ -45,6 +45,14 @@ public class ColumnFamilyOptions {
     }
 
     public long getWriteBufferSize() {
+        return writeBufferSize;
+    }
+
+    /**
+     * Upstream-style accessor (no {@code get} prefix) used by Flink's
+     * {@code ForStOperationUtils.createColumnFamilyDescriptor}.
+     */
+    public long writeBufferSize() {
         return writeBufferSize;
     }
 
@@ -136,5 +144,15 @@ public class ColumnFamilyOptions {
                     compactionFilterFactory) {
         this.compactionFilterFactory = compactionFilterFactory;
         return this;
+    }
+
+    /**
+     * Required by Flink's {@code ForStSyncKeyedStateBackend.dispose}, which
+     * passes column-family options through a method reference that expects
+     * {@link AutoCloseable}. No native resource yet — no-op close.
+     */
+    @Override
+    public void close() {
+        // no native resource yet
     }
 }
