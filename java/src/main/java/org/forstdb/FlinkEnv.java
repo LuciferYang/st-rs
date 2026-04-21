@@ -40,7 +40,7 @@ package org.forstdb;
  * RocksDB db = RocksDB.open(opts, path);
  * }</pre>
  */
-public class FlinkEnv extends RocksObject {
+public class FlinkEnv extends Env {
 
     static {
         NativeLibraryLoader.load();
