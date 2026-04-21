@@ -27,6 +27,22 @@ public class LRUCache extends Cache {
         super(0);
     }
 
+    /**
+     * Compatibility constructor for Flink's {@code ForStMemoryControllerUtils},
+     * which calls {@code new LRUCache(capacity, numShardBits,
+     * strictCapacityLimit, highPriPoolRatio)} when allocating shared block
+     * cache memory. The extra parameters are accepted for API compatibility
+     * but currently ignored — st-rs does not yet expose shard-count or
+     * high-priority-pool tuning to the engine.
+     */
+    public LRUCache(
+            final long capacity,
+            final int numShardBits,
+            final boolean strictCapacityLimit,
+            final double highPriPoolRatio) {
+        super(0);
+    }
+
     @Override
     protected void disposeInternal(final long handle) {
         // no native resource yet
