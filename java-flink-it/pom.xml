@@ -123,6 +123,11 @@
                         <include>**/*IT.java</include>
                         <include>**/*Test.java</include>
                     </includes>
+                    <!-- Stream test output live so a hang shows where it
+                         got stuck instead of disappearing into a buffered
+                         report file we never see. -->
+                    <useFile>false</useFile>
+                    <trimStackTrace>false</trimStackTrace>
                 </configuration>
             </plugin>
         </plugins>

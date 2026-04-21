@@ -66,14 +66,16 @@ class ForStBackendSmokeIT {
                     .build());
 
     @Test
-    @Timeout(value = 3, unit = TimeUnit.MINUTES)
+    @Timeout(value = 3, unit = TimeUnit.MINUTES, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     void valueStateAcrossKeyedStream(@TempDir Path checkpointDir) throws Exception {
+        System.out.println("[IT] step=config.start");
         final Configuration jobConfig = new Configuration();
         // Flink 2.x: state backend is selected via config, not env.setStateBackend.
         jobConfig.set(StateBackendOptions.STATE_BACKEND, "forst");
         jobConfig.setString("execution.checkpointing.dir",
                 checkpointDir.toUri().toString());
 
+        System.out.println("[IT] step=env.create");
         final StreamExecutionEnvironment env =
                 StreamExecutionEnvironment.getExecutionEnvironment(jobConfig);
         env.setParallelism(2);
@@ -84,10 +86,12 @@ class ForStBackendSmokeIT {
                 "b", "b",
                 "c");
 
+        System.out.println("[IT] step=executeAndCollect.before");
         final List<String> outputs = new ArrayList<>(env.fromData(inputs)
                 .keyBy(s -> s)
                 .process(new CountingFn())
                 .executeAndCollect("st-rs ForSt smoke", inputs.size()));
+        System.out.println("[IT] step=executeAndCollect.after outputs=" + outputs);
 
         // 6 inputs => 6 outputs (one per record).
         assertEquals(inputs.size(), outputs.size(),
@@ -124,6 +128,8 @@ class ForStBackendSmokeIT {
 
         @Override
         public void open(OpenContext openContext) {
+            System.out.println("[IT] CountingFn.open subtask="
+                    + getRuntimeContext().getTaskInfo().getIndexOfThisSubtask());
             counter = getRuntimeContext().getState(
                     new ValueStateDescriptor<>("counter", Long.class));
         }
@@ -131,6 +137,8 @@ class ForStBackendSmokeIT {
         @Override
         public void processElement(String value, Context ctx, Collector<String> out)
                 throws Exception {
+            System.out.println("[IT] CountingFn.processElement key=" + ctx.getCurrentKey()
+                    + " value=" + value);
             final Long current = counter.value();
             final long next = (current == null ? 0L : current) + 1L;
             counter.update(next);
