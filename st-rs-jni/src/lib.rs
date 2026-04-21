@@ -1677,7 +1677,10 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesNative(
         }
     };
     if flush_memtable != 0 {
-        if let Err(e) = db.flush() {
+        // Flink expects ALL CFs flushed (its state lives in a custom
+        // CF, not the default one), so use flush_all_cfs instead of
+        // the default-only flush().
+        if let Err(e) = db.flush_all_cfs() {
             throw_rocks_exception(&mut env, &e.to_string());
             return std::ptr::null_mut();
         }
@@ -1685,16 +1688,6 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesNative(
 
     let metas = db.get_live_files_metadata();
     let manifest_num = db.manifest_file_number();
-
-    // Diagnostic: log file sizes so we can spot zero-byte files that
-    // break Flink's checkpoint uploader (closeAndGetHandle returns null
-    // for empty streams).
-    eprintln!("[jni] getLiveFiles: manifest_num={} metas={}",
-        manifest_num, metas.len());
-    for m in &metas {
-        eprintln!("[jni] getLiveFiles: sst file_number={} size={}",
-            m.file_number, m.file_size);
-    }
     // Upstream encodes the MANIFEST byte length here so Flink can
     // truncate/upload exactly that many bytes. st-rs has no partial
     // MANIFEST snapshot yet — 0 means "no truncation hint", which is

@@ -1527,6 +1527,27 @@ impl DbImpl {
         Ok(())
     }
 
+    /// Flush every column family that has a non-empty active memtable.
+    /// Used by Flink's snapshot path (via `getLiveFiles(flushMemtable=true)`),
+    /// which needs all CFs persisted before reading the SST list —
+    /// `flush()` alone only flushes the default CF.
+    pub fn flush_all_cfs(&self) -> Result<()> {
+        // Snapshot the set of CF ids under the lock, then drop it to
+        // avoid holding across each per-CF flush (which re-takes the lock).
+        let cf_ids: Vec<ColumnFamilyId> = {
+            let state = self.state.lock().unwrap();
+            state.column_families.keys().copied().collect()
+        };
+        for cf_id in cf_ids {
+            let setup = self.start_flush_cf_locked(cf_id)?;
+            if let Some(setup) = setup {
+                let result = self.write_immutable_to_sst(&setup);
+                self.complete_flush_locked(setup, result)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Insert or overwrite `key → value`.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let mut batch = WriteBatch::new();
