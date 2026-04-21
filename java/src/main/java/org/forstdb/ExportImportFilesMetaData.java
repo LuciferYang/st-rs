@@ -20,11 +20,35 @@ package org.forstdb;
 
 /**
  * Metadata returned from an SST file export operation.
+ *
+ * <p>Upstream RocksDB stores everything on the native side and exposes
+ * an opaque handle. st-rs has no engine-side export yet, so we keep
+ * the SST file paths on the Java side and let
+ * {@link RocksDB#createColumnFamilyWithImport} flatten them into a path
+ * array before crossing JNI. Once a real export path lands the storage
+ * can be moved native-side without changing this class's signature.
  */
 public class ExportImportFilesMetaData extends RocksObject {
 
+    private final java.util.List<String> sstFiles;
+
     protected ExportImportFilesMetaData(final long handle) {
         super(handle);
+        this.sstFiles = java.util.Collections.emptyList();
+    }
+
+    /**
+     * Construct from an explicit list of SST file paths. Convenient
+     * for tests and for callers that already know the file layout
+     * (e.g. ones that read it from a checkpoint manifest).
+     */
+    public ExportImportFilesMetaData(final java.util.List<String> sstFiles) {
+        super(0L);
+        this.sstFiles = java.util.List.copyOf(sstFiles);
+    }
+
+    public java.util.List<String> getSstFiles() {
+        return sstFiles;
     }
 
     @Override

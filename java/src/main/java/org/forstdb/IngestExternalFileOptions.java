@@ -19,31 +19,25 @@
 package org.forstdb;
 
 /**
- * Options for importing column families from exported metadata.
+ * Options controlling {@link RocksDB#ingestExternalFile} behavior.
+ *
+ * <p>Pure Java; the values are flattened to scalars before crossing the
+ * JNI boundary.
  */
-public class ImportColumnFamilyOptions extends RocksObject {
+public class IngestExternalFileOptions {
 
     private boolean moveFiles = false;
-
-    public ImportColumnFamilyOptions() {
-        super(0);
-    }
 
     public boolean getMoveFiles() {
         return moveFiles;
     }
 
     /**
-     * If true, SST files are moved (renamed) into the DB directory rather
-     * than copied. Default: false.
+     * If true, the SST files are moved (renamed) into the DB directory
+     * instead of copied. Default: false.
      */
-    public ImportColumnFamilyOptions setMoveFiles(final boolean flag) {
-        this.moveFiles = flag;
+    public IngestExternalFileOptions setMoveFiles(final boolean moveFiles) {
+        this.moveFiles = moveFiles;
         return this;
-    }
-
-    @Override
-    protected void disposeInternal(final long handle) {
-        // no native resource yet
     }
 }

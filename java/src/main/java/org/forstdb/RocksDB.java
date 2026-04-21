@@ -229,6 +229,58 @@ public class RocksDB extends RocksObject {
         dropColumnFamily0(nativeHandle_, cf.getNativeHandle());
     }
 
+    /**
+     * Ingest one or more externally-built SST files into an existing
+     * column family. Used by Flink's keyed-state restore path.
+     */
+    public void ingestExternalFile(
+            final ColumnFamilyHandle cf,
+            final java.util.List<String> paths,
+            final IngestExternalFileOptions opts) {
+        ingestExternalFile(
+                nativeHandle_,
+                cf.getNativeHandle(),
+                paths.toArray(new String[0]),
+                opts != null && opts.getMoveFiles());
+    }
+
+    /**
+     * Create a new column family and atomically ingest the SSTs listed
+     * in {@code metadata} into it. Mirrors Flink's restore call:
+     * {@code db.createColumnFamilyWithImport(desc, opts, metadataList)}.
+     *
+     * <p>The descriptor's CF options are forwarded; per-CF tuning is not
+     * yet honored by the engine but the descriptor is stored on the
+     * returned handle (see {@link ColumnFamilyHandle#getDescriptor()}).
+     */
+    public ColumnFamilyHandle createColumnFamilyWithImport(
+            final ColumnFamilyDescriptor desc,
+            final ImportColumnFamilyOptions opts,
+            final java.util.List<ExportImportFilesMetaData> metadata) {
+        // Flatten every metadata's SST list into a single path array.
+        final java.util.List<String> allPaths = new java.util.ArrayList<>();
+        for (final ExportImportFilesMetaData md : metadata) {
+            allPaths.addAll(md.getSstFiles());
+        }
+        final long cfHandle = createColumnFamilyWithImport(
+                nativeHandle_,
+                desc.getNameAsString(),
+                allPaths.toArray(new String[0]),
+                opts != null && opts.getMoveFiles());
+        // Mirror createColumnFamily(desc): attach a configured filter
+        // factory if one rode along on the descriptor's options.
+        if (desc.getOptions() != null
+                && desc.getOptions().getCompactionFilterFactory() != null) {
+            final long factoryHandle = desc.getOptions()
+                    .getCompactionFilterFactory()
+                    .getNativeFactoryHandle();
+            if (factoryHandle != 0L) {
+                setCompactionFilterFactory(nativeHandle_, cfHandle, factoryHandle);
+            }
+        }
+        return new ColumnFamilyHandle(cfHandle, desc);
+    }
+
     // --- Iterators ---
 
     public RocksIterator newIterator(final ColumnFamilyHandle cf) {
@@ -277,7 +329,9 @@ public class RocksDB extends RocksObject {
             final int largestLen = buf.getInt();
             final byte[] largest = new byte[largestLen];
             buf.get(largest);
-            final String fileName = String.valueOf(fileNumber) + ".sst";
+            // Mirror the engine's filename format (6-digit zero-padded —
+            // see make_table_file_name in src/file/filename.rs).
+            final String fileName = String.format("%06d.sst", fileNumber);
             result.add(new LiveFileMetaData(cfName, fileName, level,
                     fileSize, smallest, largest));
         }
@@ -395,6 +449,12 @@ public class RocksDB extends RocksObject {
         }
         setCompactionFilterFactory(nativeHandle_, cf.getNativeHandle(), handle);
     }
+
+    private static native void ingestExternalFile(long dbHandle, long cfHandle,
+            String[] paths, boolean moveFiles);
+
+    private static native long createColumnFamilyWithImport(long dbHandle,
+            String name, String[] paths, boolean moveFiles);
 
     private static native void waitForPendingWork(long dbHandle);
 

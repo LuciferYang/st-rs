@@ -1738,3 +1738,133 @@ pub extern "system" fn Java_org_forstdb_RocksDB_setCompactionFilterFactory(
         throw_rocks_exception(&mut env, &e.to_string());
     }
 }
+
+// ---------------------------------------------------------------------------
+// SST ingestion (org.forstdb.RocksDB.ingestExternalFile +
+// createColumnFamilyWithImport)
+//
+// Used by Flink's ForStOperationUtils when restoring keyed state from a
+// checkpoint. The Java side hands us a list of SST file paths (already on
+// disk, produced earlier by an export / live-files snapshot). We hand those
+// to the engine's ingest_external_file or create_column_family_with_import.
+// ---------------------------------------------------------------------------
+
+fn read_string_array(
+    env: &mut JNIEnv,
+    paths: &jni::objects::JObjectArray,
+) -> Result<Vec<String>, String> {
+    let len = env
+        .get_array_length(paths)
+        .map_err(|e| format!("failed to read paths length: {e}"))?
+        as usize;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let elem = env
+            .get_object_array_element(paths, i as i32)
+            .map_err(|e| format!("failed to read paths[{i}]: {e}"))?;
+        let jstr = jni::objects::JString::from(elem);
+        let s: String = env
+            .get_string(&jstr)
+            .map_err(|e| format!("failed to decode paths[{i}]: {e}"))?
+            .into();
+        out.push(s);
+    }
+    Ok(out)
+}
+
+/// `RocksDB.ingestExternalFile(long dbHandle, long cfHandle,
+///     String[] paths, boolean moveFiles)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_ingestExternalFile(
+    mut env: JNIEnv,
+    _this: JObject,
+    db_handle: jlong,
+    cf_handle: jlong,
+    paths: jni::objects::JObjectArray,
+    move_files: jni::sys::jboolean,
+) {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(db_handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null db handle");
+            return;
+        }
+    };
+    let cf = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
+        Some(cf) => cf,
+        None => {
+            throw_rocks_exception(&mut env, "null cf handle");
+            return;
+        }
+    };
+    let path_strs = match read_string_array(&mut env, &paths) {
+        Ok(v) => v,
+        Err(e) => {
+            throw_rocks_exception(&mut env, &e);
+            return;
+        }
+    };
+    let path_bufs: Vec<std::path::PathBuf> =
+        path_strs.iter().map(std::path::PathBuf::from).collect();
+    let path_refs: Vec<&std::path::Path> =
+        path_bufs.iter().map(|p| p.as_path()).collect();
+    let opts = st_rs::db::ingest_external_file::IngestExternalFileOptions {
+        move_files: move_files != 0,
+        ..Default::default()
+    };
+    if let Err(e) = db.ingest_external_file(&**cf, &path_refs, &opts) {
+        throw_rocks_exception(&mut env, &e.to_string());
+    }
+}
+
+/// `RocksDB.createColumnFamilyWithImport(long dbHandle, String name,
+///     String[] paths, boolean moveFiles) -> long`
+///
+/// Creates a new CF and atomically ingests the listed SSTs into it.
+/// On any error the partial CF is dropped before throwing.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_createColumnFamilyWithImport(
+    mut env: JNIEnv,
+    _this: JObject,
+    db_handle: jlong,
+    name: JString,
+    paths: jni::objects::JObjectArray,
+    _move_files: jni::sys::jboolean,
+) -> jlong {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(db_handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null db handle");
+            return 0;
+        }
+    };
+    let cf_name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            throw_rocks_exception(&mut env, &format!("failed to decode CF name: {e}"));
+            return 0;
+        }
+    };
+    let path_strs = match read_string_array(&mut env, &paths) {
+        Ok(v) => v,
+        Err(e) => {
+            throw_rocks_exception(&mut env, &e);
+            return 0;
+        }
+    };
+    let path_bufs: Vec<std::path::PathBuf> =
+        path_strs.iter().map(std::path::PathBuf::from).collect();
+    let path_refs: Vec<&std::path::Path> =
+        path_bufs.iter().map(|p| p.as_path()).collect();
+    // Note: engine's create_column_family_with_import always copies
+    // (uses Default options). The move_files hint is accepted on the
+    // Java side for API compatibility but currently ignored.
+    let cf_opts = st_rs::api::options::ColumnFamilyOptions::default();
+    match db.create_column_family_with_import(&cf_name, &cf_opts, &path_refs) {
+        Ok(cf) => to_handle(cf),
+        Err(e) => {
+            throw_rocks_exception(&mut env, &e.to_string());
+            0
+        }
+    }
+}
