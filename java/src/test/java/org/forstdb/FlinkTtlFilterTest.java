@@ -64,11 +64,13 @@ class FlinkTtlFilterTest {
         // TTL 1 second; value-state means timestamp at offset 0.
         factory.configure(FlinkCompactionFilter.Config.createForValue(1000L, 0L));
 
-        // Engine's auto-compaction picker currently only scans the default
-        // CF; using it directly proves the JNI bridge end-to-end.
-        // (Custom-CF auto-compaction is a separate engine gap, not part of M2.)
-        final ColumnFamilyHandle cf = db.getDefaultColumnFamily();
-        db.setCompactionFilterFactory(cf, factory);
+        // Use a custom CF — same shape Flink uses for keyed state. M2.5
+        // taught the picker to scan all CFs, so the filter actually runs.
+        final ColumnFamilyOptions cfOpts = new ColumnFamilyOptions();
+        cfOpts.setCompactionFilterFactory(factory);
+        final ColumnFamilyDescriptor desc = new ColumnFamilyDescriptor(
+                "ttl-cf", cfOpts);
+        final ColumnFamilyHandle cf = db.createColumnFamily(desc);
 
         final long now = System.currentTimeMillis();
         final byte[] freshKey = "fresh".getBytes();

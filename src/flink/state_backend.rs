@@ -456,17 +456,23 @@ mod tests {
                 Some(u64::from_le_bytes(v[..8].try_into().unwrap()))
             });
 
-        // TTL = 1000ms. With a fixed clock at 5000ms, entries with
-        // timestamps <= 3999 should be dropped.
+        // TTL = 1s. set_ttl_compaction_filter uses SystemTime::now()
+        // for the clock, so timestamps must be expressed against
+        // wall-clock now rather than a synthetic origin.
         sb.set_ttl_compaction_filter(&*cf, 1000, extractor).unwrap();
 
-        // Write an expired entry (ts=1000, age = 5000-1000 = 4000 > 1000).
-        let mut expired_val = 1000u64.to_le_bytes().to_vec();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Expired: timestamped 60s in the past, well beyond the 1s TTL.
+        let mut expired_val = (now_ms - 60_000).to_le_bytes().to_vec();
         expired_val.extend_from_slice(b"expired-data");
         sb.put_cf(&*cf, b"old", &expired_val).unwrap();
 
-        // Write a fresh entry (ts=4500, age = 5000-4500 = 500 < 1000).
-        let mut fresh_val = 4500u64.to_le_bytes().to_vec();
+        // Fresh: timestamped now, well inside the TTL.
+        let mut fresh_val = now_ms.to_le_bytes().to_vec();
         fresh_val.extend_from_slice(b"fresh-data");
         sb.put_cf(&*cf, b"new", &fresh_val).unwrap();
 
@@ -477,14 +483,13 @@ mod tests {
             sb.wait_for_pending_work().unwrap();
         }
 
-        // The fresh entry should survive; the expired one may or may
-        // not be dropped (depends on whether compaction ran and
-        // whether the TTL filter's clock captured the right time).
-        // At minimum, the fresh entry must be present.
+        // After M2.5 the picker scans custom CFs too, so the filter
+        // actually runs and the expired entry is gone; fresh survives.
         assert_eq!(
             sb.get_cf(&*cf, b"new").unwrap(),
             Some(fresh_val.clone())
         );
+        assert_eq!(sb.get_cf(&*cf, b"old").unwrap(), None);
 
         sb.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

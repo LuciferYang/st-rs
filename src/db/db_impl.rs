@@ -2508,50 +2508,64 @@ impl DbImpl {
     /// Layer 4f allows only one background compaction at a time.
     /// A future layer can queue multiple plans.
     fn maybe_pick_compaction(&self, state: &mut DbState) -> Option<CompactionPlan> {
-        // Collect everything we need from the immutable borrow of
-        // the CF first, then do the mutable state updates.
-        let (inputs, input_numbers, input_levels, filter_factory, merge_operator) = {
-            let cf = state.default_cf();
-            if cf.pending_compaction.is_some() {
-                return None;
-            }
-            if cf.l0.len() < Self::COMPACTION_TRIGGER {
-                return None;
-            }
-            let mut inputs: Vec<Arc<BlockBasedTableReader>> = Vec::new();
-            let mut input_numbers: Vec<u64> = Vec::new();
-            let mut input_levels: Vec<u32> = Vec::new();
-            let mut union_smallest: Vec<u8> = Vec::new();
-            let mut union_largest: Vec<u8> = Vec::new();
-            for entry in &cf.l0 {
-                inputs.push(Arc::clone(&entry.reader));
-                input_numbers.push(entry.number);
-                input_levels.push(0);
-                if union_smallest.is_empty() || entry.smallest_key < union_smallest {
-                    union_smallest.clone_from(&entry.smallest_key);
+        // Scan every CF and pick the first one that's both over the L0
+        // trigger and not already compacting. Default-CF-first ordering
+        // is preserved by sorting CF ids ascending (DEFAULT_CF_ID == 0).
+        let mut cf_ids: Vec<ColumnFamilyId> =
+            state.column_families.keys().copied().collect();
+        cf_ids.sort_unstable();
+
+        let (cf_id, inputs, input_numbers, input_levels, filter_factory,
+             merge_operator) = 'pick: {
+            for id in cf_ids {
+                let cf = match state.column_families.get(&id) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                if cf.pending_compaction.is_some() {
+                    continue;
                 }
-                if union_largest.is_empty() || entry.largest_key > union_largest {
-                    union_largest.clone_from(&entry.largest_key);
+                if cf.l0.len() < Self::COMPACTION_TRIGGER {
+                    continue;
                 }
-            }
-            for entry in &cf.l1 {
-                if entry.smallest_key <= union_largest
-                    && entry.largest_key >= union_smallest
-                {
+                let mut inputs: Vec<Arc<BlockBasedTableReader>> = Vec::new();
+                let mut input_numbers: Vec<u64> = Vec::new();
+                let mut input_levels: Vec<u32> = Vec::new();
+                let mut union_smallest: Vec<u8> = Vec::new();
+                let mut union_largest: Vec<u8> = Vec::new();
+                for entry in &cf.l0 {
                     inputs.push(Arc::clone(&entry.reader));
                     input_numbers.push(entry.number);
-                    input_levels.push(1);
+                    input_levels.push(0);
+                    if union_smallest.is_empty() || entry.smallest_key < union_smallest {
+                        union_smallest.clone_from(&entry.smallest_key);
+                    }
+                    if union_largest.is_empty() || entry.largest_key > union_largest {
+                        union_largest.clone_from(&entry.largest_key);
+                    }
                 }
+                for entry in &cf.l1 {
+                    if entry.smallest_key <= union_largest
+                        && entry.largest_key >= union_smallest
+                    {
+                        inputs.push(Arc::clone(&entry.reader));
+                        input_numbers.push(entry.number);
+                        input_levels.push(1);
+                    }
+                }
+                let ff = cf.compaction_filter_factory.as_ref().map(Arc::clone);
+                let mo = cf.merge_operator.as_ref().map(Arc::clone);
+                break 'pick (id, inputs, input_numbers, input_levels, ff, mo);
             }
-            let ff = cf.compaction_filter_factory.as_ref().map(Arc::clone);
-            let mo = cf.merge_operator.as_ref().map(Arc::clone);
-            (inputs, input_numbers, input_levels, ff, mo)
+            return None;
         };
+
         // Now safe to mutate state.
         let out_number = state.next_file_number;
         state.next_file_number += 1;
         let min_snap_seq = state.min_snap_seq();
         Some(CompactionPlan {
+            cf_id,
             out_number,
             inputs,
             input_numbers,
@@ -2600,6 +2614,10 @@ struct FlushSetup {
 /// inside the closure scheduled on `Priority::Bottom` by
 /// [`DbImpl::schedule_compaction`].
 struct CompactionPlan {
+    /// Column family this plan is for. The picker scans every CF and
+    /// returns the first one over threshold; schedule/run/wait must
+    /// honor this rather than assuming the default CF.
+    cf_id: ColumnFamilyId,
     /// File number reserved for the compaction output.
     out_number: u64,
     /// Table readers for the input SSTs.
@@ -2741,7 +2759,11 @@ impl DbImpl {
     fn schedule_compaction(&self, plan: CompactionPlan) {
         {
             let mut state = self.state.lock().unwrap();
-            state.default_cf_mut().pending_compaction = Some(plan.out_number);
+            // Mark the CF the plan came from as pending — was hard-coded
+            // to default before M2.5.
+            if let Ok(cf) = state.cf_mut(plan.cf_id) {
+                cf.pending_compaction = Some(plan.out_number);
+            }
         }
         let weak = self.weak_self();
         self.thread_pool.schedule(
@@ -2764,10 +2786,13 @@ impl DbImpl {
     /// `state.ssts` if the merge fails), so the next picker
     /// pass will try again.
     fn run_compaction_task(&self, plan: CompactionPlan) -> Result<()> {
+        let cf_id = plan.cf_id;
         let result = self.run_compaction_inner(plan);
         {
             let mut state = self.state.lock().unwrap();
-            state.default_cf_mut().pending_compaction = None;
+            if let Ok(cf) = state.cf_mut(cf_id) {
+                cf.pending_compaction = None;
+            }
         }
         self.flush_done.notify_all();
         result
@@ -2779,6 +2804,7 @@ impl DbImpl {
     /// a private helper in case tests need it) and the
     /// background task.
     fn run_compaction_inner(&self, plan: CompactionPlan) -> Result<()> {
+        let cf_id = plan.cf_id;
         let out_number = plan.out_number;
         let inputs = plan.inputs;
         let input_numbers = plan.input_numbers;
@@ -2811,17 +2837,18 @@ impl DbImpl {
         // Swap inputs for the output under the lock.
         let mut state = self.state.lock().unwrap();
         {
-            let cf = state.default_cf_mut();
+            let cf = state.cf_mut(cf_id)?;
             cf.l0.retain(|e| !input_numbers.contains(&e.number));
             cf.l1.retain(|e| !input_numbers.contains(&e.number));
         }
 
-        // Build the VersionEdit for deleted + new files.
+        // Build the VersionEdit for deleted + new files. The CF id matches
+        // the plan's CF (was hard-coded to DEFAULT_CF_ID before M2.5).
         let deleted_files: Vec<(u32, u64)> = input_numbers.iter().enumerate()
             .map(|(i, &n)| (input_levels[i], n))
             .collect();
         let mut edit = VersionEdit {
-            column_family_id: Some(DEFAULT_CF_ID),
+            column_family_id: Some(cf_id),
             deleted_files,
             ..Default::default()
         };
@@ -2848,7 +2875,7 @@ impl DbImpl {
                 largest_key: largest.clone(),
                 level: 1,
             };
-            let cf = state.default_cf_mut();
+            let cf = state.cf_mut(cf_id)?;
             let pos = cf.l1.partition_point(|e| e.smallest_key < smallest);
             cf.l1.insert(pos, new_entry);
 
