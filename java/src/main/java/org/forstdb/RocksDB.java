@@ -209,6 +209,18 @@ public class RocksDB extends RocksObject {
             throws RocksDBException {
         final long cfHandle = createColumnFamily(
                 nativeHandle_, desc.getNameAsString());
+        // If the descriptor's options carry a configured Flink TTL filter
+        // factory, attach it to the freshly created CF so subsequent
+        // compactions invoke it.
+        if (desc.getOptions() != null
+                && desc.getOptions().getCompactionFilterFactory() != null) {
+            final long factoryHandle = desc.getOptions()
+                    .getCompactionFilterFactory()
+                    .getNativeFactoryHandle();
+            if (factoryHandle != 0L) {
+                setCompactionFilterFactory(nativeHandle_, cfHandle, factoryHandle);
+            }
+        }
         return new ColumnFamilyHandle(cfHandle, desc);
     }
 
@@ -363,6 +375,49 @@ public class RocksDB extends RocksObject {
 
     private static native void releaseSnapshot(long dbHandle,
             long snapshotHandle);
+
+    private static native void setCompactionFilterFactory(
+            long dbHandle, long cfHandle, long factoryHandle);
+
+    /**
+     * Attach a Flink TTL compaction-filter factory (built via
+     * {@link FlinkCompactionFilter.FlinkCompactionFilterFactory#configure})
+     * to an existing column family. Subsequent compactions on that CF
+     * will run the filter.
+     */
+    public void setCompactionFilterFactory(
+            final ColumnFamilyHandle cf,
+            final FlinkCompactionFilter.FlinkCompactionFilterFactory factory) {
+        final long handle = factory.getNativeFactoryHandle();
+        if (handle == 0L) {
+            throw new IllegalStateException(
+                    "factory not configured — call configure(Config) first");
+        }
+        setCompactionFilterFactory(nativeHandle_, cf.getNativeHandle(), handle);
+    }
+
+    private static native void waitForPendingWork(long dbHandle);
+
+    /**
+     * Block until any pending background flush + compaction has completed.
+     * Useful in tests that need to observe post-compaction state without
+     * sleep races.
+     */
+    public void waitForPendingWork() {
+        waitForPendingWork(nativeHandle_);
+    }
+
+    private static native long getDefaultColumnFamily(long dbHandle);
+
+    /**
+     * Returns a handle to the always-present default column family.
+     * Auto-compaction in the engine currently only scans this CF, so
+     * tests that want to observe filter/compaction effects should
+     * operate on it directly.
+     */
+    public ColumnFamilyHandle getDefaultColumnFamily() {
+        return new ColumnFamilyHandle(getDefaultColumnFamily(nativeHandle_));
+    }
 
     private static native long createColumnFamily(long dbHandle, String name)
             throws RocksDBException;

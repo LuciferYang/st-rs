@@ -1597,3 +1597,144 @@ pub extern "system" fn Java_org_forstdb_FlinkEnv_disposeFlinkEnv(
 ) {
     unsafe { drop_handle::<Arc<dyn st_rs::FileSystem>>(handle) };
 }
+
+// ---------------------------------------------------------------------------
+// FlinkCompactionFilterFactory (org.forstdb.FlinkCompactionFilter$FlinkCompactionFilterFactory)
+//
+// Wraps st-rs's pure-Rust TtlCompactionFilterFactory. The Java side calls
+// this once per CF after Flink populates its Config(stateType, ttl,
+// timestampOffset). The handle is then passed via setCompactionFilterFactory
+// to attach the factory to a column family.
+//
+// List state with element-level filtering (Flink's ListElementFilter)
+// requires a real reverse-JNI callback and is not supported yet.
+// ---------------------------------------------------------------------------
+
+/// `FlinkCompactionFilterFactory.createFlinkTtlFactory(long ttlMillis,
+///     int timestampOffset) -> long`
+///
+/// Builds a TTL filter factory that extracts an 8-byte big-endian
+/// timestamp at `timestampOffset` of each value and removes entries
+/// older than `now - ttl`.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlinkCompactionFilter_00024FlinkCompactionFilterFactory_createFlinkTtlFactory(
+    _env: JNIEnv,
+    _class: JClass,
+    ttl_millis: jlong,
+    timestamp_offset: jint,
+) -> jlong {
+    let offset = timestamp_offset as usize;
+    let extractor: std::sync::Arc<st_rs::flink::compaction_filter::TimestampExtractor> =
+        std::sync::Arc::new(move |value: &[u8]| -> Option<u64> {
+            if value.len() < offset + 8 {
+                return None;
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&value[offset..offset + 8]);
+            Some(u64::from_be_bytes(buf))
+        });
+    let clock: Box<dyn Fn() -> u64 + Send + Sync> = Box::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    });
+    let factory: Arc<dyn st_rs::CompactionFilterFactory> = Arc::new(
+        st_rs::TtlCompactionFilterFactory::new(ttl_millis as u64, extractor, clock),
+    );
+    to_handle(factory)
+}
+
+/// `FlinkCompactionFilterFactory.disposeFlinkTtlFactory(long handle)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlinkCompactionFilter_00024FlinkCompactionFilterFactory_disposeFlinkTtlFactory(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    unsafe { drop_handle::<Arc<dyn st_rs::CompactionFilterFactory>>(handle) };
+}
+
+/// `RocksDB.getDefaultColumnFamily(long dbHandle) -> long`
+///
+/// Returns a handle to the always-present default CF. Tests use this
+/// when they need to attach a per-CF feature (compaction filter, etc.)
+/// to the default CF without going through the descriptor path.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_getDefaultColumnFamily(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jlong {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return 0;
+        }
+    };
+    to_handle(db.default_column_family())
+}
+
+/// `RocksDB.waitForPendingWork(long dbHandle)` — blocks until any
+/// pending background flush + compaction has completed. Tests use this
+/// to assert post-compaction state without sleep races.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_waitForPendingWork(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return;
+        }
+    };
+    if let Err(e) = db.wait_for_pending_work() {
+        throw_rocks_exception(&mut env, &e.to_string());
+    }
+}
+
+/// `RocksDB.setCompactionFilterFactory(long dbHandle, long cfHandle,
+///     long factoryHandle)`
+///
+/// Attaches the factory referenced by `factoryHandle` to the column
+/// family referenced by `cfHandle`. Subsequent compactions on that CF
+/// will run the factory's filter.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_setCompactionFilterFactory(
+    mut env: JNIEnv,
+    _this: JObject,
+    db_handle: jlong,
+    cf_handle: jlong,
+    factory_handle: jlong,
+) {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(db_handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null db handle");
+            return;
+        }
+    };
+    let cf = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
+        Some(cf) => cf,
+        None => {
+            throw_rocks_exception(&mut env, "null cf handle");
+            return;
+        }
+    };
+    let factory = match unsafe {
+        from_handle::<Arc<dyn st_rs::CompactionFilterFactory>>(factory_handle)
+    } {
+        Some(f) => Arc::clone(f),
+        None => {
+            throw_rocks_exception(&mut env, "null factory handle");
+            return;
+        }
+    };
+    if let Err(e) = db.set_compaction_filter_factory(&**cf, factory) {
+        throw_rocks_exception(&mut env, &e.to_string());
+    }
+}

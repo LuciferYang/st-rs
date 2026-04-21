@@ -156,6 +156,11 @@ public class ColumnFamilyOptions implements AutoCloseable {
         return this;
     }
 
+    public FlinkCompactionFilter.FlinkCompactionFilterFactory
+            getCompactionFilterFactory() {
+        return compactionFilterFactory;
+    }
+
     /**
      * Required by Flink's {@code ForStSyncKeyedStateBackend.dispose}, which
      * passes column-family options through a method reference that expects

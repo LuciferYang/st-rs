@@ -142,19 +142,44 @@ public class FlinkCompactionFilter extends AbstractCompactionFilter<Slice> {
      * FLINK-INTEGRATION-STATUS.md).
      */
     public static class FlinkCompactionFilterFactory
-            extends AbstractCompactionFilterFactory<FlinkCompactionFilter> {
+            extends AbstractCompactionFilterFactory<FlinkCompactionFilter>
+            implements AutoCloseable {
+
+        static {
+            NativeLibraryLoader.load();
+        }
 
         private final TimeProvider timeProvider;
         private final Logger logger;
+        private long nativeFactoryHandle;
 
         public FlinkCompactionFilterFactory(
                 final TimeProvider timeProvider, final Logger logger) {
             this.timeProvider = timeProvider;
             this.logger = logger;
+            this.nativeFactoryHandle = 0L;
         }
 
-        public void configure(final Config config) {
-            // Accepted for API compatibility — engine wiring lands in M2.
+        /**
+         * Build the native TTL filter factory from the Flink-supplied
+         * {@link Config}. Called once per CF before
+         * {@code setCompactionFilterFactory}. List state with element-level
+         * filtering is not yet supported (silently skipped).
+         */
+        public synchronized void configure(final Config config) {
+            if (nativeFactoryHandle != 0L) {
+                return;
+            }
+            if (config == null || config.stateType == StateType.Disabled
+                    || config.stateType == StateType.List) {
+                return;
+            }
+            nativeFactoryHandle = createFlinkTtlFactory(
+                    config.ttl, config.timestampOffset);
+        }
+
+        long getNativeFactoryHandle() {
+            return nativeFactoryHandle;
         }
 
         @Override
@@ -167,5 +192,18 @@ public class FlinkCompactionFilter extends AbstractCompactionFilter<Slice> {
         public String name() {
             return "FlinkCompactionFilterFactory";
         }
+
+        @Override
+        public synchronized void close() {
+            if (nativeFactoryHandle != 0L) {
+                disposeFlinkTtlFactory(nativeFactoryHandle);
+                nativeFactoryHandle = 0L;
+            }
+        }
+
+        private static native long createFlinkTtlFactory(
+                long ttlMillis, int timestampOffset);
+
+        private static native void disposeFlinkTtlFactory(long handle);
     }
 }
