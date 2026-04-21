@@ -30,6 +30,7 @@ import org.apache.flink.test.junit5.MiniClusterExtension;
 import org.apache.flink.util.Collector;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -39,6 +40,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -64,6 +66,7 @@ class ForStBackendSmokeIT {
                     .build());
 
     @Test
+    @Timeout(value = 3, unit = TimeUnit.MINUTES)
     void valueStateAcrossKeyedStream(@TempDir Path checkpointDir) throws Exception {
         final Configuration jobConfig = new Configuration();
         // Flink 2.x: state backend is selected via config, not env.setStateBackend.

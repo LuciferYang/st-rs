@@ -146,6 +146,7 @@ jobs:
         run: cd java && mvn install -DskipTests -q
 
       - name: Run Flink integration tests
+        timeout-minutes: 20
         run: |
           cd java-flink-it && \
           mvn test -Djava.library.path=../target/debug -B

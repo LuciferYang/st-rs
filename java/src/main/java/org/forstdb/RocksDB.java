@@ -36,6 +36,16 @@ public class RocksDB extends RocksObject {
         NativeLibraryLoader.load();
     }
 
+    /**
+     * Compatibility shim for Flink's {@code ForStStateBackend}, which
+     * calls {@code RocksDB.loadLibrary()} during backend init. The actual
+     * load already happened in the static initializer above; this method
+     * just ensures the symbol exists for callers that look it up by name.
+     */
+    public static void loadLibrary() {
+        NativeLibraryLoader.load();
+    }
+
     private WriteOptions defaultWriteOptions = null;
     private ReadOptions defaultReadOptions = null;
 

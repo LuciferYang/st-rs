@@ -45,6 +45,26 @@ public class NativeLibraryLoader {
 
     private static final String LIB_NAME = "st_rs_jni";
     private static volatile boolean loaded = false;
+    private static final NativeLibraryLoader INSTANCE = new NativeLibraryLoader();
+
+    /**
+     * Singleton accessor for compatibility with Flink's
+     * {@code ForStStateBackend}, which retrieves the loader as
+     * {@code NativeLibraryLoader.getInstance().loadLibrary(tmpDir)}.
+     */
+    public static NativeLibraryLoader getInstance() {
+        return INSTANCE;
+    }
+
+    /**
+     * Compatibility shim for Flink's {@code ForStStateBackend}, which calls
+     * this with a temporary directory hint for native lib extraction. We
+     * ignore the hint and defer to {@link #load()}'s standard strategy
+     * (java.library.path, then JAR extraction to the system temp dir).
+     */
+    public synchronized void loadLibrary(final String tmpDir) throws IOException {
+        load();
+    }
 
     /**
      * Load the native library. Safe to call multiple times.
