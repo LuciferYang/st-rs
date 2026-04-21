@@ -865,6 +865,9 @@ impl DbImpl {
         &self.path
     }
 
+    /// Return the file number of the active MANIFEST, or 0 if no
+    /// MANIFEST has been created yet. Used by checkpoint to know
+    /// which MANIFEST file to copy.
     pub fn manifest_file_number(&self) -> u64 {
         let state = self.state.lock().unwrap();
         state.version_set.manifest_file_number()
