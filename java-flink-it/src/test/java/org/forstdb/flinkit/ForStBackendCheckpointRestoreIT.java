@@ -98,9 +98,13 @@ class ForStBackendCheckpointRestoreIT {
                 Types.STRING);
 
         env1.fromSource(src1, WatermarkStrategy.noWatermarks(), "datagen")
+                .uid("phase1-datagen")
                 .keyBy(s -> s)
                 .process(new CountingFn())
-                .print();
+                // Stable UID so phase 2 picks up this operator's state.
+                .uid("counter")
+                .print()
+                .uid("phase1-print");
 
         System.out.println("[IT] phase=1 step=executeAsync.before");
         final JobClient client1 = env1.executeAsync("phase 1 - build state");
@@ -141,6 +145,10 @@ class ForStBackendCheckpointRestoreIT {
         // ---------- Phase 2: start from savepoint, verify continuity ----
         final Configuration cfg2 = baseConfig(checkpointDir);
         cfg2.set(StateRecoveryOptions.SAVEPOINT_PATH, savepointPath);
+        // Phase 2 uses a different (bounded) source, so the savepoint's
+        // datagen operator state is unmatched. Allow it to be ignored —
+        // we only care about restoring the keyed state on `counter`.
+        cfg2.set(StateRecoveryOptions.SAVEPOINT_IGNORE_UNCLAIMED_STATE, true);
         final StreamExecutionEnvironment env2 =
                 StreamExecutionEnvironment.getExecutionEnvironment(cfg2);
         env2.setParallelism(2);
@@ -149,9 +157,16 @@ class ForStBackendCheckpointRestoreIT {
         // ticks exactly once. If state was restored, the next value
         // for each key must be > 1 — proving phase 1's writes survived.
         env2.fromData(Arrays.asList(KEY_RING))
+                // Different UID so the savepoint's datagen state stays
+                // unmatched (and is ignored thanks to the config above).
+                .uid("phase2-collection-source")
                 .keyBy(s -> s)
                 .process(new RestoredCountingFn())
-                .print();
+                // SAME UID as phase 1's process operator — the keyed
+                // state is restored under this UID.
+                .uid("counter")
+                .print()
+                .uid("phase2-print");
 
         System.out.println("[IT] phase=2 step=executeAsync.before");
         final JobClient client2 = env2.executeAsync("phase 2 - restore");
