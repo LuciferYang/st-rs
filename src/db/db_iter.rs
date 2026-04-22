@@ -355,11 +355,78 @@ impl<'a> UserKeyIter for SstUserKeyIter<'a> {
 /// Returned by [`crate::db::db_impl::DbImpl::iter`]. Owns its own
 /// snapshot of the engine state, so it survives concurrent writes
 /// to the engine without interference.
+///
+/// # Two construction modes
+///
+/// - **Eager** ([`Self::from_snapshot`] etc.): merges every source
+///   into a single `Vec` at construction time. O(N) memory; safe for
+///   small / test workloads where N is bounded.
+/// - **Streaming** ([`Self::from_arcs`]): owns an `Arc` to each
+///   source and refills a bounded chunk on demand inside `next()` /
+///   `seek()`. O(chunk_size) steady-state memory. The path Flink
+///   needs for `MapState` / `ListState` over multi-GB data.
+///
+/// Forward iteration stays chunked end-to-end. The first backward
+/// op (`prev` / `seek_to_last`) triggers a one-shot full materialise
+/// fallback — backward over multi-GB state isn't a Flink workload
+/// today and the simple fallback keeps the streaming code small.
 pub struct DbIterator {
+    /// Current chunk of (key, value) — tombstones already filtered.
+    /// In eager mode this is the full materialised set.
     items: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Current position. `None` means "invalid"; `Some(i)` means
-    /// `items[i]` is the current entry.
+    /// Position in `items`. `None` means "invalid". In streaming mode
+    /// `Some(items.len())` triggers a refill on the next forward step.
     pos: Option<usize>,
+    /// Streaming-mode state. `None` for eager iterators (legacy
+    /// constructors) — those keep `items` populated end-to-end.
+    streaming: Option<StreamingState>,
+}
+
+/// Snapshot-owned sources + chunk cursor. Lives inside a `DbIterator`
+/// when constructed via [`DbIterator::from_arcs`].
+struct StreamingState {
+    sources: IteratorSources,
+    /// Snapshot sequence — entries with seq > read_seq are invisible.
+    read_seq: SequenceNumber,
+    /// Maximum live entries per chunk. Bounds steady-state memory.
+    chunk_size: usize,
+    /// Refill cursor — what `refill()` should do next time it runs.
+    cursor: RefillCursor,
+    /// Lazy fallback for backward iteration. When the user calls
+    /// `prev` or `seek_to_last`, we materialise the entire snapshot
+    /// here and switch into eager backward mode.
+    backward_full: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+}
+
+/// Where the next `refill()` should start.
+enum RefillCursor {
+    /// Refill from the beginning of every source. Either initial state
+    /// or after `seek_to_first`.
+    Start,
+    /// Refill from `target` inclusive — set by `seek(target)`.
+    SeekFrom(Vec<u8>),
+    /// Refill from the key strictly greater than this — set after a
+    /// chunk is consumed, so the next chunk continues forward.
+    After(Vec<u8>),
+    /// All sources exhausted — no more refills.
+    Done,
+}
+
+/// Snapshot of every source the streaming iterator may need to read.
+struct IteratorSources {
+    /// Active memtable, eagerly cloned into a sorted user-key view at
+    /// iterator-construction time. Bounded by `write_buffer_size`
+    /// (default 64 MiB) so this is safe to materialise in full.
+    /// Each entry is `(user_key, value, is_tombstone)`.
+    memtable_view: Vec<(Vec<u8>, Vec<u8>, bool)>,
+    /// Same shape for the immutable memtable (a flush-in-progress one),
+    /// if present.
+    immutable_view: Vec<(Vec<u8>, Vec<u8>, bool)>,
+    /// SST readers in priority order (newest-first per L0, then L1).
+    /// Each refill creates a fresh `SstUserKeyIter` per reader and
+    /// drops it before returning, so the readers themselves stay
+    /// borrow-free between calls.
+    ssts: Vec<Arc<BlockBasedTableReader>>,
 }
 
 impl DbIterator {
@@ -369,6 +436,7 @@ impl DbIterator {
         Self {
             items: Vec::new(),
             pos: None,
+            streaming: None,
         }
     }
 
@@ -478,7 +546,52 @@ impl DbIterator {
             .filter(|(_, v)| !v.is_empty())
             .collect();
 
-        Ok(Self { items, pos: None })
+        Ok(Self {
+            items,
+            pos: None,
+            streaming: None,
+        })
+    }
+
+    /// Default chunk size for [`Self::from_arcs`] — enough to hide
+    /// per-refill overhead while staying small enough that a single
+    /// chunk fits comfortably in L2 cache.
+    pub const DEFAULT_CHUNK_SIZE: usize = 1024;
+
+    /// Build a streaming `DbIterator` that owns `Arc`s to its sources
+    /// and refills a bounded chunk on demand. Use this on multi-GB
+    /// state — the eager constructors above materialise everything
+    /// into a single `Vec` and OOM at scale.
+    ///
+    /// Memtables are still snapshot-cloned at construction (bounded by
+    /// `write_buffer_size`); only the SST traversal is incremental.
+    pub fn from_arcs(
+        memtable: &MemTable,
+        immutable: Option<&MemTable>,
+        ssts: Vec<Arc<BlockBasedTableReader>>,
+        read_seq: SequenceNumber,
+        chunk_size: usize,
+    ) -> Self {
+        let memtable_view = collect_memtable_view(memtable, read_seq);
+        let immutable_view = immutable
+            .map(|m| collect_memtable_view(m, read_seq))
+            .unwrap_or_default();
+        let sources = IteratorSources {
+            memtable_view,
+            immutable_view,
+            ssts,
+        };
+        Self {
+            items: Vec::new(),
+            pos: None,
+            streaming: Some(StreamingState {
+                sources,
+                read_seq,
+                chunk_size,
+                cursor: RefillCursor::Start,
+                backward_full: None,
+            }),
+        }
     }
 
     /// Number of live entries materialised.
@@ -510,11 +623,28 @@ impl DbIterator {
 
     /// Position at the first live key in the snapshot.
     pub fn seek_to_first(&mut self) {
+        if self.streaming.is_some() {
+            self.streaming.as_mut().unwrap().cursor = RefillCursor::Start;
+            self.refill();
+            return;
+        }
         self.pos = if self.items.is_empty() { None } else { Some(0) };
     }
 
-    /// Position at the last live key in the snapshot.
+    /// Position at the last live key in the snapshot. In streaming
+    /// mode this triggers a one-shot full materialisation; subsequent
+    /// `prev` walks the backward buffer.
     pub fn seek_to_last(&mut self) {
+        if self.streaming.is_some() {
+            self.materialise_backward();
+            // Reuse `items` for the backward pass.
+            self.pos = if self.items.is_empty() {
+                None
+            } else {
+                Some(self.items.len() - 1)
+            };
+            return;
+        }
         self.pos = if self.items.is_empty() {
             None
         } else {
@@ -524,6 +654,12 @@ impl DbIterator {
 
     /// Position at the first key `>= target`.
     pub fn seek(&mut self, target: &[u8]) {
+        if self.streaming.is_some() {
+            self.streaming.as_mut().unwrap().cursor =
+                RefillCursor::SeekFrom(target.to_vec());
+            self.refill();
+            return;
+        }
         let idx = self
             .items
             .partition_point(|(k, _)| k.as_slice() < target);
@@ -536,30 +672,279 @@ impl DbIterator {
 
     /// Position at the last key `<= target`.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
+        if self.streaming.is_some() {
+            self.materialise_backward();
+            // Fall through to the eager binary-search path below.
+        }
         let idx = self
             .items
             .partition_point(|(k, _)| k.as_slice() <= target);
         self.pos = if idx == 0 { None } else { Some(idx - 1) };
     }
 
-    /// Advance to the next live key.
+    /// Advance to the next live key. In streaming mode this refills
+    /// the chunk transparently when the current one runs out.
     pub fn next(&mut self) {
         if let Some(i) = self.pos {
             let next = i + 1;
-            self.pos = if next >= self.items.len() {
-                None
-            } else {
-                Some(next)
-            };
+            if next < self.items.len() {
+                self.pos = Some(next);
+                return;
+            }
+            // End of current chunk. In streaming mode, try to refill.
+            if self.streaming.is_some() {
+                let last_key = self.items[i].0.clone();
+                let s = self.streaming.as_mut().unwrap();
+                // Avoid overwriting an already-Done cursor.
+                if !matches!(s.cursor, RefillCursor::Done) {
+                    s.cursor = RefillCursor::After(last_key);
+                }
+                self.refill();
+                return;
+            }
+            self.pos = None;
         }
     }
 
-    /// Step back to the previous live key.
+    /// Step back to the previous live key. Triggers full materialise
+    /// the first time it's called in streaming mode.
     pub fn prev(&mut self) {
+        if self.streaming.is_some() && self.streaming.as_ref().unwrap()
+                .backward_full.is_none() {
+            // Capture current key (if any) so we can re-position after
+            // switching to the backward buffer.
+            let cur_key = self.pos.map(|i| self.items[i].0.clone());
+            self.materialise_backward();
+            // Re-position at `cur_key` (or invalid if we were past end).
+            self.pos = match cur_key {
+                Some(k) => self
+                    .items
+                    .iter()
+                    .position(|(ik, _)| ik == &k),
+                None => None,
+            };
+        }
         if let Some(i) = self.pos {
             self.pos = if i == 0 { None } else { Some(i - 1) };
         }
     }
+
+    // --------- Streaming-mode internals ---------
+
+    /// Drain a fresh chunk from the underlying sources into `items`.
+    /// Resets `pos` to point at the first entry of the new chunk
+    /// (or to `None` if empty).
+    fn refill(&mut self) {
+        let s = match self.streaming.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        if matches!(s.cursor, RefillCursor::Done) {
+            self.items.clear();
+            self.pos = None;
+            return;
+        }
+
+        // Decide our seek target for this refill.
+        let (start_key, exclusive): (Option<&[u8]>, bool) = match &s.cursor {
+            RefillCursor::Start => (None, false),
+            RefillCursor::SeekFrom(k) => (Some(k.as_slice()), false),
+            RefillCursor::After(k) => (Some(k.as_slice()), true),
+            RefillCursor::Done => unreachable!(),
+        };
+
+        let chunk = build_chunk(
+            &s.sources,
+            s.read_seq,
+            start_key,
+            exclusive,
+            s.chunk_size,
+        );
+
+        // Update the cursor: if we filled less than chunk_size live
+        // entries AND nothing was skipped past, sources are exhausted.
+        // Otherwise advance after the last key we emitted.
+        match chunk.last_key.clone() {
+            Some(last) if chunk.live.len() == s.chunk_size => {
+                s.cursor = RefillCursor::After(last);
+            }
+            Some(_) => {
+                // We emitted fewer than chunk_size — sources exhausted.
+                s.cursor = RefillCursor::Done;
+            }
+            None => {
+                s.cursor = RefillCursor::Done;
+            }
+        }
+
+        self.items = chunk.live;
+        self.pos = if self.items.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+    }
+
+    /// Materialise the entire snapshot into `items` for backward
+    /// iteration. Idempotent — no-op once we've already done it.
+    fn materialise_backward(&mut self) {
+        let s = match self.streaming.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        if s.backward_full.is_some() {
+            // Already materialised — switch `items` to the cached buf.
+            self.items = self.streaming.as_ref().unwrap()
+                .backward_full.as_ref().unwrap().clone();
+            return;
+        }
+
+        // Drain everything in one big chunk.
+        let chunk = build_chunk(&s.sources, s.read_seq, None, false, usize::MAX);
+        let s = self.streaming.as_mut().unwrap();
+        s.backward_full = Some(chunk.live.clone());
+        s.cursor = RefillCursor::Done;
+        self.items = chunk.live;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming-mode helpers
+// ---------------------------------------------------------------------------
+
+/// One refill's worth of live (non-tombstone) entries plus the last
+/// user key the merge actually visited (which may be a tombstone, used
+/// to advance the cursor for the next refill).
+struct ChunkOutput {
+    /// Live entries in user-key order, ready to walk.
+    live: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Last user key consumed by this refill (live or tombstone).
+    /// `None` means "merge produced nothing" — no more data.
+    last_key: Option<Vec<u8>>,
+}
+
+/// Snapshot the memtable's contents into a sorted, deduplicated user-key
+/// view. Each output row is `(user_key, value, is_tombstone)`. The
+/// memtable-iter already surfaces only the newest visible version per
+/// user key for `read_seq`, so the output is a clean snapshot view.
+fn collect_memtable_view(
+    memtable: &MemTable,
+    read_seq: SequenceNumber,
+) -> Vec<(Vec<u8>, Vec<u8>, bool)> {
+    let mut out: Vec<(Vec<u8>, Vec<u8>, bool)> = Vec::new();
+    let mut it = MemtableUserKeyIter::new_at(memtable, read_seq);
+    it.seek_to_first();
+    while it.valid() {
+        let key = it.key().to_vec();
+        if it.is_tombstone() {
+            out.push((key, Vec::new(), true));
+        } else {
+            out.push((key, it.value().to_vec(), false));
+        }
+        it.next();
+    }
+    out
+}
+
+/// Merge memtable view + immutable view + SST iterators starting at
+/// `start_key` (or beginning if `None`). Honours newest-source-wins:
+/// memtable > immutable > SSTs in the order passed.
+///
+/// `chunk_size` caps the number of **live** entries returned. We may
+/// process more sources than that number (tombstones consume budget on
+/// the source side but not on the live counter).
+fn build_chunk(
+    sources: &IteratorSources,
+    read_seq: SequenceNumber,
+    start_key: Option<&[u8]>,
+    exclusive: bool,
+    chunk_size: usize,
+) -> ChunkOutput {
+    use std::collections::BTreeMap;
+
+    // Collect into a BTreeMap so we can deduplicate by user key with
+    // first-source-wins semantics. Only enumerate as many keys as we
+    // need to fill the chunk.
+    let mut map: BTreeMap<Vec<u8>, (Vec<u8>, bool)> = BTreeMap::new();
+    let mut last_key: Option<Vec<u8>> = None;
+
+    // Walk both memtable views in priority order. Inlined twice to
+    // sidestep the borrow checker (a closure would capture `map`
+    // mutably and conflict with the post-call live-count check).
+    for view in [&sources.memtable_view, &sources.immutable_view] {
+        if live_count(&map) >= chunk_size {
+            break;
+        }
+        let start_idx = match start_key {
+            None => 0,
+            Some(target) => {
+                let mut i = view.partition_point(|(k, _, _)| k.as_slice() < target);
+                if exclusive && i < view.len() && view[i].0.as_slice() == target {
+                    i += 1;
+                }
+                i
+            }
+        };
+        for (k, v, is_tomb) in &view[start_idx..] {
+            map.entry(k.clone())
+                .or_insert_with(|| (v.clone(), *is_tomb));
+            if last_key.as_deref().is_none_or(|lk| lk < k.as_slice()) {
+                last_key = Some(k.clone());
+            }
+            if live_count(&map) >= chunk_size {
+                break;
+            }
+        }
+    }
+
+    // SSTs in priority order. Each gets a fresh iterator scoped to
+    // this call — no borrow leaks back to the iterator struct.
+    for table in &sources.ssts {
+        if live_count(&map) >= chunk_size {
+            break;
+        }
+        let mut it = SstUserKeyIter::new_at(table.iter(), read_seq);
+        match start_key {
+            None => it.seek_to_first(),
+            Some(target) => {
+                it.seek(target);
+                if exclusive && it.valid() && it.key() == target {
+                    it.next();
+                }
+            }
+        }
+        while it.valid() {
+            let k = it.key().to_vec();
+            let is_tomb = it.is_tombstone();
+            map.entry(k.clone())
+                .or_insert_with(|| {
+                    if is_tomb {
+                        (Vec::new(), true)
+                    } else {
+                        (it.value().to_vec(), false)
+                    }
+                });
+            if last_key.as_deref().is_none_or(|lk| lk < k.as_slice()) {
+                last_key = Some(k);
+            }
+            if map.values().filter(|(_, t)| !t).count() >= chunk_size {
+                break;
+            }
+            it.next();
+        }
+    }
+
+    let live: Vec<(Vec<u8>, Vec<u8>)> = map
+        .into_iter()
+        .filter(|(_, (_, is_tomb))| !is_tomb)
+        .map(|(k, (v, _))| (k, v))
+        .collect();
+    ChunkOutput { live, last_key }
+}
+
+#[inline]
+fn live_count(map: &std::collections::BTreeMap<Vec<u8>, (Vec<u8>, bool)>) -> usize {
+    map.values().filter(|(_, t)| !t).count()
 }
 
 /// Helper: build a merging iterator over a memtable + a snapshot
@@ -769,5 +1154,98 @@ mod tests {
         assert_eq!(it.key(), b"only");
         it.prev();
         assert!(!it.valid());
+    }
+
+    // ---- Streaming-mode tests ----
+
+    #[test]
+    fn streaming_iter_walks_full_set_with_chunked_refills() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        // 100 keys, chunk_size=8 forces ~13 refills.
+        for i in 0..100 {
+            let k = format!("k{i:04}");
+            mt.add(i + 1, ValueType::Value, k.as_bytes(), k.as_bytes())
+                .unwrap();
+        }
+        let mut it = DbIterator::from_arcs(&mt, None, Vec::new(),
+                READ_AT_LATEST, 8);
+        it.seek_to_first();
+        let mut keys = Vec::new();
+        while it.valid() {
+            keys.push(String::from_utf8(it.key().to_vec()).unwrap());
+            it.next();
+        }
+        assert_eq!(keys.len(), 100);
+        assert_eq!(keys[0], "k0000");
+        assert_eq!(keys[99], "k0099");
+    }
+
+    #[test]
+    fn streaming_iter_skips_tombstones_across_chunks() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        for i in 0..20 {
+            let k = format!("k{i:04}");
+            // Even keys: live; odd keys: tombstone.
+            let vt = if i % 2 == 0 {
+                ValueType::Value
+            } else {
+                ValueType::Deletion
+            };
+            mt.add(i + 1, vt, k.as_bytes(), b"v").unwrap();
+        }
+        let mut it = DbIterator::from_arcs(&mt, None, Vec::new(),
+                READ_AT_LATEST, 4);
+        it.seek_to_first();
+        let mut keys = Vec::new();
+        while it.valid() {
+            keys.push(String::from_utf8(it.key().to_vec()).unwrap());
+            it.next();
+        }
+        // 10 even keys: k0000, k0002, ... k0018
+        assert_eq!(keys.len(), 10);
+        assert_eq!(keys.first().map(String::as_str), Some("k0000"));
+        assert_eq!(keys.last().map(String::as_str), Some("k0018"));
+    }
+
+    #[test]
+    fn streaming_iter_seek_skips_to_target() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        for i in 0..30 {
+            let k = format!("k{i:04}");
+            mt.add(i + 1, ValueType::Value, k.as_bytes(), b"v").unwrap();
+        }
+        let mut it = DbIterator::from_arcs(&mt, None, Vec::new(),
+                READ_AT_LATEST, 5);
+        it.seek(b"k0010");
+        let mut keys = Vec::new();
+        while it.valid() {
+            keys.push(String::from_utf8(it.key().to_vec()).unwrap());
+            it.next();
+        }
+        // Should yield k0010..k0029 (20 entries).
+        assert_eq!(keys.len(), 20);
+        assert_eq!(keys[0], "k0010");
+        assert_eq!(keys[19], "k0029");
+    }
+
+    #[test]
+    fn streaming_iter_backward_falls_back_to_full_materialise() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        for i in 0..10 {
+            let k = format!("k{i:04}");
+            mt.add(i + 1, ValueType::Value, k.as_bytes(), b"v").unwrap();
+        }
+        let mut it = DbIterator::from_arcs(&mt, None, Vec::new(),
+                READ_AT_LATEST, 3);
+        it.seek_to_last();
+        let mut keys = Vec::new();
+        while it.valid() {
+            keys.push(String::from_utf8(it.key().to_vec()).unwrap());
+            it.prev();
+        }
+        // Walked backward through all 10 keys.
+        assert_eq!(keys.len(), 10);
+        assert_eq!(keys.first().map(String::as_str), Some("k0009"));
+        assert_eq!(keys.last().map(String::as_str), Some("k0000"));
     }
 }

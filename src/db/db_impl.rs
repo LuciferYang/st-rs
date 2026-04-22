@@ -1936,12 +1936,15 @@ impl DbImpl {
         let state = self.state.lock().unwrap();
         let cf = state.default_cf();
         let ssts = Self::collect_all_ssts(&state);
-        let it = crate::db::db_iter::DbIterator::from_snapshot_with_immutable_at(
+        // Use the chunked streaming iterator so multi-GB state on
+        // disk doesn't OOM the iterator's working set.
+        let it = crate::db::db_iter::DbIterator::from_arcs(
             &cf.memtable,
             cf.immutable.as_deref(),
-            &ssts,
+            ssts,
             read_seq,
-        )?;
+            crate::db::db_iter::DbIterator::DEFAULT_CHUNK_SIZE,
+        );
         drop(state);
         Ok(it)
     }
@@ -1992,11 +1995,13 @@ impl DbImpl {
         let state = self.state.lock().unwrap();
         let cf = state.default_cf();
         let ssts = Self::collect_all_ssts(&state);
-        let it = crate::db::db_iter::DbIterator::from_snapshot_with_immutable(
+        let it = crate::db::db_iter::DbIterator::from_arcs(
             &cf.memtable,
             cf.immutable.as_deref(),
-            &ssts,
-        )?;
+            ssts,
+            crate::db::db_iter::READ_AT_LATEST,
+            crate::db::db_iter::DbIterator::DEFAULT_CHUNK_SIZE,
+        );
         drop(state);
         Ok(it)
     }
@@ -2027,11 +2032,13 @@ impl DbImpl {
         let state = self.state.lock().unwrap();
         let cf_state = state.cf(cf.id())?;
         let ssts = Self::collect_cf_ssts(cf_state);
-        let it = crate::db::db_iter::DbIterator::from_snapshot_with_immutable(
+        let it = crate::db::db_iter::DbIterator::from_arcs(
             &cf_state.memtable,
             cf_state.immutable.as_deref(),
-            &ssts,
-        )?;
+            ssts,
+            crate::db::db_iter::READ_AT_LATEST,
+            crate::db::db_iter::DbIterator::DEFAULT_CHUNK_SIZE,
+        );
         drop(state);
         Ok(it)
     }
