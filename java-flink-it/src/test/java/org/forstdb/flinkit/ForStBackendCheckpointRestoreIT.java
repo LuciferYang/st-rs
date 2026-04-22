@@ -113,8 +113,12 @@ class ForStBackendCheckpointRestoreIT {
         // savepoint path that phase 2 will restore from.
         System.out.println("[IT] phase=1 step=triggerSavepoint");
         final String savepointPath = client1
+                // ForSt-backed jobs only support NATIVE savepoints; the
+                // CANONICAL format errors with "does not support CANONICAL
+                // savepoints" because the native backend's snapshot writer
+                // can't produce the portable format.
                 .triggerSavepoint(savepointDir.toUri().toString(),
-                        SavepointFormatType.CANONICAL)
+                        SavepointFormatType.NATIVE)
                 .get(60, TimeUnit.SECONDS);
         System.out.println("[IT] phase=1 savepoint=" + savepointPath);
 
