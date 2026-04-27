@@ -75,6 +75,22 @@ public class RocksIterator extends RocksObject implements RocksIteratorInterface
         return value0(nativeHandle_);
     }
 
+    /**
+     * Vectorized read: pop up to {@code max} live `(key, value)`
+     * pairs from the current position and advance the iterator past
+     * them. Returns alternating {@code [key, value, key, value, ...]}
+     * — length is {@code 2 * actualCount}. An empty array means the
+     * iterator is exhausted.
+     *
+     * <p>Designed for the Velox / Gluten consumer that wants to
+     * amortise JNI-crossing cost across many keys per call. Equivalent
+     * to a loop of {@code key()/value()/next()} but pays the JNI cost
+     * once per batch instead of three times per key.
+     */
+    public byte[][] nextBatch(final int max) {
+        return nextBatch0(nativeHandle_, max);
+    }
+
     @Override
     protected void disposeInternal(final long handle) {
         disposeIterator(handle);
@@ -97,6 +113,8 @@ public class RocksIterator extends RocksObject implements RocksIteratorInterface
     private static native byte[] key0(long handle);
 
     private static native byte[] value0(long handle);
+
+    private static native byte[][] nextBatch0(long handle, int max);
 
     private static native void disposeIterator(long handle);
 }

@@ -1266,6 +1266,71 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_value0(
     }
 }
 
+/// `RocksIterator.nextBatch0(long handle, int max) -> byte[][]`
+///
+/// Vectorized read: returns up to `2 * max` byte arrays, alternating
+/// `[key, value, key, value, ...]`. Returns an empty array when the
+/// iterator is exhausted. Designed for the Velox / Gluten path that
+/// wants to amortise JNI-crossing cost across many keys per call.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksIterator_nextBatch0(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    max: jint,
+) -> jni::sys::jobjectArray {
+    if handle == 0 {
+        return std::ptr::null_mut();
+    }
+    let iter = unsafe { &mut *(handle as *mut st_rs::DbIterator) };
+    let cap = if max < 0 { 0 } else { max as usize };
+    let batch = iter.next_chunk(cap);
+
+    let byte_class = match env.find_class("[B") {
+        Ok(c) => c,
+        Err(e) => {
+            throw_rocks_exception(&mut env, &format!("find byte[]: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    let arr = match env.new_object_array(
+        (batch.len() * 2) as i32,
+        &byte_class,
+        JObject::null(),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            throw_rocks_exception(&mut env, &format!("new byte[][]: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    for (i, (k, v)) in batch.iter().enumerate() {
+        let k_arr = match env.byte_array_from_slice(k) {
+            Ok(a) => a,
+            Err(e) => {
+                throw_rocks_exception(&mut env, &format!("key bytes: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        let v_arr = match env.byte_array_from_slice(v) {
+            Ok(a) => a,
+            Err(e) => {
+                throw_rocks_exception(&mut env, &format!("value bytes: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        if let Err(e) = env.set_object_array_element(&arr, (i * 2) as i32, k_arr) {
+            throw_rocks_exception(&mut env, &format!("set key elem {i}: {e}"));
+            return std::ptr::null_mut();
+        }
+        if let Err(e) = env.set_object_array_element(&arr, (i * 2 + 1) as i32, v_arr) {
+            throw_rocks_exception(&mut env, &format!("set value elem {i}: {e}"));
+            return std::ptr::null_mut();
+        }
+    }
+    arr.into_raw()
+}
+
 /// `RocksIterator.disposeIterator(long handle)`
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_RocksIterator_disposeIterator(

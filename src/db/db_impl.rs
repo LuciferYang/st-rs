@@ -3443,6 +3443,35 @@ mod tests {
     }
 
     #[test]
+    fn iter_drains_5000_entries_with_chunked_next_chunk() {
+        // Mirror the failing Java BatchIteratorTest.drainsLargeDataset
+        // through the real DbImpl::put + iter path.
+        let dir = temp_dir("iter-5k");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        let n = 5000u64;
+        for i in 0..n {
+            let k = format!("k{i:06}");
+            db.put(k.as_bytes(), k.as_bytes()).unwrap();
+        }
+        let mut it = db.iter().unwrap();
+        it.seek_to_first();
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let batch = it.next_chunk(512);
+            if batch.is_empty() {
+                break;
+            }
+            for (k, _) in batch {
+                keys.push(k);
+            }
+        }
+        assert_eq!(keys.len() as u64, n,
+            "expected {n} keys, got {}", keys.len());
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn open_put_get() {
         let dir = temp_dir("basic");
         let db = DbImpl::open(&opts(), &dir).unwrap();

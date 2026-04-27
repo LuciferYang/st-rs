@@ -706,6 +706,55 @@ impl DbIterator {
         }
     }
 
+    /// Vectorized forward read: pop up to `max` live `(key, value)`
+    /// pairs from the current position and advance the iterator past
+    /// them. Returns fewer than `max` only when the iterator is
+    /// exhausted; an empty Vec means "no more entries".
+    ///
+    /// Designed for the Velox / Gluten consumer that wants to
+    /// amortise JNI-crossing cost across many keys per call. In
+    /// streaming mode this transparently spans multiple internal
+    /// refills if `max` exceeds the configured chunk size.
+    pub fn next_chunk(&mut self, max: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(max);
+        if max == 0 {
+            return out;
+        }
+        while out.len() < max {
+            // Drain whatever's left of the current chunk first.
+            if let Some(i) = self.pos {
+                let take = (max - out.len()).min(self.items.len() - i);
+                for j in 0..take {
+                    out.push(self.items[i + j].clone());
+                }
+                let new_i = i + take;
+                if new_i < self.items.len() {
+                    self.pos = Some(new_i);
+                    return out;
+                }
+                // Current chunk exhausted. In streaming mode, try a refill;
+                // otherwise we're done.
+                if self.streaming.is_some() {
+                    let last_key = self.items[self.items.len() - 1].0.clone();
+                    let s = self.streaming.as_mut().unwrap();
+                    if !matches!(s.cursor, RefillCursor::Done) {
+                        s.cursor = RefillCursor::After(last_key);
+                    }
+                    self.refill();
+                    if !self.valid() {
+                        return out;
+                    }
+                    continue;
+                }
+                self.pos = None;
+                return out;
+            }
+            // No position — done.
+            return out;
+        }
+        out
+    }
+
     /// Step back to the previous live key. Triggers full materialise
     /// the first time it's called in streaming mode.
     pub fn prev(&mut self) {
@@ -860,91 +909,91 @@ fn build_chunk(
     exclusive: bool,
     chunk_size: usize,
 ) -> ChunkOutput {
-    use std::collections::BTreeMap;
+    use crate::db::merging_iterator::{MergingIterator, UserKeyIter};
 
-    // Collect into a BTreeMap so we can deduplicate by user key with
-    // first-source-wins semantics. Only enumerate as many keys as we
-    // need to fill the chunk.
-    let mut map: BTreeMap<Vec<u8>, (Vec<u8>, bool)> = BTreeMap::new();
-    let mut last_key: Option<Vec<u8>> = None;
-
-    // Walk both memtable views in priority order. Inlined twice to
-    // sidestep the borrow checker (a closure would capture `map`
-    // mutably and conflict with the post-call live-count check).
-    for view in [&sources.memtable_view, &sources.immutable_view] {
-        if live_count(&map) >= chunk_size {
-            break;
-        }
-        let start_idx = match start_key {
-            None => 0,
-            Some(target) => {
-                let mut i = view.partition_point(|(k, _, _)| k.as_slice() < target);
-                if exclusive && i < view.len() && view[i].0.as_slice() == target {
-                    i += 1;
-                }
-                i
-            }
-        };
-        for (k, v, is_tomb) in &view[start_idx..] {
-            map.entry(k.clone())
-                .or_insert_with(|| (v.clone(), *is_tomb));
-            if last_key.as_deref().is_none_or(|lk| lk < k.as_slice()) {
-                last_key = Some(k.clone());
-            }
-            if live_count(&map) >= chunk_size {
-                break;
-            }
-        }
+    // True k-way merge across all sources. Collecting into a BTreeMap
+    // doesn't bound the chunk correctly when one source has keys far
+    // past where the chunk should end (a tiny immutable holding the
+    // newest key was producing 1024-key chunks plus that one key, and
+    // the cursor then skipped past the ~3000 SST keys in between).
+    //
+    // The MergingIterator's borrows are local to this stack frame —
+    // both the SST iterators and the view adapters are dropped here,
+    // so no self-referential lifetime leaks back to DbIterator.
+    let mut srcs: Vec<Box<dyn UserKeyIter + '_>> = Vec::new();
+    if !sources.memtable_view.is_empty() {
+        srcs.push(Box::new(MemtableViewIter::new(&sources.memtable_view)));
     }
-
-    // SSTs in priority order. Each gets a fresh iterator scoped to
-    // this call — no borrow leaks back to the iterator struct.
+    if !sources.immutable_view.is_empty() {
+        srcs.push(Box::new(MemtableViewIter::new(&sources.immutable_view)));
+    }
     for table in &sources.ssts {
-        if live_count(&map) >= chunk_size {
-            break;
-        }
-        let mut it = SstUserKeyIter::new_at(table.iter(), read_seq);
-        match start_key {
-            None => it.seek_to_first(),
-            Some(target) => {
-                it.seek(target);
-                if exclusive && it.valid() && it.key() == target {
-                    it.next();
-                }
+        srcs.push(Box::new(SstUserKeyIter::new_at(table.iter(), read_seq)));
+    }
+    let mut merging = MergingIterator::new(srcs);
+    match start_key {
+        None => merging.seek_to_first(),
+        Some(target) => {
+            merging.seek(target);
+            if exclusive && merging.valid() && merging.key() == target {
+                merging.next();
             }
-        }
-        while it.valid() {
-            let k = it.key().to_vec();
-            let is_tomb = it.is_tombstone();
-            map.entry(k.clone())
-                .or_insert_with(|| {
-                    if is_tomb {
-                        (Vec::new(), true)
-                    } else {
-                        (it.value().to_vec(), false)
-                    }
-                });
-            if last_key.as_deref().is_none_or(|lk| lk < k.as_slice()) {
-                last_key = Some(k);
-            }
-            if map.values().filter(|(_, t)| !t).count() >= chunk_size {
-                break;
-            }
-            it.next();
         }
     }
 
-    let live: Vec<(Vec<u8>, Vec<u8>)> = map
-        .into_iter()
-        .filter(|(_, (_, is_tomb))| !is_tomb)
-        .map(|(k, (v, _))| (k, v))
-        .collect();
+    let mut live: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    while merging.valid() && live.len() < chunk_size {
+        if !merging.is_tombstone() {
+            live.push((merging.key().to_vec(), merging.value().to_vec()));
+        }
+        merging.next();
+    }
+    let last_key = live.last().map(|(k, _)| k.clone());
     ChunkOutput { live, last_key }
 }
 
-#[inline]
-fn live_count(map: &std::collections::BTreeMap<Vec<u8>, (Vec<u8>, bool)>) -> usize {
-    map.values().filter(|(_, t)| !t).count()
+/// `UserKeyIter` adapter over a sorted, deduplicated memtable view
+/// (`Vec<(user_key, value, is_tombstone)>`). Lets the merging iterator
+/// consume an in-memory snapshot the same way it consumes SSTs.
+struct MemtableViewIter<'a> {
+    view: &'a [(Vec<u8>, Vec<u8>, bool)],
+    /// Index of the current entry, or `view.len()` when invalid.
+    pos: usize,
+}
+
+impl<'a> MemtableViewIter<'a> {
+    fn new(view: &'a [(Vec<u8>, Vec<u8>, bool)]) -> Self {
+        Self { view, pos: view.len() }
+    }
+}
+
+impl<'a> crate::db::merging_iterator::UserKeyIter for MemtableViewIter<'a> {
+    fn valid(&self) -> bool {
+        self.pos < self.view.len()
+    }
+    fn key(&self) -> &[u8] {
+        &self.view[self.pos].0
+    }
+    fn value(&self) -> &[u8] {
+        &self.view[self.pos].1
+    }
+    fn seek_to_first(&mut self) {
+        self.pos = 0;
+        if self.pos >= self.view.len() {
+            self.pos = self.view.len();
+        }
+    }
+    fn seek(&mut self, target: &[u8]) {
+        self.pos = self.view.partition_point(|(k, _, _)| k.as_slice() < target);
+    }
+    fn next(&mut self) {
+        if self.pos < self.view.len() {
+            self.pos += 1;
+        }
+    }
+    fn is_tombstone(&self) -> bool {
+        self.view[self.pos].2
+    }
 }
 
 /// Helper: build a merging iterator over a memtable + a snapshot
@@ -1226,6 +1275,138 @@ mod tests {
         assert_eq!(keys.len(), 20);
         assert_eq!(keys[0], "k0010");
         assert_eq!(keys[19], "k0029");
+    }
+
+    #[test]
+    fn next_chunk_returns_requested_count_and_advances() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        for i in 0..50 {
+            let k = format!("k{i:04}");
+            mt.add(i + 1, ValueType::Value, k.as_bytes(), b"v").unwrap();
+        }
+        let mut it = DbIterator::from_arcs(&mt, None, Vec::new(),
+                READ_AT_LATEST, 8);
+        it.seek_to_first();
+        let batch = it.next_chunk(10);
+        assert_eq!(batch.len(), 10);
+        assert_eq!(batch[0].0, b"k0000");
+        assert_eq!(batch[9].0, b"k0009");
+        // Iterator advanced past the batch.
+        let batch2 = it.next_chunk(10);
+        assert_eq!(batch2[0].0, b"k0010");
+    }
+
+    #[test]
+    fn next_chunk_spans_multiple_refills() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        for i in 0..50 {
+            let k = format!("k{i:04}");
+            mt.add(i + 1, ValueType::Value, k.as_bytes(), b"v").unwrap();
+        }
+        // Tiny chunk_size forces ~6 internal refills for max=50.
+        let mut it = DbIterator::from_arcs(&mt, None, Vec::new(),
+                READ_AT_LATEST, 8);
+        it.seek_to_first();
+        let batch = it.next_chunk(50);
+        // All 50 keys returned in one call.
+        assert_eq!(batch.len(), 50);
+        assert_eq!(batch[0].0, b"k0000");
+        assert_eq!(batch[49].0, b"k0049");
+    }
+
+    #[test]
+    fn next_chunk_underfills_when_exhausted() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        for i in 0..7 {
+            let k = format!("k{i:04}");
+            mt.add(i + 1, ValueType::Value, k.as_bytes(), b"v").unwrap();
+        }
+        let mut it = DbIterator::from_arcs(&mt, None, Vec::new(),
+                READ_AT_LATEST, 1024);
+        it.seek_to_first();
+        let batch = it.next_chunk(1000);
+        assert_eq!(batch.len(), 7);
+        // A second call returns empty.
+        assert!(it.next_chunk(10).is_empty());
+    }
+
+    #[test]
+    fn next_chunk_after_seek_starts_at_target() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        for i in 0..30 {
+            let k = format!("k{i:04}");
+            mt.add(i + 1, ValueType::Value, k.as_bytes(), b"v").unwrap();
+        }
+        let mut it = DbIterator::from_arcs(&mt, None, Vec::new(),
+                READ_AT_LATEST, 5);
+        it.seek(b"k0010");
+        let batch = it.next_chunk(5);
+        assert_eq!(batch.len(), 5);
+        assert_eq!(batch[0].0, b"k0010");
+        assert_eq!(batch[4].0, b"k0014");
+    }
+
+    #[test]
+    fn next_chunk_skips_tombstones() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        for i in 0..20 {
+            let k = format!("k{i:04}");
+            let vt = if i % 2 == 0 { ValueType::Value } else { ValueType::Deletion };
+            mt.add(i + 1, vt, k.as_bytes(), b"v").unwrap();
+        }
+        let mut it = DbIterator::from_arcs(&mt, None, Vec::new(),
+                READ_AT_LATEST, 4);
+        it.seek_to_first();
+        let batch = it.next_chunk(20);
+        // 10 even keys survive.
+        assert_eq!(batch.len(), 10);
+        assert_eq!(batch[0].0, b"k0000");
+        assert_eq!(batch[9].0, b"k0018");
+    }
+
+    #[test]
+    fn next_chunk_drains_large_dataset_at_default_chunk_size() {
+        // Mirrors the Java BatchIteratorTest.drainsLargeDataset case:
+        // 5000 entries, default chunk_size, max < chunk_size per call.
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        let n = 5000u64;
+        for i in 0..n {
+            let k = format!("k{i:06}");
+            mt.add(i + 1, ValueType::Value, k.as_bytes(), b"v").unwrap();
+        }
+        let mut it = DbIterator::from_arcs(
+            &mt, None, Vec::new(), READ_AT_LATEST,
+            DbIterator::DEFAULT_CHUNK_SIZE);
+        it.seek_to_first();
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let batch = it.next_chunk(512);
+            if batch.is_empty() {
+                break;
+            }
+            for (k, _) in batch {
+                keys.push(k);
+            }
+        }
+        assert_eq!(keys.len() as u64, n);
+        assert_eq!(keys[0], b"k000000");
+        assert_eq!(keys[(n - 1) as usize], format!("k{:06}", n - 1).as_bytes());
+    }
+
+    #[test]
+    fn next_chunk_zero_returns_empty_without_advancing() {
+        let mut mt = MemTable::new(Arc::new(BytewiseComparator));
+        for i in 0..5 {
+            let k = format!("k{i:04}");
+            mt.add(i + 1, ValueType::Value, k.as_bytes(), b"v").unwrap();
+        }
+        let mut it = DbIterator::from_arcs(&mt, None, Vec::new(),
+                READ_AT_LATEST, 8);
+        it.seek_to_first();
+        assert!(it.next_chunk(0).is_empty());
+        // Position unchanged — next() should still see k0000.
+        assert!(it.valid());
+        assert_eq!(it.key(), b"k0000");
     }
 
     #[test]
