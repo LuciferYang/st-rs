@@ -150,6 +150,13 @@ struct CfState {
     /// sequence number. A key `k` with `start <= k < end` and
     /// `entry_seq < tombstone_seq` is considered deleted.
     range_tombstones: Vec<RangeTombstone>,
+    /// Per-CF tuning passed at create time. Drives this CF's flush
+    /// trigger (`write_buffer_size`) and L0→L1 compaction trigger
+    /// (`level0_file_num_compaction_trigger`) instead of the global
+    /// defaults. Stored as a snapshot — mutating the
+    /// `ColumnFamilyOptions` the caller built doesn't retroactively
+    /// affect the CF.
+    options: crate::api::options::ColumnFamilyOptions,
 }
 
 /// Concrete column family handle.
@@ -584,6 +591,7 @@ impl DbImpl {
             merge_operator: None,
             compaction_filter_factory: None,
             range_tombstones: replayed_range_tombstones,
+            options: crate::api::options::ColumnFamilyOptions::default(),
         };
         let mut all_cfs = HashMap::from([(DEFAULT_CF_ID, default_cf)]);
         let mut max_cf_id: ColumnFamilyId = 0;
@@ -655,6 +663,7 @@ impl DbImpl {
                     merge_operator: None,
                     compaction_filter_factory: None,
                     range_tombstones: Vec::new(),
+                    options: crate::api::options::ColumnFamilyOptions::default(),
                 });
             }
         }
@@ -1052,7 +1061,7 @@ impl DbImpl {
     pub fn create_column_family(
         &self,
         name: &str,
-        _options: &crate::api::options::ColumnFamilyOptions,
+        options: &crate::api::options::ColumnFamilyOptions,
     ) -> Result<Arc<ColumnFamilyHandleImpl>> {
         let mut state = self.state.lock().unwrap();
         // Check for duplicate name.
@@ -1075,9 +1084,10 @@ impl DbImpl {
             immutable_wal_number: None,
             pending_flush_sst_number: None,
             pending_compaction: None,
-            merge_operator: resolve_merge_operator(&_options.merge_operator_name),
+            merge_operator: resolve_merge_operator(&options.merge_operator_name),
             compaction_filter_factory: None,
             range_tombstones: Vec::new(),
+            options: options.clone(),
         });
         // Persist the CF addition to the MANIFEST.
         let edit = VersionEdit {
@@ -1627,15 +1637,36 @@ impl DbImpl {
             state.last_sequence = handler.seq - 1;
         }
 
-        // 4. Maybe trigger flush (default CF only for now; non-default
-        //    CFs don't auto-flush — callers must use flush_cf()).
-        let needs_flush = state.default_cf().memtable.approximate_memory_usage() >= self.write_buffer_size;
+        // 4. Maybe trigger flush. Each CF's threshold is its own
+        //    write_buffer_size if non-zero, otherwise falls back to
+        //    the global db_write_buffer_size.
+        let cfs_needing_flush: Vec<ColumnFamilyId> = state.column_families
+            .values()
+            .filter(|cf| {
+                let per_cf = cf.options.write_buffer_size;
+                let threshold = if per_cf > 0 { per_cf } else { self.write_buffer_size };
+                cf.memtable.approximate_memory_usage() >= threshold
+                    && cf.immutable.is_none()
+            })
+            .map(|cf| cf.id)
+            .collect();
         drop(state);
-        if needs_flush {
+        for cf_id in cfs_needing_flush {
             // Background flush — put() returns as soon as the
             // memtable freeze + WAL roll are done; the SST write
             // happens on a worker thread.
-            self.schedule_flush()?;
+            if cf_id == DEFAULT_CF_ID {
+                self.schedule_flush()?;
+            } else {
+                // Synchronous flush for custom CFs (no scheduler hook
+                // exists for them yet); cheap because the memtable
+                // is small at this trigger point.
+                let cf_handle = ColumnFamilyHandleImpl {
+                    id: cf_id,
+                    name: String::new(),
+                };
+                let _ = self.flush_cf(&cf_handle);
+            }
         }
         Ok(())
     }
@@ -2562,7 +2593,15 @@ impl DbImpl {
                 if cf.pending_compaction.is_some() {
                     continue;
                 }
-                if cf.l0.len() < Self::COMPACTION_TRIGGER {
+                // Per-CF L0 trigger (Flink may set this lower for
+                // hot state CFs); fall back to the engine default
+                // when the CF's option is non-positive.
+                let trigger = if cf.options.level0_file_num_compaction_trigger > 0 {
+                    cf.options.level0_file_num_compaction_trigger as usize
+                } else {
+                    Self::COMPACTION_TRIGGER
+                };
+                if cf.l0.len() < trigger {
                     continue;
                 }
                 let mut inputs: Vec<Arc<BlockBasedTableReader>> = Vec::new();
@@ -3440,6 +3479,64 @@ mod tests {
         let n = C.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         std::env::temp_dir().join(format!("st-rs-db-{tag}-{pid}-{n}"))
+    }
+
+    #[test]
+    fn per_cf_write_buffer_size_triggers_independent_flush() {
+        // Two custom CFs with different write_buffer_size: tiny CF
+        // should flush after a handful of writes; large CF should not.
+        let dir = temp_dir("per-cf-wbs");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+
+        let tiny_opts = crate::api::options::ColumnFamilyOptions {
+            write_buffer_size: 256,           // ~few entries
+            level0_file_num_compaction_trigger: 64, // never triggers in this test
+            ..crate::api::options::ColumnFamilyOptions::default()
+        };
+        let large_opts = crate::api::options::ColumnFamilyOptions {
+            write_buffer_size: 64 * 1024 * 1024, // never trips
+            level0_file_num_compaction_trigger: 64,
+            ..crate::api::options::ColumnFamilyOptions::default()
+        };
+        let tiny = db.create_column_family("tiny", &tiny_opts).unwrap();
+        let large = db.create_column_family("large", &large_opts).unwrap();
+
+        // Write enough to comfortably exceed 256B in `tiny` and stay
+        // well under 64MiB in `large`. Use the WriteBatch path so
+        // both CFs land their writes through the same auto-flush check.
+        for i in 0..50u64 {
+            let k = format!("k{i:04}");
+            let v = format!("value-{i:04}");
+            let mut wb = crate::api::write_batch::WriteBatch::new();
+            wb.put_cf(tiny.id(), k.as_bytes().to_vec(), v.as_bytes().to_vec());
+            wb.put_cf(large.id(), k.as_bytes().to_vec(), v.as_bytes().to_vec());
+            db.write(&wb).unwrap();
+        }
+        db.wait_for_pending_work().unwrap();
+
+        // Snapshot the per-CF level layout. `tiny` should have flushed
+        // to at least one L0 SST; `large` should have everything still
+        // in its memtable (no L0).
+        let (tiny_l0, large_l0, large_mem) = {
+            let state = db.state.lock().unwrap();
+            let t = state.cf(tiny.id()).unwrap();
+            let l = state.cf(large.id()).unwrap();
+            (t.l0.len(), l.l0.len(), l.memtable.num_entries())
+        };
+        assert!(
+            tiny_l0 >= 1,
+            "tiny CF should have flushed (l0={tiny_l0}) — per-CF \
+             write_buffer_size=256 not honoured"
+        );
+        assert_eq!(
+            large_l0, 0,
+            "large CF should not have flushed (l0={large_l0}) — \
+             tiny CF's threshold leaked into large CF"
+        );
+        assert_eq!(large_mem, 50, "all 50 entries should still be in `large`'s memtable");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

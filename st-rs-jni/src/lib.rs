@@ -546,6 +546,59 @@ pub extern "system" fn Java_org_forstdb_RocksDB_createColumnFamily(
     }
 }
 
+/// `RocksDB.createColumnFamilyWithOptions(long handle, String name,
+///     long writeBufferSize, int level0FileNumCompactionTrigger) -> long`
+///
+/// Same as `createColumnFamily` but actually honors the per-CF tuning
+/// the Java caller built into its `ColumnFamilyOptions`. Pass `0` /
+/// non-positive for any field that should fall back to the engine
+/// default. Used by `RocksDB.createColumnFamily(ColumnFamilyDescriptor)`
+/// once the descriptor carries non-default options.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_createColumnFamilyWithOptions(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    name: JString,
+    write_buffer_size: jlong,
+    level0_file_num_compaction_trigger: jint,
+) -> jlong {
+    let db = match unsafe { from_handle::<Arc<st_rs::DbImpl>>(handle) } {
+        Some(db) => db,
+        None => {
+            throw_rocks_exception(&mut env, "null handle");
+            return 0;
+        }
+    };
+    let cf_name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            throw_rocks_exception(&mut env, "failed to read CF name");
+            return 0;
+        }
+    };
+
+    let mut cf_opts = st_rs::api::options::ColumnFamilyOptions {
+        merge_operator_name: st_rs::StringAppendOperator::NAME.to_string(),
+        ..st_rs::api::options::ColumnFamilyOptions::default()
+    };
+    if write_buffer_size > 0 {
+        cf_opts.write_buffer_size = write_buffer_size as usize;
+    }
+    if level0_file_num_compaction_trigger > 0 {
+        cf_opts.level0_file_num_compaction_trigger =
+            level0_file_num_compaction_trigger;
+    }
+
+    match db.create_column_family(&cf_name, &cf_opts) {
+        Ok(cf) => to_handle(cf),
+        Err(e) => {
+            throw_rocks_exception(&mut env, &e.to_string());
+            0
+        }
+    }
+}
+
 /// `RocksDB.getColumnFamilyByName(long handle, String name) -> long`
 ///
 /// Returns a handle to an existing CF, or 0 if not found.

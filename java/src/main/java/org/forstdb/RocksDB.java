@@ -207,8 +207,17 @@ public class RocksDB extends RocksObject {
      */
     public ColumnFamilyHandle createColumnFamily(final ColumnFamilyDescriptor desc)
             throws RocksDBException {
-        final long cfHandle = createColumnFamily(
-                nativeHandle_, desc.getNameAsString());
+        // Forward write_buffer_size from the descriptor's options so
+        // the engine flushes this CF at its own threshold instead of
+        // the global default. 0 / non-positive falls back to the
+        // engine default — matches RocksDB convention. Other tunables
+        // can join here as wiring lands; Flink only relies on
+        // writeBufferSize today.
+        final long writeBufferSize = desc.getOptions() != null
+                ? desc.getOptions().getWriteBufferSize()
+                : 0L;
+        final long cfHandle = createColumnFamilyWithOptions(
+                nativeHandle_, desc.getNameAsString(), writeBufferSize, 0);
         // If the descriptor's options carry a configured Flink TTL filter
         // factory, attach it to the freshly created CF so subsequent
         // compactions invoke it.
@@ -519,6 +528,10 @@ public class RocksDB extends RocksObject {
     public ColumnFamilyHandle getDefaultColumnFamily() {
         return new ColumnFamilyHandle(getDefaultColumnFamily(nativeHandle_));
     }
+
+    private static native long createColumnFamilyWithOptions(
+            long dbHandle, String name, long writeBufferSize,
+            int level0FileNumCompactionTrigger);
 
     private static native long createColumnFamily(long dbHandle, String name)
             throws RocksDBException;
