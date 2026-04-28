@@ -24,10 +24,13 @@ MVCC snapshots with snapshot-aware compaction retention.
 
 **Flink integration:**
 merge operator (`StringAppendOperator` for `ListState`),
-compaction filter (TTL state expiration),
+compaction filter (Value-state TTL + reverse-JNI list-state element-level TTL),
 incremental checkpoints (`disableFileDeletions` / `getLiveFiles` / `enableFileDeletions`),
+savepoint + restore (NATIVE format),
 DeleteRange + `deleteFilesInRanges` (rescaling),
 SST ingestion + `createColumnFamilyWithImport` (restore),
+chunked-refill streaming iterator (`nextBatch` for vectorized reads),
+per-CF options honored engine-side (`write_buffer_size`, `level0_file_num_compaction_trigger`),
 write stall (back-pressure),
 engine properties (`rocksdb.*` metrics),
 `FlinkStateBackend` facade, `FlinkFileSystem` for remote storage.
@@ -131,7 +134,7 @@ try (DBOptions opts = new DBOptions().setCreateIfMissing(true);
 
 - `#![deny(unsafe_code)]` on the core engine — `unsafe` confined to `st-rs-jni`
 - No C/C++ dependencies — compression uses pure-Rust crates (`snap`, `lz4_flex`)
-- 373 tests, clippy clean
+- 529 Rust + 23 Java tests, clippy clean, end-to-end Flink MiniCluster IT (checkpoint + savepoint/restore)
 
 ## License
 
