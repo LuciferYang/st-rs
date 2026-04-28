@@ -64,6 +64,24 @@
                     <source>${java.version}</source>
                     <target>${java.version}</target>
                 </configuration>
+                <executions>
+                    <!--
+                      JMH bench classes import org.openjdk.jmh.* which
+                      is only on the classpath under the `bench` profile.
+                      Exclude them from the default test-compile so plain
+                      `mvn package` (e.g. the Fat JAR CI step) doesn't
+                      fail. The `bench` profile re-includes them via its
+                      own testCompile execution.
+                    -->
+                    <execution>
+                        <id>default-testCompile</id>
+                        <configuration>
+                            <testExcludes>
+                                <testExclude>**/jmh/**</testExclude>
+                            </testExcludes>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
