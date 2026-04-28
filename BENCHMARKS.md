@@ -32,7 +32,39 @@ CI runs `cargo bench --no-run` so the benches stay buildable, but we
 do **not** gate merges on bench numbers (no regression baseline yet —
 see gaps below).
 
-### 2. Standalone perf harness — `examples/db_bench.rs`
+### 2. JMH JNI-overhead benchmark — `java/src/test/java/org/forstdb/jmh/`
+
+Measures the same hot paths from Java so the difference between Rust
+direct numbers (criterion) and Java-via-JNI numbers reveals per-call
+boundary overhead (byte-array marshalling, GlobalRef churn, exception
+checks).
+
+```bash
+./bench.sh                              # full suite, default tuning
+./bench.sh get_hit                      # filter by regex
+./bench.sh -wi 5 -i 10 -f 2 get_hit     # custom warmup / iters / forks
+```
+
+The script builds the release JNI cdylib, compiles the bench classes
+under the `bench` Maven profile, and launches a fresh JVM with the
+right `java.library.path` and test classpath so JMH's forks find both.
+
+Groups mirror the criterion harness: `put_one`, `put_batch/{8,64,512}`,
+`get_hit`, `get_miss`, `scan_forward`, `next_batch/{64,256,1024}`.
+
+**Sample comparison (Apple Silicon, single-threaded, warm DB,
+`-wi 1 -i 2 -f 1` — illustrative, not a publishable baseline):**
+
+| Workload | Rust (criterion) | Java+JNI (JMH) | Delta |
+|---|---:|---:|---:|
+| `get_hit` (random in-range point lookup) | ~18.5 µs/op | ~23.0 µs/op | +4.5 µs (~24%) per call |
+
+That ~4.5 µs overhead is the per-call cost of `byte[]` allocation +
+JNI marshalling on the get path. It's the headline number this bench
+exists to track — a 10× regression here would cost Flink workloads
+real money.
+
+### 3. Standalone perf harness — `examples/db_bench.rs`
 
 Quick port of upstream RocksDB's `db_bench_tool.cc`. Single-shot
 fillseq / readrandom / scanforward numbers on a 100k-entry DB.
@@ -47,22 +79,7 @@ cargo run --release --example db_bench
 These are tracked here so future contributors can pick them up. Each
 gap lists *why* it would be valuable and *what* would close it.
 
-### a. JNI-overhead bench
-
-**Gap:** All current benches drive `DbImpl` from Rust directly, so we
-have no measurement of the per-call cost of crossing the JVM ↔ Rust
-boundary (jbyte_array marshalling, GlobalRef churn, exception checks).
-
-**Why it matters:** Flink workloads call into `org.forstdb.RocksDB`
-millions of times per second. JNI overhead dominates short ops (a
-1µs Rust `get` can become a 5µs Java `get` purely from boundary cost).
-
-**To close:** add a JMH harness under `java/src/jmh/java/...` (or use
-a simple JUnit benchmark with `System.nanoTime`) that times
-`db.put` / `db.get` / `iterator.nextBatch` Java-side, then compare
-against the Rust criterion numbers for the same workload.
-
-### b. Compaction-throughput bench
+### a. Compaction-throughput bench
 
 **Gap:** No bench measures bytes/sec rewritten during background
 compaction, the ratio of read vs write amplification, or the wall-clock
@@ -77,7 +94,7 @@ write path can land silently.
 of L0 SSTs (via `flush_all_cfs` in a loop), then times
 `pick_compaction_batch + CompactionJob::run`. Report MB/s.
 
-### c. Comparison vs upstream RocksDB / ForSt
+### b. Comparison vs upstream RocksDB / ForSt
 
 **Gap:** Numbers are absolute. We can say "st-rs does X ops/s" but
 not "st-rs does X% of ForSt's ops/s on the same workload".
@@ -86,12 +103,12 @@ not "st-rs does X% of ForSt's ops/s on the same workload".
 replacement for ForSt". A 3× regression vs ForSt on a hot path is a
 release blocker even if the absolute number looks fine.
 
-**To close:** wire `rocksdbjni` as an alternate JAR in the JNI
-overhead bench (b), run both against the same Java workload, and
+**To close:** wire `rocksdbjni` as an alternate JAR in the JMH
+JNI-overhead bench, run both against the same Java workload, and
 report a ratio. Or, more ambitious: a Rust harness that drives both
 engines via their FFI surfaces.
 
-### d. Vectorized-read comparison (scalar vs `next_chunk`)
+### c. Vectorized-read comparison (scalar vs `next_chunk`)
 
 **Gap:** We have `scan_forward/full_db` (scalar `next()`) and
 `next_chunk/{64,256,1024}` (M5b vectorized) as separate groups, but no
@@ -104,7 +121,7 @@ clearly demonstrate that — adding a paired comparison group would.
 **To close:** add a `read_modes` group that runs both styles back-to-back
 on the same DB and reports the ratio.
 
-### e. CI regression gate
+### d. CI regression gate
 
 **Gap:** CI compiles benches but doesn't run them or compare against
 a baseline. A 5× write-path regression would land green.
@@ -123,7 +140,7 @@ between releases.
 GHA's shared runners are too noisy for raw absolute numbers (load
 averages vary), so option 2 is the most realistic short-term path.
 
-### f. Concurrency / multi-writer bench
+### e. Concurrency / multi-writer bench
 
 **Gap:** All benches are single-threaded. We don't measure throughput
 under N concurrent writers, contention on the memtable's skip-list, or
@@ -138,7 +155,7 @@ serious lock contention.
 each performing `put` and reports aggregate throughput at N ∈ {1, 2,
 4, 8}.
 
-### g. Stable bench environment / variance budget
+### f. Stable bench environment / variance budget
 
 **Gap:** No documented procedure for running benches in a stable
 environment (CPU governor, hyperthreading, background load), so

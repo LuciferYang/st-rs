@@ -71,8 +71,77 @@
                 <version>3.2.5</version>
                 <configuration>
                     <argLine>-Djava.library.path=${project.basedir}/../target/debug</argLine>
+                    <excludes>
+                        <exclude>**/jmh/**</exclude>
+                    </excludes>
                 </configuration>
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+          Opt-in JMH benchmarking profile. Activate with `-Pbench`.
+          Adds JMH deps + a test-compile-time annotation processor and
+          points the JNI library path at `target/release` so we measure
+          optimized-binary throughput, not debug.
+        -->
+        <profile>
+            <id>bench</id>
+            <dependencies>
+                <dependency>
+                    <groupId>org.openjdk.jmh</groupId>
+                    <artifactId>jmh-core</artifactId>
+                    <version>1.37</version>
+                    <scope>test</scope>
+                </dependency>
+                <dependency>
+                    <groupId>org.openjdk.jmh</groupId>
+                    <artifactId>jmh-generator-annprocess</artifactId>
+                    <version>1.37</version>
+                    <scope>test</scope>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-compiler-plugin</artifactId>
+                        <version>3.11.0</version>
+                        <executions>
+                            <execution>
+                                <id>jmh-annproc</id>
+                                <phase>process-test-sources</phase>
+                                <goals><goal>testCompile</goal></goals>
+                                <configuration>
+                                    <annotationProcessorPaths>
+                                        <path>
+                                            <groupId>org.openjdk.jmh</groupId>
+                                            <artifactId>jmh-generator-annprocess</artifactId>
+                                            <version>1.37</version>
+                                        </path>
+                                    </annotationProcessorPaths>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.1.1</version>
+                        <configuration>
+                            <classpathScope>test</classpathScope>
+                            <mainClass>org.forstdb.jmh.BenchmarkRunner</mainClass>
+                            <systemProperties>
+                                <systemProperty>
+                                    <key>java.library.path</key>
+                                    <value>${project.basedir}/../target/release</value>
+                                </systemProperty>
+                            </systemProperties>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
