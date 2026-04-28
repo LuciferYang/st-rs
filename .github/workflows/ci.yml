@@ -41,6 +41,9 @@ jobs:
       - name: Test (no default features)
         run: cargo test -p st-rs --no-default-features
 
+      - name: Bench compile (smoke check, no run)
+        run: cargo bench -p st-rs --no-run
+
   java:
     name: Java compile
     runs-on: ubuntu-latest

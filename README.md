@@ -49,6 +49,7 @@ batch APIs (`multi_get` / `multi_put` / `multi_delete` / `prefix_scan`).
 # Rust engine + tests
 cargo build --release
 cargo test
+cargo bench --bench engine     # see BENCHMARKS.md
 
 # JNI native library
 cargo build --release -p st-rs-jni
