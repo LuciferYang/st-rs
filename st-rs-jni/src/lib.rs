@@ -31,6 +31,7 @@
 //! `Box::from_raw` to reclaim and drop the object.
 
 mod jni_fs_backend;
+mod jni_list_compaction_filter;
 
 use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring, JNI_TRUE};
@@ -226,7 +227,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_put__JJJ_3B_3B(
         }
     };
     let disable_wal = unsafe { from_handle::<RustWriteOptions>(write_opts_handle) }
-        .map_or(false, |wo| wo.disable_wal);
+        .is_some_and(|wo| wo.disable_wal);
 
     let mut batch = st_rs::WriteBatch::new();
     if cf_handle == 0 {
@@ -272,7 +273,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_delete__JJJ_3B(
         }
     };
     let disable_wal = unsafe { from_handle::<RustWriteOptions>(write_opts_handle) }
-        .map_or(false, |wo| wo.disable_wal);
+        .is_some_and(|wo| wo.disable_wal);
 
     let mut batch = st_rs::WriteBatch::new();
     if cf_handle == 0 {
@@ -328,7 +329,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_merge__JJJ_3B_3B(
         }
     };
     let disable_wal = unsafe { from_handle::<RustWriteOptions>(write_opts_handle) }
-        .map_or(false, |wo| wo.disable_wal);
+        .is_some_and(|wo| wo.disable_wal);
 
     let mut batch = st_rs::WriteBatch::new();
     if cf_handle == 0 {
@@ -872,7 +873,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_write__JJJ(
         }
     };
     let disable_wal = unsafe { from_handle::<RustWriteOptions>(write_opts_handle) }
-        .map_or(false, |wo| wo.disable_wal);
+        .is_some_and(|wo| wo.disable_wal);
     if let Err(e) = db.write_opt(batch, disable_wal) {
         throw_rocks_exception(&mut env, &e.to_string());
     }
@@ -1771,6 +1772,56 @@ pub extern "system" fn Java_org_forstdb_FlinkCompactionFilter_00024FlinkCompacti
     handle: jlong,
 ) {
     unsafe { drop_handle::<Arc<dyn st_rs::CompactionFilterFactory>>(handle) };
+}
+
+/// `FlinkCompactionFilterFactory.createFlinkListTtlFactory(
+///     long ttlMillis, ListElementFilterFactory javaFactory) -> long`
+///
+/// Builds a TTL filter factory that, for each compaction job, calls back
+/// into the Java `ListElementFilterFactory` to obtain a fresh
+/// `ListElementFilter`. The Rust filter then invokes
+/// `nextUnexpiredOffset(byte[], long ttl, long now)` for every value to
+/// truncate or drop expired list-state entries.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlinkCompactionFilter_00024FlinkCompactionFilterFactory_createFlinkListTtlFactory(
+    mut env: JNIEnv,
+    _class: JClass,
+    ttl_millis: jlong,
+    java_factory: JObject,
+) -> jlong {
+    if java_factory.is_null() {
+        throw_rocks_exception(&mut env, "null ListElementFilterFactory");
+        return 0;
+    }
+    let jvm = match env.get_java_vm() {
+        Ok(vm) => Arc::new(vm),
+        Err(e) => {
+            throw_rocks_exception(&mut env, &format!("get_java_vm failed: {e}"));
+            return 0;
+        }
+    };
+    let factory_ref = match env.new_global_ref(&java_factory) {
+        Ok(r) => r,
+        Err(e) => {
+            throw_rocks_exception(&mut env, &format!("new_global_ref failed: {e}"));
+            return 0;
+        }
+    };
+    let clock: Box<dyn Fn() -> u64 + Send + Sync> = Box::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    });
+    let factory: Arc<dyn st_rs::CompactionFilterFactory> = Arc::new(
+        jni_list_compaction_filter::JniListCompactionFilterFactory::new(
+            ttl_millis as u64,
+            jvm,
+            factory_ref,
+            clock,
+        ),
+    );
+    to_handle(factory)
 }
 
 /// `RocksDB.getLiveFilesNative(long dbHandle, boolean flushMemtable) -> String[]`

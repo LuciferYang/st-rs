@@ -163,15 +163,26 @@ public class FlinkCompactionFilter extends AbstractCompactionFilter<Slice> {
         /**
          * Build the native TTL filter factory from the Flink-supplied
          * {@link Config}. Called once per CF before
-         * {@code setCompactionFilterFactory}. List state with element-level
-         * filtering is not yet supported (silently skipped).
+         * {@code setCompactionFilterFactory}. List state with a
+         * {@link ListElementFilterFactory} is wired through a reverse-JNI
+         * callback into the Java filter; fixed-element-length list state
+         * without a factory is currently skipped.
          */
         public synchronized void configure(final Config config) {
             if (nativeFactoryHandle != 0L) {
                 return;
             }
-            if (config == null || config.stateType == StateType.Disabled
-                    || config.stateType == StateType.List) {
+            if (config == null || config.stateType == StateType.Disabled) {
+                return;
+            }
+            if (config.stateType == StateType.List) {
+                if (config.listElementFilterFactory != null) {
+                    nativeFactoryHandle = createFlinkListTtlFactory(
+                            config.ttl, config.listElementFilterFactory);
+                }
+                // Fixed-element-length list state without a factory is
+                // not yet handled — leave the handle at 0 so the engine
+                // skips installing a filter.
                 return;
             }
             nativeFactoryHandle = createFlinkTtlFactory(
@@ -203,6 +214,9 @@ public class FlinkCompactionFilter extends AbstractCompactionFilter<Slice> {
 
         private static native long createFlinkTtlFactory(
                 long ttlMillis, int timestampOffset);
+
+        private static native long createFlinkListTtlFactory(
+                long ttlMillis, ListElementFilterFactory listElementFilterFactory);
 
         private static native void disposeFlinkTtlFactory(long handle);
     }
