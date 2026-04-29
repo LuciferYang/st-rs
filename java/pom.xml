@@ -119,6 +119,18 @@
                     <version>1.37</version>
                     <scope>test</scope>
                 </dependency>
+                <!--
+                  Upstream RocksDB JNI for the comparison bench
+                  (RocksdbBenchmark). Lives in `org.rocksdb` so it does
+                  not collide with our `org.forstdb` classes; the bundled
+                  JAR ships natives for all major platforms.
+                -->
+                <dependency>
+                    <groupId>org.rocksdb</groupId>
+                    <artifactId>rocksdbjni</artifactId>
+                    <version>9.8.4</version>
+                    <scope>test</scope>
+                </dependency>
             </dependencies>
             <build>
                 <plugins>

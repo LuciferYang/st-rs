@@ -64,7 +64,43 @@ JNI marshalling on the get path. It's the headline number this bench
 exists to track — a 10× regression here would cost Flink workloads
 real money.
 
-### 3. Standalone perf harness — `examples/db_bench.rs`
+### 3. Upstream-RocksDB comparison — `RocksdbBenchmark.java`
+
+Same workloads as `JniOverheadBenchmark` but driving
+`org.rocksdb.RocksDB` (rocksdbjni 9.8.4). Lives next to the JNI
+bench so JMH reports both classes side-by-side, e.g.
+`JniOverheadBenchmark.get_hit` vs `RocksdbBenchmark.get_hit`. Run
+exactly the same way:
+
+```bash
+./bench.sh                              # both backends
+./bench.sh 'get_hit$'                   # filter to one workload, both backends
+```
+
+Notes on fairness: identical key/value sizes, write-buffer cap, PRNG
+access pattern. Bloom filters and Snappy compression are left at each
+engine's defaults — we deliberately do **not** disable them on either
+side, because "what does the engine do out of the box" is the answer
+this bench is supposed to give.
+
+**Sample numbers (Apple Silicon, single-threaded, `-wi 1 -i 2 -f 1`
+— small N, illustrative only):**
+
+| Workload | st-rs JNI | RocksDB JNI | Ratio |
+|---|---:|---:|---:|
+| `get_hit` | ~37 µs/op | ~4.4 µs/op | st-rs ~8.4× slower |
+| `get_miss` (bloom path) | ~3.4 µs/op | ~9.9 µs/op | **st-rs ~3× faster** |
+| `put_one` | ~4500 µs/op | ~7.4 µs/op | st-rs ~600× slower |
+
+These are useful precisely because they're surprising. The `get_hit`
+gap likely traces to block-cache hit rate or block decode hot path;
+the `get_miss` win comes from a faster (or simpler) bloom check; the
+`put_one` blow-up almost certainly means we're fsync-ing on every put
+where RocksDB defaults to async WAL. Each row above is a follow-up
+ticket waiting to be filed — see `gap a` below for the next bench
+that would isolate the compaction side.
+
+### 4. Standalone perf harness — `examples/db_bench.rs`
 
 Quick port of upstream RocksDB's `db_bench_tool.cc`. Single-shot
 fillseq / readrandom / scanforward numbers on a 100k-entry DB.
@@ -94,21 +130,7 @@ write path can land silently.
 of L0 SSTs (via `flush_all_cfs` in a loop), then times
 `pick_compaction_batch + CompactionJob::run`. Report MB/s.
 
-### b. Comparison vs upstream RocksDB / ForSt
-
-**Gap:** Numbers are absolute. We can say "st-rs does X ops/s" but
-not "st-rs does X% of ForSt's ops/s on the same workload".
-
-**Why it matters:** the project's value proposition is "drop-in
-replacement for ForSt". A 3× regression vs ForSt on a hot path is a
-release blocker even if the absolute number looks fine.
-
-**To close:** wire `rocksdbjni` as an alternate JAR in the JMH
-JNI-overhead bench, run both against the same Java workload, and
-report a ratio. Or, more ambitious: a Rust harness that drives both
-engines via their FFI surfaces.
-
-### c. Vectorized-read comparison (scalar vs `next_chunk`)
+### b. Vectorized-read comparison (scalar vs `next_chunk`)
 
 **Gap:** We have `scan_forward/full_db` (scalar `next()`) and
 `next_chunk/{64,256,1024}` (M5b vectorized) as separate groups, but no
@@ -121,7 +143,7 @@ clearly demonstrate that — adding a paired comparison group would.
 **To close:** add a `read_modes` group that runs both styles back-to-back
 on the same DB and reports the ratio.
 
-### d. CI regression gate
+### c. CI regression gate
 
 **Gap:** CI compiles benches but doesn't run them or compare against
 a baseline. A 5× write-path regression would land green.
@@ -140,7 +162,7 @@ between releases.
 GHA's shared runners are too noisy for raw absolute numbers (load
 averages vary), so option 2 is the most realistic short-term path.
 
-### e. Concurrency / multi-writer bench
+### d. Concurrency / multi-writer bench
 
 **Gap:** All benches are single-threaded. We don't measure throughput
 under N concurrent writers, contention on the memtable's skip-list, or
@@ -155,7 +177,7 @@ serious lock contention.
 each performing `put` and reports aggregate throughput at N ∈ {1, 2,
 4, 8}.
 
-### f. Stable bench environment / variance budget
+### e. Stable bench environment / variance budget
 
 **Gap:** No documented procedure for running benches in a stable
 environment (CPU governor, hyperthreading, background load), so
