@@ -21,7 +21,7 @@ Groups:
 
 | Group | Workload | Why it matters |
 |---|---|---|
-| `put_sequential/put_one` | one `db.put()` per iteration | baseline write latency including WAL fsync |
+| `put_sequential/put_one` | one `db.put()` per iteration | baseline write latency (buffered WAL append; no per-write fsync, matching RocksDB defaults) |
 | `put_batch/{8,64,512}` | one `WriteBatch::write()` per iteration | shows WAL amortization with batch size |
 | `get_random/hit` | random in-range point lookup on a populated DB | warm read path: bloom hit + block cache + memtable miss → SST decode |
 | `get_random/miss` | random out-of-range lookup | bloom-filter fast path; should be ~10–100× the hit rate |
@@ -83,22 +83,36 @@ engine's defaults — we deliberately do **not** disable them on either
 side, because "what does the engine do out of the box" is the answer
 this bench is supposed to give.
 
-**Sample numbers (Apple Silicon, single-threaded, `-wi 1 -i 2 -f 1`
-— small N, illustrative only):**
+**Measured (Apple Silicon, single-threaded, `-wi 1 -i 2 -f 1` — small
+N, illustrative; not a publishable baseline):**
 
-| Workload | st-rs JNI | RocksDB JNI | Ratio |
-|---|---:|---:|---:|
-| `get_hit` | ~37 µs/op | ~4.4 µs/op | st-rs ~8.4× slower |
-| `get_miss` (bloom path) | ~3.4 µs/op | ~9.9 µs/op | **st-rs ~3× faster** |
-| `put_one` | ~4500 µs/op | ~7.4 µs/op | st-rs ~600× slower |
+| Workload | st-rs JNI (before) | st-rs JNI (after) | RocksDB JNI (after) | Ratio (st-rs ÷ RocksDB) |
+|---|---:|---:|---:|---:|
+| `get_hit` | ~37 µs/op | **1.58 µs/op** | 1.70 µs/op | 0.93× — basically tied |
+| `get_miss` | ~3.4 µs/op | **0.81 µs/op** | 3.00 µs/op | 0.27× — st-rs ~3.7× faster |
+| `put_one` | ~4500 µs/op | **2.10 µs/op** | 4.55 µs/op | 0.46× — st-rs ~2.2× faster |
 
-These are useful precisely because they're surprising. The `get_hit`
-gap likely traces to block-cache hit rate or block decode hot path;
-the `get_miss` win comes from a faster (or simpler) bloom check; the
-`put_one` blow-up almost certainly means we're fsync-ing on every put
-where RocksDB defaults to async WAL. Each row above is a follow-up
-ticket waiting to be filed — see `gap a` below for the next bench
-that would isolate the compaction side.
+Two defaults landed to close the gap:
+
+1. **`WriteOptions.sync` is now honored end-to-end.** Previously
+   `DbImpl::write_opt` called `state.wal.sync()` unconditionally on
+   every batch — even though the public `WriteOptions::default()`
+   has `sync=false`, matching RocksDB. The trait-level `fn write`
+   ignored its `opts` argument entirely. Both are fixed: the WAL is
+   fsync'd only when `WriteOptions.sync == true`. Recent writes are
+   still durable across process crashes (kernel buffer cache); only
+   kernel or power loss can drop them. Java callers can opt back into
+   per-write fsync via `new WriteOptions().setSync(true)`.
+
+2. **`DbOptions::default().block_cache_size` is now 32 MiB**, matching
+   upstream RocksDB's default `BlockBasedTableOptions`. The shared-LRU
+   plumbing through `BlockBasedTableReader::open_with_cache` was
+   already in place; the default was 0 (no cache), so every `get`
+   re-decoded the data block from disk.
+
+The Rust-side `cargo bench --bench engine` numbers reflect the same
+two fixes (no JNI overhead in this path): `put_one` dropped from
+~4500 µs to **~850 ns**, `get_hit` from ~18.5 µs to **~890 ns**.
 
 ### 4. Standalone perf harness — `examples/db_bench.rs`
 

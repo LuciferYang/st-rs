@@ -226,8 +226,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_put__JJJ_3B_3B(
             return;
         }
     };
-    let disable_wal = unsafe { from_handle::<RustWriteOptions>(write_opts_handle) }
-        .is_some_and(|wo| wo.disable_wal);
+    let opts = engine_write_options(write_opts_handle);
 
     let mut batch = st_rs::WriteBatch::new();
     if cf_handle == 0 {
@@ -243,7 +242,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_put__JJJ_3B_3B(
         use st_rs::api::db::ColumnFamilyHandle;
         batch.put_cf(cf_arc.id(), key_bytes, val_bytes);
     }
-    if let Err(e) = db.write_opt(&batch, disable_wal) {
+    if let Err(e) = db.write_opt(&batch, &opts) {
         throw_rocks_exception(&mut env, &e.to_string());
     }
 }
@@ -272,8 +271,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_delete__JJJ_3B(
             return;
         }
     };
-    let disable_wal = unsafe { from_handle::<RustWriteOptions>(write_opts_handle) }
-        .is_some_and(|wo| wo.disable_wal);
+    let opts = engine_write_options(write_opts_handle);
 
     let mut batch = st_rs::WriteBatch::new();
     if cf_handle == 0 {
@@ -289,7 +287,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_delete__JJJ_3B(
         use st_rs::api::db::ColumnFamilyHandle;
         batch.delete_cf(cf_arc.id(), key_bytes);
     }
-    let result = db.write_opt(&batch, disable_wal);
+    let result = db.write_opt(&batch, &opts);
 
     if let Err(e) = result {
         throw_rocks_exception(&mut env, &e.to_string());
@@ -328,8 +326,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_merge__JJJ_3B_3B(
             return;
         }
     };
-    let disable_wal = unsafe { from_handle::<RustWriteOptions>(write_opts_handle) }
-        .is_some_and(|wo| wo.disable_wal);
+    let opts = engine_write_options(write_opts_handle);
 
     let mut batch = st_rs::WriteBatch::new();
     if cf_handle == 0 {
@@ -346,7 +343,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_merge__JJJ_3B_3B(
         batch.merge_cf(cf_arc.id(), key_bytes, val_bytes);
     }
 
-    if let Err(e) = db.write_opt(&batch, disable_wal) {
+    if let Err(e) = db.write_opt(&batch, &opts) {
         throw_rocks_exception(&mut env, &e.to_string());
     }
 }
@@ -872,9 +869,8 @@ pub extern "system" fn Java_org_forstdb_RocksDB_write__JJJ(
             return;
         }
     };
-    let disable_wal = unsafe { from_handle::<RustWriteOptions>(write_opts_handle) }
-        .is_some_and(|wo| wo.disable_wal);
-    if let Err(e) = db.write_opt(batch, disable_wal) {
+    let opts = engine_write_options(write_opts_handle);
+    if let Err(e) = db.write_opt(batch, &opts) {
         throw_rocks_exception(&mut env, &e.to_string());
     }
 }
@@ -883,9 +879,29 @@ pub extern "system" fn Java_org_forstdb_RocksDB_write__JJJ(
 // WriteOptions (org.forstdb.WriteOptions)
 // ---------------------------------------------------------------------------
 
-/// Rust-side WriteOptions — carries the `disable_wal` flag.
+/// Rust-side WriteOptions — carries the `disable_wal` and `sync` flags.
 struct RustWriteOptions {
     disable_wal: bool,
+    sync: bool,
+}
+
+impl RustWriteOptions {
+    fn to_engine(&self) -> st_rs::WriteOptions {
+        st_rs::WriteOptions {
+            sync: self.sync,
+            disable_wal: self.disable_wal,
+            ..st_rs::WriteOptions::default()
+        }
+    }
+}
+
+/// Look up the engine-side [`st_rs::WriteOptions`] for the given
+/// JNI handle, or return defaults (matching RocksDB: `sync=false`,
+/// `disable_wal=false`) if the handle is null.
+fn engine_write_options(write_opts_handle: jlong) -> st_rs::WriteOptions {
+    unsafe { from_handle::<RustWriteOptions>(write_opts_handle) }
+        .map(|wo| wo.to_engine())
+        .unwrap_or_default()
 }
 
 #[no_mangle]
@@ -893,7 +909,10 @@ pub extern "system" fn Java_org_forstdb_WriteOptions_newWriteOptions(
     _env: JNIEnv,
     _class: JClass,
 ) -> jlong {
-    to_handle(RustWriteOptions { disable_wal: false })
+    to_handle(RustWriteOptions {
+        disable_wal: false,
+        sync: false,
+    })
 }
 
 #[no_mangle]
@@ -907,6 +926,20 @@ pub extern "system" fn Java_org_forstdb_WriteOptions_setDisableWAL(
         // Safety: single-threaded access from Java.
         let opts = unsafe { &mut *(handle as *mut RustWriteOptions) };
         opts.disable_wal = disable == JNI_TRUE;
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_WriteOptions_setSync(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    sync: jboolean,
+) {
+    if let Some(_opts) = unsafe { from_handle::<RustWriteOptions>(handle) } {
+        // Safety: single-threaded access from Java.
+        let opts = unsafe { &mut *(handle as *mut RustWriteOptions) };
+        opts.sync = sync == JNI_TRUE;
     }
 }
 

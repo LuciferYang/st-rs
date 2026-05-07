@@ -60,7 +60,7 @@
 //! On open we read CURRENT to discover live SSTs, then walk the
 //! directory for any `*.log` files and replay them.
 
-use crate::api::options::DbOptions;
+use crate::api::options::{DbOptions, WriteOptions};
 use crate::core::status::{Result, Status};
 use crate::core::types::{SequenceNumber, ValueType};
 use crate::db::compaction::CompactionJob;
@@ -1593,16 +1593,20 @@ impl DbImpl {
     /// stall / back-pressure mechanism that prevents unbounded L0
     /// growth.
     pub fn write(&self, batch: &WriteBatch) -> Result<()> {
-        self.write_opt(batch, false)
+        self.write_opt(batch, &WriteOptions::default())
     }
 
-    /// Apply a [`WriteBatch`] atomically with optional WAL skip.
+    /// Apply a [`WriteBatch`] atomically, honoring the supplied
+    /// [`WriteOptions`].
     ///
-    /// When `disable_wal` is `true`, the batch is applied directly
-    /// to the memtable without writing to the WAL. This is Flink's
-    /// default mode — durability comes from Flink's distributed
-    /// checkpointing, not from the engine's WAL.
-    pub fn write_opt(&self, batch: &WriteBatch, disable_wal: bool) -> Result<()> {
+    /// `disable_wal=true` skips the WAL entirely (Flink's default
+    /// mode: durability comes from distributed checkpointing).
+    /// `sync=true` calls `fdatasync` on the WAL after appending —
+    /// matching upstream RocksDB, the default is `sync=false`, which
+    /// leaves the WAL buffered. Without `sync`, recent writes are
+    /// still durable across process crashes (kernel buffer cache),
+    /// only kernel/power loss can drop them.
+    pub fn write_opt(&self, batch: &WriteBatch, opts: &WriteOptions) -> Result<()> {
         if batch.count() == 0 {
             return Ok(()); // nothing to do
         }
@@ -1616,13 +1620,15 @@ impl DbImpl {
         // Reserve a sequence range for this batch.
         let first_seq = state.last_sequence + 1;
 
-        if !disable_wal {
+        if !opts.disable_wal {
             let mut record_buf = Vec::new();
             encode_batch_record(batch, first_seq, &mut record_buf);
 
-            // 1. WAL append + sync.
+            // 1. WAL append (+ optional fsync).
             state.wal.add_record(&record_buf)?;
-            state.wal.sync()?;
+            if opts.sync {
+                state.wal.sync()?;
+            }
         }
 
         // 2. Memtable insert.
@@ -3377,10 +3383,10 @@ impl crate::api::db::Db for DbImpl {
 
     fn write(
         &self,
-        _opts: &crate::api::options::WriteOptions,
+        opts: &crate::api::options::WriteOptions,
         batch: &WriteBatch,
     ) -> Result<()> {
-        DbImpl::write(self, batch)
+        DbImpl::write_opt(self, batch, opts)
     }
 
     fn multi_get(

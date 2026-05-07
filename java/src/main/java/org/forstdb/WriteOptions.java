@@ -42,6 +42,20 @@ public class WriteOptions extends RocksObject {
         return this;
     }
 
+    /**
+     * If true, the engine fsyncs the WAL after appending. Durable but slow.
+     * Defaults to {@code false}, matching upstream RocksDB — recent writes are
+     * still durable across process crashes (kernel buffer cache); only kernel
+     * or power loss can drop them.
+     *
+     * @param flag true to fsync the WAL on every write
+     * @return this instance for method chaining
+     */
+    public WriteOptions setSync(final boolean flag) {
+        setSync(nativeHandle_, flag);
+        return this;
+    }
+
     @Override
     protected void disposeInternal(final long handle) {
         disposeWriteOptions(handle);
@@ -52,6 +66,8 @@ public class WriteOptions extends RocksObject {
     private static native long newWriteOptions();
 
     private static native void setDisableWAL(long handle, boolean flag);
+
+    private static native void setSync(long handle, boolean flag);
 
     private static native void disposeWriteOptions(long handle);
 }
