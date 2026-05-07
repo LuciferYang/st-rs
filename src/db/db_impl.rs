@@ -88,7 +88,7 @@ use crate::sst::block_based::table_builder::{
 use crate::sst::block_based::table_reader::{BlockBasedTableReader, BlockCache};
 use crate::cache::lru::LruCache;
 use crate::core::types::FileType;
-use crate::util::coding::{get_varint32, put_varint32};
+use crate::util::coding::{get_varint32, put_varint32, put_varint64};
 use crate::api::write_batch::{Record, WriteBatch, WriteBatchHandler};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1567,11 +1567,64 @@ impl DbImpl {
         Ok(())
     }
 
-    /// Insert or overwrite `key → value`.
+    /// Insert or overwrite `key → value` using default [`WriteOptions`].
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let mut batch = WriteBatch::new();
-        batch.put(key.to_vec(), value.to_vec());
-        self.write(&batch)
+        self.put_opt(key, value, &WriteOptions::default())
+    }
+
+    /// Fast-path single-key insert that bypasses [`WriteBatch`].
+    ///
+    /// The single-key path avoids two redundant `Vec<u8>` allocations
+    /// (one per key/value to populate the batch) plus the
+    /// `Vec<Record>` push and the dispatch through
+    /// [`encode_batch_record`]. Semantics are identical to building
+    /// a one-record `WriteBatch` and calling [`Self::write_opt`].
+    pub fn put_opt(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        opts: &WriteOptions,
+    ) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        while state.default_cf().l0.len() >= self.level0_stop_writes_trigger as usize {
+            state = self.flush_done.wait(state).unwrap();
+        }
+        let seq = state.last_sequence + 1;
+
+        if !opts.disable_wal {
+            // Encode a 1-record WAL entry inline.
+            let mut record_buf: Vec<u8> =
+                Vec::with_capacity(10 + 5 + 1 + 5 + key.len() + 5 + value.len());
+            put_varint64(&mut record_buf, seq);
+            put_varint32(&mut record_buf, 1); // count = 1
+            record_buf.push(0x1); // Put tag
+            put_varint32(&mut record_buf, key.len() as u32);
+            record_buf.extend_from_slice(key);
+            put_varint32(&mut record_buf, value.len() as u32);
+            record_buf.extend_from_slice(value);
+            state.wal.add_record(&record_buf)?;
+            if opts.sync {
+                state.wal.sync()?;
+            }
+        }
+
+        state
+            .default_cf_mut()
+            .memtable
+            .add(seq, ValueType::Value, key, value)?;
+        state.last_sequence = seq;
+
+        let needs_flush = {
+            let cf = state.default_cf();
+            let per_cf = cf.options.write_buffer_size;
+            let threshold = if per_cf > 0 { per_cf } else { self.write_buffer_size };
+            cf.memtable.approximate_memory_usage() >= threshold && cf.immutable.is_none()
+        };
+        drop(state);
+        if needs_flush {
+            self.schedule_flush()?;
+        }
+        Ok(())
     }
 
     /// Delete `key`.
@@ -3079,7 +3132,7 @@ impl Drop for DbImpl {
 /// Flink disables WAL (`WriteOptions.setDisableWAL(true)`) so this
 /// does not affect the Flink integration path.
 fn encode_batch_record(batch: &WriteBatch, first_seq: SequenceNumber, out: &mut Vec<u8>) {
-    crate::util::coding::put_varint64(out, first_seq);
+    put_varint64(out, first_seq);
     put_varint32(out, batch.records().len() as u32);
     for record in batch.records() {
         match record {

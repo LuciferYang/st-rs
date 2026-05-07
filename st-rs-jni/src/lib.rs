@@ -228,20 +228,23 @@ pub extern "system" fn Java_org_forstdb_RocksDB_put__JJJ_3B_3B(
     };
     let opts = engine_write_options(write_opts_handle);
 
-    let mut batch = st_rs::WriteBatch::new();
     if cf_handle == 0 {
-        batch.put(key_bytes, val_bytes);
-    } else {
-        let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
-            Some(cf) => cf,
-            None => {
-                throw_rocks_exception(&mut env, "null column family handle");
-                return;
-            }
-        };
-        use st_rs::api::db::ColumnFamilyHandle;
-        batch.put_cf(cf_arc.id(), key_bytes, val_bytes);
+        // Default-CF fast path: bypass WriteBatch entirely.
+        if let Err(e) = db.put_opt(&key_bytes, &val_bytes, &opts) {
+            throw_rocks_exception(&mut env, &e.to_string());
+        }
+        return;
     }
+    let cf_arc = match unsafe { from_handle::<Arc<st_rs::ColumnFamilyHandleImpl>>(cf_handle) } {
+        Some(cf) => cf,
+        None => {
+            throw_rocks_exception(&mut env, "null column family handle");
+            return;
+        }
+    };
+    use st_rs::api::db::ColumnFamilyHandle;
+    let mut batch = st_rs::WriteBatch::new();
+    batch.put_cf(cf_arc.id(), key_bytes, val_bytes);
     if let Err(e) = db.write_opt(&batch, &opts) {
         throw_rocks_exception(&mut env, &e.to_string());
     }
