@@ -37,6 +37,10 @@ harness = false
 name = "concurrent"
 harness = false
 
+[[bench]]
+name = "compaction"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

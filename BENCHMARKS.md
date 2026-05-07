@@ -201,7 +201,40 @@ The Rust-side `cargo bench --bench engine` numbers reflect the same
 two fixes (no JNI overhead in this path): `put_one` dropped from
 ~4500 µs to **~850 ns**, `get_hit` from ~18.5 µs to **~890 ns**.
 
-### 5. Standalone perf harness — `examples/db_bench.rs`
+### 5. Compaction-throughput bench — `benches/compaction.rs`
+
+Builds N synthetic L0 SST files in a temp dir, then times
+`CompactionJob::run()` merging them into a single L1 SST. Reports
+MB/s on the input bytes — the metric a regression in the merging
+iterator, block builder, or filter-block writer would surface.
+
+```bash
+cargo bench --bench compaction
+cargo bench --bench compaction -- disjoint     # filter
+```
+
+Configurations cover the read-vs-write-amplification axes:
+
+| Config | Inputs × entries | Overlap | What it stresses |
+|---|---:|---:|---|
+| `disjoint_4x25k` | 4 × 25k | 0% | merge + write path with no dedup; every entry survives |
+| `overlap_50_4x25k` | 4 × 25k | 50% | typical L0 → L1 with moderate duplication |
+| `fullover_4x25k` | 4 × 25k | 100% | dedup-heavy; 75% of input entries are stale and dropped |
+
+**Recorded result (Apple Silicon, 10 samples):**
+
+| Config | Time | Throughput |
+|---|---:|---:|
+| `disjoint_4x25k` | 74.7 ms | 148 MiB/s |
+| `overlap_50_4x25k` | 54.5 ms | 203 MiB/s |
+| `fullover_4x25k` | 42.3 ms | 262 MiB/s |
+
+The MB/s number rises with overlap because more entries get dropped
+during dedup, so the output SST writes less. A meaningful regression
+would show up as a uniform drop across all three configs (slower
+merging iterator) or a drop only on `fullover` (slower dedup).
+
+### 6. Standalone perf harness — `examples/db_bench.rs`
 
 Quick port of upstream RocksDB's `db_bench_tool.cc`. Single-shot
 fillseq / readrandom / scanforward numbers on a 100k-entry DB.
@@ -211,25 +244,81 @@ Useful for eyeballing absolute throughput; not statistical.
 cargo run --release --example db_bench
 ```
 
+## How to run benches reproducibly
+
+Bench numbers are only meaningful relative to a stable environment.
+The defaults criterion gives you on a noisy laptop are fine for
+spotting 2× regressions but useless for tracking 5–10% changes.
+This section captures the minimum hygiene to get repeatable numbers
+on the machines we actually use.
+
+**General (any OS):**
+
+- **Quiesce the box.** Close browsers, IDEs, Slack, anything that
+  kicks off background work. Disable Spotlight/index-syncing.
+  Bench *just* benches.
+- **Run on AC power.** Battery-saving / dynamic frequency scaling
+  destroys repeatability.
+- **Always run the comparison side back-to-back.** Don't compare a
+  number from yesterday's machine state with today's — re-run both
+  baselines together and look at the *delta*, not absolute MB/s.
+- **Beware thermal throttling.** Long bench runs (>5 min) on a
+  thermally constrained machine (laptop, Mac mini, anything fanless)
+  will drift downward as the chip heats up. If you see a bench
+  monotonically slowing across criterion samples, that's the cause.
+- **Use criterion's confidence intervals.** A change inside the
+  reported interval is noise; criterion already prints the p-value
+  for `change` rows.
+
+**Linux (best-case stable runner):**
+
+```bash
+# 1. Set the CPU governor to "performance" so the cores don't downclock.
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# 2. Disable turbo so per-core frequency is fixed (predictable, slower).
+echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo   # Intel
+# AMD: cpupower frequency-set -g performance
+
+# 3. Pin the bench process to specific cores. taskset works for any
+#    binary; cset shield can isolate cores from the kernel scheduler:
+sudo cset shield --cpu 2,3 --kthread on
+sudo cset shield --exec -- cargo bench --bench engine
+
+# 4. Optionally disable hyperthreading siblings of pinned cores so the
+#    benched code has the L1/L2/scheduler to itself.
+echo 0 | sudo tee /sys/devices/system/cpu/cpu3/online
+```
+
+**Apple Silicon (the most common dev box here):**
+
+```bash
+# 1. Keep the system from sleeping or throttling for power reasons
+#    while a bench is running.
+caffeinate -dimsu cargo bench --bench engine
+
+# 2. Higher-fidelity: also prevent the OS from idling cores.
+sudo pmset noidle &
+NOIDLE=$!
+cargo bench --bench engine
+kill $NOIDLE
+```
+
+Apple Silicon has performance + efficiency cores; the macOS scheduler
+will sometimes hand criterion samples to E-cores and skew the
+distribution. There's no public API to pin to P-cores, but running
+on AC + caffeinate gets close enough for our purposes.
+
+**Variance budget:** treat any per-run change inside ±10% as noise
+on a laptop, ±5% on a quiesced desktop, ±2% on a `cset`-shielded
+Linux runner. CI runs (GHA shared runners) routinely swing ±20–30%
+on iteration-throughput benches because the underlying VM is
+shared — that's what gap (c) is for.
+
 ## What we don't have (gaps)
 
 These are tracked here so future contributors can pick them up. Each
 gap lists *why* it would be valuable and *what* would close it.
-
-### a. Compaction-throughput bench
-
-**Gap:** No bench measures bytes/sec rewritten during background
-compaction, the ratio of read vs write amplification, or the wall-clock
-cost of a manual full compaction on a populated DB.
-
-**Why it matters:** compaction tuning is a major source of
-production incidents in any LSM. Without a regression baseline a
-slowdown in the merging iterator, block builder, or filter-block
-write path can land silently.
-
-**To close:** new `benches/compaction.rs` that pre-populates N levels
-of L0 SSTs (via `flush_all_cfs` in a loop), then times
-`pick_compaction_batch + CompactionJob::run`. Report MB/s.
 
 ### c. CI regression gate
 
@@ -249,21 +338,6 @@ between releases.
 
 GHA's shared runners are too noisy for raw absolute numbers (load
 averages vary), so option 2 is the most realistic short-term path.
-
-### e. Stable bench environment / variance budget
-
-**Gap:** No documented procedure for running benches in a stable
-environment (CPU governor, hyperthreading, background load), so
-local numbers are not directly comparable across machines or runs.
-
-**Why it matters:** bench output without a variance budget is
-anecdotal. Even Criterion's own confidence intervals get washed out
-by environmental noise.
-
-**To close:** add a one-page "How to run benches reproducibly"
-section here covering at minimum: `cset shield` / `taskset` pinning,
-`performance` CPU governor, disabling turbo, and Apple Silicon's
-`pmset noidle`.
 
 ## Convention
 
