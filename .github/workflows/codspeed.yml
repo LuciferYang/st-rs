@@ -8,15 +8,14 @@ name: CodSpeed
 # meaning we get useful regression detection on GitHub-hosted runners
 # whose noise budget is otherwise too high to track 5-10% changes.
 #
-# REQUIRED ONE-TIME SETUP (before this workflow is meaningful):
+# REQUIRED ONE-TIME SETUP (before enabling this workflow):
 #   1. Install the CodSpeed GitHub App on the repo:
 #        https://github.com/apps/codspeed
 #   2. Generate a project token at https://codspeed.io/settings,
 #      then add it as a repo secret named CODSPEED_TOKEN.
-#
-# Until both steps are done this workflow will fail with an auth
-# error. To temporarily disable while CodSpeed is being set up, set
-# the repo variable CODSPEED_DISABLED=true (overrides the gate below).
+#   3. Set the repo variable CODSPEED_ENABLED=true to turn this
+#      workflow on. (Skipped by default so the workflow doesn't
+#      show as failing while setup is still pending.)
 #
 # See BENCHMARKS.md "CI regression gate" for context.
 
@@ -31,7 +30,7 @@ jobs:
   benchmarks:
     name: Run benchmarks under CodSpeed
     runs-on: ubuntu-22.04
-    if: ${{ vars.CODSPEED_DISABLED != 'true' }}
+    if: ${{ vars.CODSPEED_ENABLED == 'true' }}
     steps:
       - uses: actions/checkout@v4
 

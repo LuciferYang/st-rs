@@ -333,16 +333,15 @@ output.
   deltas vs the base branch, fails if a regression exceeds the
   configured threshold.
 
-**One-time setup** (required before the workflow becomes meaningful):
+**One-time setup** (required to enable the workflow):
 
 1. Install the [CodSpeed GitHub App](https://github.com/apps/codspeed)
    on this repo.
 2. Generate a project token at <https://codspeed.io/settings>, then
    add it as a repo secret named `CODSPEED_TOKEN`.
-
-Until both are done the workflow will fail with an auth error. To
-temporarily disable the workflow while the setup is pending, set
-the repo variable `CODSPEED_DISABLED=true`.
+3. Set the repo variable `CODSPEED_ENABLED=true` to turn the
+   workflow on. (Off by default so the check doesn't show as
+   failing while setup is pending.)
 
 **Local fallback:** the `codspeed-criterion-compat` crate is a
 drop-in for `criterion`; when the CodSpeed env vars aren't set
