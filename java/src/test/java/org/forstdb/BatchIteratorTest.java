@@ -21,6 +21,7 @@ package org.forstdb;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -146,6 +147,75 @@ class BatchIteratorTest {
             }
 
             db.close();
+        }
+    }
+
+    @Test
+    void nextBatchPacked_roundTripsKeyValuePairs(@TempDir Path dbDir)
+            throws Exception {
+        try (DBOptions opts = new DBOptions().setCreateIfMissing(true)) {
+            final RocksDB db = RocksDB.open(opts, dbDir.toString());
+            for (int i = 0; i < 25; i++) {
+                final String k = String.format("k%04d", i);
+                final String v = "value-of-" + k;
+                db.put(k.getBytes(), v.getBytes());
+            }
+
+            try (RocksIterator it = db.newIterator(new ColumnFamilyHandle(0))) {
+                it.seekToFirst();
+
+                final byte[] packed = it.nextBatchPacked(10);
+                final List<byte[]> keys = new ArrayList<>();
+                final List<byte[]> values = new ArrayList<>();
+                decodePacked(packed, keys, values);
+
+                assertEquals(10, keys.size());
+                assertEquals(10, values.size());
+                for (int i = 0; i < 10; i++) {
+                    final String expectedK = String.format("k%04d", i);
+                    assertArrayEquals(expectedK.getBytes(), keys.get(i));
+                    assertArrayEquals(("value-of-" + expectedK).getBytes(), values.get(i));
+                }
+
+                // Pull the rest and verify exhaustion.
+                final byte[] rest = it.nextBatchPacked(100);
+                final List<byte[]> restKeys = new ArrayList<>();
+                final List<byte[]> restValues = new ArrayList<>();
+                decodePacked(rest, restKeys, restValues);
+                assertEquals(15, restKeys.size());
+
+                final byte[] empty = it.nextBatchPacked(10);
+                final List<byte[]> emptyKeys = new ArrayList<>();
+                final List<byte[]> emptyValues = new ArrayList<>();
+                decodePacked(empty, emptyKeys, emptyValues);
+                assertEquals(0, emptyKeys.size());
+            }
+
+            db.close();
+        }
+    }
+
+    /**
+     * Decode the big-endian packed buffer produced by
+     * {@link RocksIterator#nextBatchPacked(int)} into parallel
+     * key / value lists. Test helper, not for production paths
+     * where consumers can avoid the per-pair byte[] copy.
+     */
+    private static void decodePacked(
+            final byte[] packed,
+            final List<byte[]> keys,
+            final List<byte[]> values) {
+        final ByteBuffer bb = ByteBuffer.wrap(packed);
+        final int count = bb.getInt();
+        for (int i = 0; i < count; i++) {
+            final int keyLen = bb.getInt();
+            final byte[] key = new byte[keyLen];
+            bb.get(key);
+            keys.add(key);
+            final int valLen = bb.getInt();
+            final byte[] val = new byte[valLen];
+            bb.get(val);
+            values.add(val);
         }
     }
 }

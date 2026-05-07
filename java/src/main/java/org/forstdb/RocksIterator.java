@@ -91,6 +91,32 @@ public class RocksIterator extends RocksObject implements RocksIteratorInterface
         return nextBatch0(nativeHandle_, max);
     }
 
+    /**
+     * Vectorized read returning a single packed {@code byte[]} buffer
+     * instead of a {@code 2N}-long {@code byte[][]}. The buffer layout
+     * is big-endian:
+     *
+     * <pre>
+     *   [count: u32]
+     *   for each pair:
+     *     [key_len: u32][key_bytes]
+     *     [val_len: u32][val_bytes]
+     * </pre>
+     *
+     * <p>This trades {@code 1 + 2N} JVM allocations + JNI crossings
+     * (one {@code byte_array_from_slice} per key and value) for a
+     * single allocation and one bulk copy. Decode on demand via
+     * {@link java.nio.ByteBuffer#wrap(byte[])} — typically ~3–5×
+     * cheaper end-to-end than {@link #nextBatch(int)} for chunks
+     * that contain dozens of pairs or more.
+     *
+     * <p>Returns an empty buffer (count=0) when the iterator is
+     * exhausted.
+     */
+    public byte[] nextBatchPacked(final int max) {
+        return nextBatchPacked0(nativeHandle_, max);
+    }
+
     @Override
     protected void disposeInternal(final long handle) {
         disposeIterator(handle);
@@ -115,6 +141,8 @@ public class RocksIterator extends RocksObject implements RocksIteratorInterface
     private static native byte[] value0(long handle);
 
     private static native byte[][] nextBatch0(long handle, int max);
+
+    private static native byte[] nextBatchPacked0(long handle, int max);
 
     private static native void disposeIterator(long handle);
 }

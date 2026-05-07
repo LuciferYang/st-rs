@@ -64,7 +64,8 @@ under the `bench` Maven profile, and launches a fresh JVM with the
 right `java.library.path` and test classpath so JMH's forks find both.
 
 Groups mirror the criterion harness: `put_one`, `put_batch/{8,64,512}`,
-`get_hit`, `get_miss`, `scan_forward`, `next_batch/{64,256,1024}`.
+`get_hit`, `get_miss`, `scan_forward`, `next_batch/{64,256,1024}`,
+`next_batch_packed/{64,256,1024}`.
 
 **Sample comparison (Apple Silicon, single-threaded, warm DB,
 `-wi 1 -i 2 -f 1` — illustrative, not a publishable baseline):**
@@ -77,6 +78,24 @@ That ~4.5 µs overhead is the per-call cost of `byte[]` allocation +
 JNI marshalling on the get path. It's the headline number this bench
 exists to track — a 10× regression here would cost Flink workloads
 real money.
+
+**Recorded result — packed vs unpacked vectorized read (50k entries,
+`-wi 1 -i 2 -f 1`):**
+
+| chunk | `next_batch` (`byte[][]`) | `next_batch_packed` (`byte[]`) | Speedup |
+|---|---:|---:|---:|
+| 64 | 23.47 ms | 8.05 ms | 2.9× |
+| 256 | 25.63 ms | 7.74 ms | 3.3× |
+| 1024 | 28.35 ms | 6.93 ms | 4.1× |
+
+The unpacked variant pays one `byte_array_from_slice` JNI crossing
+per key *and* per value — for 50k entries that's 100k JVM allocations
+across the JNI boundary. The packed variant builds the chunk once
+in Rust with a length-prefixed layout, then crosses with a single
+`byte_array_from_slice`; the Java caller decodes pairs on demand
+via `ByteBuffer.wrap(packed)`. The win grows with chunk size because
+fixed per-chunk costs amortize while the per-entry savings stay
+constant. See `RocksIterator.nextBatchPacked(int)`.
 
 ### 3. Upstream-RocksDB comparison — `RocksdbBenchmark.java`
 

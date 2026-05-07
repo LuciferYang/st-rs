@@ -1418,6 +1418,59 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_nextBatch0(
     arr.into_raw()
 }
 
+/// `RocksIterator.nextBatchPacked0(long handle, int max) -> byte[]`
+///
+/// Vectorized read returning a single packed `byte[]` instead of a
+/// 2N-long `byte[][]`. The buffer layout is big-endian:
+///
+/// ```text
+///   [count: u32]
+///   for each pair:
+///     [key_len: u32][key_bytes]
+///     [val_len: u32][val_bytes]
+/// ```
+///
+/// This trades 1 + 2N JVM allocations + JNI crossings (one per
+/// `byte_array_from_slice`) for a single allocation + one bulk copy
+/// from the Rust-side staging buffer. The Java caller decodes pairs
+/// on demand via `ByteBuffer.wrap(packed)`.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksIterator_nextBatchPacked0(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    max: jint,
+) -> jbyteArray {
+    if handle == 0 {
+        return std::ptr::null_mut();
+    }
+    let iter = unsafe { &mut *(handle as *mut st_rs::DbIterator) };
+    let cap = if max < 0 { 0 } else { max as usize };
+    let batch = iter.next_chunk(cap);
+
+    let total: usize = 4
+        + batch
+            .iter()
+            .map(|(k, v)| 8 + k.len() + v.len())
+            .sum::<usize>();
+    let mut buf: Vec<u8> = Vec::with_capacity(total);
+    buf.extend_from_slice(&(batch.len() as u32).to_be_bytes());
+    for (k, v) in &batch {
+        buf.extend_from_slice(&(k.len() as u32).to_be_bytes());
+        buf.extend_from_slice(k);
+        buf.extend_from_slice(&(v.len() as u32).to_be_bytes());
+        buf.extend_from_slice(v);
+    }
+
+    match env.byte_array_from_slice(&buf) {
+        Ok(arr) => arr.into_raw(),
+        Err(e) => {
+            throw_rocks_exception(&mut env, &format!("packed byte[]: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// `RocksIterator.disposeIterator(long handle)`
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_RocksIterator_disposeIterator(

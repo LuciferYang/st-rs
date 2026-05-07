@@ -19,6 +19,7 @@
 package org.forstdb.jmh;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
@@ -220,6 +221,43 @@ public class JniOverheadBenchmark {
                 // nextBatch returns alternating key/value entries —
                 // halve to count logical rows.
                 total += chunk.length / 2;
+            }
+            bh.consume(total);
+        }
+    }
+
+    /**
+     * Same workload as {@link #next_batch} but using
+     * {@link RocksIterator#nextBatchPacked(int)}, which returns one
+     * {@code byte[]} containing all keys and values for the chunk
+     * instead of {@code 2N} separately-allocated {@code byte[]}s.
+     * Each iteration still extracts every key+value into its own
+     * {@code byte[]} (matching the {@code next_batch} workload), so
+     * the diff is purely the JNI / JVM allocation cost.
+     */
+    @Benchmark
+    @Measurement(iterations = 3, time = 3)
+    public void next_batch_packed(final ChunkSizeParam p, final Blackhole bh) throws Exception {
+        try (RocksIterator it = db.newIterator(defaultCf)) {
+            it.seekToFirst();
+            int total = 0;
+            while (true) {
+                byte[] packed = it.nextBatchPacked(p.chunk);
+                if (packed == null || packed.length == 0) break;
+                final ByteBuffer bb = ByteBuffer.wrap(packed);
+                final int count = bb.getInt();
+                if (count == 0) break;
+                for (int i = 0; i < count; i++) {
+                    final int klen = bb.getInt();
+                    final byte[] key = new byte[klen];
+                    bb.get(key);
+                    bh.consume(key);
+                    final int vlen = bb.getInt();
+                    final byte[] val = new byte[vlen];
+                    bb.get(val);
+                    bh.consume(val);
+                }
+                total += count;
             }
             bh.consume(total);
         }
