@@ -313,31 +313,58 @@ on AC + caffeinate gets close enough for our purposes.
 on a laptop, ±5% on a quiesced desktop, ±2% on a `cset`-shielded
 Linux runner. CI runs (GHA shared runners) routinely swing ±20–30%
 on iteration-throughput benches because the underlying VM is
-shared — that's what gap (c) is for.
+shared — see "CI regression gate" below for how we work around it.
+
+## CI regression gate
+
+The criterion benches are wired to [CodSpeed](https://codspeed.io)
+via the `codspeed-criterion-compat` shim and the
+`.github/workflows/codspeed.yml` workflow. CodSpeed instruments at
+the function-call level (using `valgrind`-style counting), which
+sidesteps GHA's wall-time noise problem: the same instrumented
+counts come out regardless of which physical machine GitHub
+allocates. That's why we don't try to gate on raw `cargo bench`
+output.
+
+**Behavior:**
+
+- On every push to `main`: re-runs the suite to refresh the baseline.
+- On every PR: runs the suite, posts a comment with per-bench
+  deltas vs the base branch, fails if a regression exceeds the
+  configured threshold.
+
+**One-time setup** (required before the workflow becomes meaningful):
+
+1. Install the [CodSpeed GitHub App](https://github.com/apps/codspeed)
+   on this repo.
+2. Generate a project token at <https://codspeed.io/settings>, then
+   add it as a repo secret named `CODSPEED_TOKEN`.
+
+Until both are done the workflow will fail with an auth error. To
+temporarily disable the workflow while the setup is pending, set
+the repo variable `CODSPEED_DISABLED=true`.
+
+**Local fallback:** the `codspeed-criterion-compat` crate is a
+drop-in for `criterion`; when the CodSpeed env vars aren't set
+(local `cargo bench`, the regular `cargo bench --no-run` smoke
+job in `ci.yml`) it falls through to plain criterion. So the gate
+is a strict superset — adding it doesn't change developer
+ergonomics.
+
+**Why CodSpeed and not bencher.dev / self-hosted runners:** CodSpeed
+is the only free-for-OSS option that gives us call-instruction
+counts rather than wall time, which is what makes a perf gate
+viable on GHA's shared runners. A self-hosted runner with `cset`
+shielding would also work but adds infra burden we don't currently
+have a maintainer for.
 
 ## What we don't have (gaps)
 
 These are tracked here so future contributors can pick them up. Each
 gap lists *why* it would be valuable and *what* would close it.
 
-### c. CI regression gate
-
-**Gap:** CI compiles benches but doesn't run them or compare against
-a baseline. A 5× write-path regression would land green.
-
-**Why it matters:** without a perf gate, optimizations decay silently
-between releases.
-
-**To close:** options in increasing order of fidelity —
-1. Run `cargo bench` on every push, compare against the previous run's
-   stored Criterion estimates (criterion writes JSON to `target/criterion/`).
-2. Use `bencher.dev` or `codspeed.io` (free for OSS) — both auto-detect
-   regressions and post PR comments.
-3. Self-hosted: dedicate a known-spec runner so absolute numbers stay
-   comparable across runs.
-
-GHA's shared runners are too noisy for raw absolute numbers (load
-averages vary), so option 2 is the most realistic short-term path.
+(All four originally listed gaps — a, b, c, d, e — are now closed;
+this section is preserved for the next round of follow-ups.)
 
 ## Convention
 

@@ -22,7 +22,9 @@
 //! Flink workloads exercise: small keyed-state writes, point lookups,
 //! forward scans, and the M5b vectorized `next_chunk` path.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use codspeed_criterion_compat::{
+    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+};
 use st_rs::{DbImpl, DbOptions, WriteBatch};
 use std::hint::black_box;
 use std::path::PathBuf;

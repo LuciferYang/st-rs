@@ -35,7 +35,7 @@
 //! A regression that introduces a long-held lock on the read path
 //! would show up here as `concurrent_get` flattening.
 
-use criterion::{
+use codspeed_criterion_compat::{
     criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
 use st_rs::{DbImpl, DbOptions};

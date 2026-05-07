@@ -27,7 +27,12 @@ snappy = ["snap"]
 lz4 = ["lz4_flex"]
 
 [dev-dependencies]
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# criterion-compatible bench runner that auto-detects whether it's
+# running under CodSpeed instrumentation. When the CodSpeed env vars
+# aren't set (i.e. local `cargo bench` or non-CodSpeed CI), it falls
+# through to plain criterion behavior. See BENCHMARKS.md "CI
+# regression gate" for the workflow + secret setup.
+codspeed-criterion-compat = { version = "4", default-features = false }
 
 [[bench]]
 name = "engine"

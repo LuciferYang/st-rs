@@ -1,0 +1,54 @@
+name: CodSpeed
+
+# CI regression gate for the criterion benches under benches/.
+#
+# Runs on every push to main (to refresh the baseline) and every pull
+# request (to detect regressions). CodSpeed instruments at the
+# function-call level so it doesn't depend on absolute wall time —
+# meaning we get useful regression detection on GitHub-hosted runners
+# whose noise budget is otherwise too high to track 5-10% changes.
+#
+# REQUIRED ONE-TIME SETUP (before this workflow is meaningful):
+#   1. Install the CodSpeed GitHub App on the repo:
+#        https://github.com/apps/codspeed
+#   2. Generate a project token at https://codspeed.io/settings,
+#      then add it as a repo secret named CODSPEED_TOKEN.
+#
+# Until both steps are done this workflow will fail with an auth
+# error. To temporarily disable while CodSpeed is being set up, set
+# the repo variable CODSPEED_DISABLED=true (overrides the gate below).
+#
+# See BENCHMARKS.md "CI regression gate" for context.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  benchmarks:
+    name: Run benchmarks under CodSpeed
+    runs-on: ubuntu-22.04
+    if: ${{ vars.CODSPEED_DISABLED != 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-codspeed
+        run: cargo install cargo-codspeed --locked
+
+      - name: Build benchmarks under CodSpeed instrumentation
+        run: cargo codspeed build -p st-rs
+
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v3
+        with:
+          run: cargo codspeed run -p st-rs
+          token: ${{ secrets.CODSPEED_TOKEN }}

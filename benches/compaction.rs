@@ -31,7 +31,9 @@
 //!   dedup workload — at 0% every entry survives, at 100% only the
 //!   newest version of each key survives).
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use codspeed_criterion_compat::{
+    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+};
 use st_rs::{
     BlockBasedTableBuilder, BlockBasedTableOptions, BlockBasedTableReader, CompactionJob,
     FileSystem, InternalKey, PosixFileSystem, RandomAccessFileReader, ValueType,
