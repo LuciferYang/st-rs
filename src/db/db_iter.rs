@@ -724,18 +724,26 @@ impl DbIterator {
             // Drain whatever's left of the current chunk first.
             if let Some(i) = self.pos {
                 let take = (max - out.len()).min(self.items.len() - i);
-                for j in 0..take {
-                    out.push(self.items[i + j].clone());
-                }
-                let new_i = i + take;
-                if new_i < self.items.len() {
-                    self.pos = Some(new_i);
+                let exhausted = i + take == self.items.len();
+                // Move entries directly out of `items` instead of cloning
+                // each `(Vec<u8>, Vec<u8>)` pair — that previously cost two
+                // heap allocations per element and made the vectorized path
+                // measurably *slower* than scalar `next()`.
+                out.extend(self.items.drain(i..i + take));
+                if !exhausted {
+                    // Drain shifted later entries left, so pos stays at `i`.
+                    self.pos = Some(i);
                     return out;
                 }
-                // Current chunk exhausted. In streaming mode, try a refill;
+                // Current chunk exhausted. In streaming mode, refill;
                 // otherwise we're done.
                 if self.streaming.is_some() {
-                    let last_key = self.items[self.items.len() - 1].0.clone();
+                    // The cursor needs an owned key, and we just moved the
+                    // last entry into `out` — borrow + clone it from there.
+                    let last_key = out
+                        .last()
+                        .map(|(k, _)| k.clone())
+                        .expect("drained chunk must contain a last key");
                     let s = self.streaming.as_mut().unwrap();
                     if !matches!(s.cursor, RefillCursor::Done) {
                         s.cursor = RefillCursor::After(last_key);
