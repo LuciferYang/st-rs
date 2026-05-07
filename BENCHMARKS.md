@@ -362,8 +362,91 @@ have a maintainer for.
 These are tracked here so future contributors can pick them up. Each
 gap lists *why* it would be valuable and *what* would close it.
 
-(All four originally listed gaps — a, b, c, d, e — are now closed;
-this section is preserved for the next round of follow-ups.)
+The original a/b/c/d/e set is closed. The next round, surfaced by the
+`concurrent_*` benches, is structural — single `Mutex<DbState>` plus
+single-threaded skip-list memtable cap concurrency.
+
+### c1. Read-side `RwLock<DbState>`
+
+**Gap:** Reads take `state.lock()` briefly to snapshot memtable + SST
+handles, then release. Even brief, this Mutex caps `concurrent_get`
+at ~1.45× peak (2T) before plateauing.
+
+**Why it matters:** Multi-slot Flink TMs and parallel scan operators
+issue concurrent reads as the realistic workload.
+
+**To close:** Replace the `Mutex` with `parking_lot::RwLock`. Audit
+every `state.lock()` call site (~30) and split into `read()` /
+`write()`. Reads take the read lock for handle snapshotting; writes
+keep exclusive access. ~50 LOC of mechanical change.
+
+**Expected:** near-linear scaling on `concurrent_get`. Does **not**
+fix the put cliff — writers still serialize on the write lock.
+
+### c2. Group commit on the write path
+
+**Gap:** Every put holds the write lock across WAL encode + append +
+memtable insert + flush trigger. With N concurrent threads,
+`concurrent_put` aggregate throughput **decreases** from 1.17 → 0.47
+Mops/s (1T → 8T) due to lock waits + cache-line bouncing.
+
+**Why it matters:** Flink keyed-state writes from N operator threads
+is the realistic concurrent-write workload.
+
+**To close:** Classic RocksDB pattern. A "leader" thread takes the
+lock, drains a queue of submitted writes, batches their WAL records
+into one `add_record`, performs all memtable inserts, then signals
+followers. Followers wait on a condvar and return after the leader
+acks. Estimated 200–400 LOC + careful invariants around sequence
+numbers and flush triggers across batched writers.
+
+**Expected:** `concurrent_put` aggregate ≥ 1T baseline at any thread
+count, with batching bonuses on the WAL when `sync=true`.
+
+**Doesn't fully scale puts** — even with the lock gone, a serial
+memtable insert through one skip-list still caps throughput.
+That's c3.
+
+### c3. Concurrent / lock-free skip-list memtable
+
+**Gap:** `SkipList::insert(&mut self, …)` requires exclusive access.
+`src/memtable/skip_list.rs:14–27` explicitly notes the port is the
+single-threaded variant; the upstream `InlineSkipList` is lock-free.
+
+**Why it matters:** Even with c2 group commit, all writes funnel
+through one skip-list on one CPU. That's the per-CF write
+throughput ceiling.
+
+**To close:** Port (or wrap a vetted crate of) a lock-free skip-list
+with atomic next-pointers and CAS-based insertion. Significant
+`unsafe`; non-trivial review.
+
+**Defer** until c2 is in and we've measured whether the memtable is
+actually the new bottleneck.
+
+### c4. Lock-free read snapshot via `Arc<DbState>` swap
+
+**Gap:** Even with c1's `RwLock`, reads still take a read lock and
+walk `state.column_families`/`l0`/`l1` to snapshot handles.
+
+**Why it matters:** Maximum read scaling — turns reads into a
+single `Arc::clone` of an atomic pointer.
+
+**To close:** `DbState` becomes `Arc<DbState>` behind an
+`ArcSwap`-like cell. Writers build a new `DbState`, swap. Readers
+load the current `Arc` (zero contention). Requires careful
+accounting of which fields can move into the immutable snapshot
+vs. need their own atomic.
+
+**Defer** until c1 has been measured and proven insufficient. The
+Flink workload may not need it.
+
+### Suggested order of attack
+
+1. **c1** first — smallest diff, proves the read-side wins.
+2. **c2** second — biggest write-side win once landed.
+3. Re-bench `concurrent_*` at each step.
+4. **c3** / **c4** only if the bench numbers still don't satisfy.
 
 ## Convention
 
