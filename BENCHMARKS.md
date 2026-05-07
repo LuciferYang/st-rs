@@ -46,7 +46,61 @@ workload. This is the win the M5b vectorization was designed for; the
 older `scan_forward` baseline hid it because the scalar bench loop
 never reads key/value at all (it just counts).
 
-### 2. JMH JNI-overhead benchmark — `java/src/test/java/org/forstdb/jmh/`
+### 2. Concurrency throughput benches — `benches/concurrent.rs`
+
+Throughput (ops/sec) at N concurrent threads. Complements the
+single-thread microbenches in `engine.rs` by surfacing lock
+contention on the global state mutex and memtable/skip-list
+serialization that single-thread numbers can't show.
+
+```bash
+cargo bench --bench concurrent                       # full run
+cargo bench --bench concurrent -- concurrent_put     # filter by group
+```
+
+Groups:
+
+| Group | Workload | Why it matters |
+|---|---|---|
+| `concurrent_put/{1,2,4,8}` | N threads each writing on disjoint key ranges | exposes write-path lock contention; every concurrent putter contends on `state.lock()` for the WAL append + memtable insert |
+| `concurrent_get/{1,2,4,8}` | N threads each doing random point lookups on a populated DB | reads release the lock fast (capture handles + SSTs, then unlock); should scale better than puts |
+
+**Recorded result (Apple Silicon, 20 samples, 10k ops/thread):**
+
+| Threads | `concurrent_put` agg | put scaling | `concurrent_get` agg | get scaling |
+|---:|---:|---:|---:|---:|
+| 1 | 1.17 Mops/s | 1.0× | 0.82 Mops/s | 1.0× |
+| 2 | 0.75 Mops/s | 0.64× | 1.19 Mops/s | 1.45× |
+| 4 | 0.55 Mops/s | 0.47× | 0.84 Mops/s | 1.02× |
+| 8 | 0.47 Mops/s | 0.40× | 1.12 Mops/s | 1.36× |
+
+Concurrent **puts get _worse_** with thread count: the single
+`Mutex<DbState>` held across the whole write path causes every
+extra thread to spend more wall time waiting on the lock + paying
+cache-line bouncing and scheduler overhead than it does doing
+useful work. **Gets** scale weakly (~1.45× peak at 2T then
+plateau) — most of the read path runs after `state.lock()` is
+released, but the lock is still acquired briefly per call to
+capture memtable/SST handles, capping read parallelism.
+
+These are real engine bottlenecks the bench was designed to
+surface. Concrete follow-ups:
+
+- **Sharded locking** (one mutex per CF, or RwLock around state)
+  would unblock `get` scaling and reduce write contention on
+  multi-CF workloads.
+- **Group commit** for the WAL append path (RocksDB's classic
+  approach: a leader thread serializes a window's writes, follower
+  threads queue and wait) would let aggregate write throughput
+  exceed single-thread.
+- **Lock-free read snapshotting** via `Arc<DbState>` swapping
+  would eliminate the read-side lock entirely.
+
+None of these are necessary for current Flink workloads (single
+operator thread per state backend instance), but they are the
+obvious next architectural moves for higher concurrency.
+
+### 3. JMH JNI-overhead benchmark — `java/src/test/java/org/forstdb/jmh/`
 
 Measures the same hot paths from Java so the difference between Rust
 direct numbers (criterion) and Java-via-JNI numbers reveals per-call
@@ -97,7 +151,7 @@ via `ByteBuffer.wrap(packed)`. The win grows with chunk size because
 fixed per-chunk costs amortize while the per-entry savings stay
 constant. See `RocksIterator.nextBatchPacked(int)`.
 
-### 3. Upstream-RocksDB comparison — `RocksdbBenchmark.java`
+### 4. Upstream-RocksDB comparison — `RocksdbBenchmark.java`
 
 Same workloads as `JniOverheadBenchmark` but driving
 `org.rocksdb.RocksDB` (rocksdbjni 9.8.4). Lives next to the JNI
@@ -147,7 +201,7 @@ The Rust-side `cargo bench --bench engine` numbers reflect the same
 two fixes (no JNI overhead in this path): `put_one` dropped from
 ~4500 µs to **~850 ns**, `get_hit` from ~18.5 µs to **~890 ns**.
 
-### 4. Standalone perf harness — `examples/db_bench.rs`
+### 5. Standalone perf harness — `examples/db_bench.rs`
 
 Quick port of upstream RocksDB's `db_bench_tool.cc`. Single-shot
 fillseq / readrandom / scanforward numbers on a 100k-entry DB.
@@ -195,21 +249,6 @@ between releases.
 
 GHA's shared runners are too noisy for raw absolute numbers (load
 averages vary), so option 2 is the most realistic short-term path.
-
-### d. Concurrency / multi-writer bench
-
-**Gap:** All benches are single-threaded. We don't measure throughput
-under N concurrent writers, contention on the memtable's skip-list, or
-the WAL write batch group commit (which is the upstream RocksDB hot
-path).
-
-**Why it matters:** Flink keyed-state writes from multiple operator
-threads are the realistic workload. Single-thread numbers can mask
-serious lock contention.
-
-**To close:** new `benches/concurrent.rs` that spins up N threads
-each performing `put` and reports aggregate throughput at N ∈ {1, 2,
-4, 8}.
 
 ### e. Stable bench environment / variance budget
 
