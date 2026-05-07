@@ -210,6 +210,49 @@ fn bench_next_chunk(c: &mut Criterion) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Apples-to-apples comparison of scalar vs vectorized iteration on the
+/// same populated DB. Both variants *physically materialize* every
+/// `(key, value)` pair into `Vec<(Vec<u8>, Vec<u8>)>` — the same shape
+/// the JNI / Velox consumer eventually copies into Java `byte[]`s. This
+/// is the workload `next_chunk` was designed for, and is the fair
+/// counterpart to `bench_scan_forward` (which only counts and never
+/// reads key/value, so it can't measure the per-element cost).
+fn bench_read_modes(c: &mut Criterion) {
+    let (db, dir) = open_populated();
+    let mut group = c.benchmark_group("read_modes");
+    group.throughput(Throughput::Elements(N_ENTRIES));
+    group.bench_function("scalar_collect", |b| {
+        b.iter(|| {
+            let mut it = db.iter().expect("iter");
+            it.seek_to_first();
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(N_ENTRIES as usize);
+            while it.valid() {
+                out.push((it.key().to_vec(), it.value().to_vec()));
+                it.next();
+            }
+            black_box(out);
+        });
+    });
+    group.bench_function("chunked_collect_1024", |b| {
+        b.iter(|| {
+            let mut it = db.iter().expect("iter");
+            it.seek_to_first();
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(N_ENTRIES as usize);
+            loop {
+                let chunk = it.next_chunk(1024);
+                if chunk.is_empty() {
+                    break;
+                }
+                out.extend(chunk);
+            }
+            black_box(out);
+        });
+    });
+    group.finish();
+    let _ = db.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 criterion_group!(
     benches,
     bench_put_sequential,
@@ -217,5 +260,6 @@ criterion_group!(
     bench_get_random,
     bench_scan_forward,
     bench_next_chunk,
+    bench_read_modes,
 );
 criterion_main!(benches);

@@ -25,12 +25,26 @@ Groups:
 | `put_batch/{8,64,512}` | one `WriteBatch::write()` per iteration | shows WAL amortization with batch size |
 | `get_random/hit` | random in-range point lookup on a populated DB | warm read path: bloom hit + block cache + memtable miss → SST decode |
 | `get_random/miss` | random out-of-range lookup | bloom-filter fast path; should be ~10–100× the hit rate |
-| `scan_forward/full_db` | `seek_to_first` + walk every key | k-way merging-iterator throughput |
-| `next_chunk/{64,256,1024}` | M5b vectorized chunked iterator | the path Flink's `nextBatch` takes; parameterized by chunk size |
+| `scan_forward/full_db` | `seek_to_first` + walk every key with `next()`, just count | k-way merging-iterator throughput; bench loop never reads key/value, so it isolates iterator bookkeeping cost |
+| `next_chunk/{64,256,1024}` | M5b vectorized chunked iterator, materializes pairs | the path Flink's `nextBatch` takes; parameterized by chunk size |
+| `read_modes/{scalar_collect,chunked_collect_1024}` | scalar `next()` + `to_vec()` vs `next_chunk(1024)` on the same DB, both producing `Vec<(Vec<u8>, Vec<u8>)>` | apples-to-apples: shows the per-call-overhead amortization the chunked path was designed for |
 
 CI runs `cargo bench --no-run` so the benches stay buildable, but we
 do **not** gate merges on bench numbers (no regression baseline yet —
 see gaps below).
+
+**Recorded result — `read_modes` (Apple Silicon, 100 samples, 50k entries):**
+
+| Mode | Time | Per-elem | Throughput |
+|---|---:|---:|---:|
+| `scalar_collect` (`next()` + `to_vec()`) | 7.13 ms | 143 ns | 7.0 Melem/s |
+| `chunked_collect_1024` (`next_chunk(1024)`) | 5.45 ms | 109 ns | 9.2 Melem/s |
+
+The chunked path is **~24% faster** than scalar when both physically
+materialize the `(key, value)` pairs — the JNI/Velox consumer's
+workload. This is the win the M5b vectorization was designed for; the
+older `scan_forward` baseline hid it because the scalar bench loop
+never reads key/value at all (it just counts).
 
 ### 2. JMH JNI-overhead benchmark — `java/src/test/java/org/forstdb/jmh/`
 
@@ -143,19 +157,6 @@ write path can land silently.
 **To close:** new `benches/compaction.rs` that pre-populates N levels
 of L0 SSTs (via `flush_all_cfs` in a loop), then times
 `pick_compaction_batch + CompactionJob::run`. Report MB/s.
-
-### b. Vectorized-read comparison (scalar vs `next_chunk`)
-
-**Gap:** We have `scan_forward/full_db` (scalar `next()`) and
-`next_chunk/{64,256,1024}` (M5b vectorized) as separate groups, but no
-direct same-DB comparison group that would make the speedup obvious.
-
-**Why it matters:** the M5b work was motivated by the hypothesis that
-batched reads amortize per-call overhead. The current numbers don't
-clearly demonstrate that — adding a paired comparison group would.
-
-**To close:** add a `read_modes` group that runs both styles back-to-back
-on the same DB and reports the ratio.
 
 ### c. CI regression gate
 
