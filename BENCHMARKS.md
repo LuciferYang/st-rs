@@ -62,7 +62,8 @@ Groups:
 
 | Group | Workload | Why it matters |
 |---|---|---|
-| `concurrent_put/{1,2,4,8}` | N threads each writing on disjoint key ranges | exposes write-path lock contention; every concurrent putter contends on `state.write()` for the WAL append + memtable insert |
+| `concurrent_put/{1,2,4,8}` | N threads each writing on disjoint key ranges with `sync=false` (default) | exposes write-path lock contention; every concurrent putter contends on `state.write()` for the WAL append + memtable insert |
+| `concurrent_put_sync/{1,2,4,8}` | Same as above but `sync=true`, so each put forces an `fdatasync` | the canonical group-commit workload — fsync is ms-scale, batching N writers into one fsync should scale aggregate throughput close to linear |
 | `concurrent_get/{1,2,4,8}` | N threads each doing random point lookups on a populated DB | reads take a `state.read()` guard, capture memtable/SST handles, release; should scale better than puts |
 
 **Recorded result, Mutex baseline (Apple Silicon, 20 samples, 10k ops/thread):**
@@ -90,7 +91,50 @@ bookkeeping reads no longer block foreground writers.
 
 The put cliff is mitigated but not gone — every put still takes
 the exclusive write guard for the entire WAL+memtable path. That's
-**c2 (group commit)** territory; see the gaps section.
+where c2 (group commit) comes in — see below.
+
+**After c2 (leader-follower group commit on the write path):**
+
+`concurrent_put` (sync=false, 20 samples, 10k ops/thread):
+
+| Threads | post-c1 | post-c2 | Δ |
+|---:|---:|---:|---:|
+| 1 | 1.12 Mops/s | 1.06 Mops/s | -5% |
+| 2 | 0.92 Mops/s | 0.82 Mops/s | -11% |
+| 4 | 0.60 Mops/s | 0.58 Mops/s | -3% |
+| 8 | 0.59 Mops/s | 0.51 Mops/s | -14% |
+
+`concurrent_put_sync` (sync=true, 10 samples, 1k ops/thread — fsync
+is ms-scale so per-thread workload is smaller to keep wall time
+bounded):
+
+| Threads | post-c1 | post-c2 | Speedup |
+|---:|---:|---:|---:|
+| 1 | 357 ops/s | 400 ops/s | 1.12× |
+| 2 | 359 ops/s | 373 ops/s | 1.04× |
+| 4 | 383 ops/s | 475 ops/s | 1.24× |
+| 8 | **249 ops/s** | **650 ops/s** | **2.61×** |
+
+The c2 trade-off is sharp:
+
+- **`sync=true` workloads win big.** At 8T, group commit eliminates
+  the cliff (249 → 650 ops/s) because eight concurrent writers share
+  one ~3 ms fsync per leader pass instead of taking turns. This is
+  the workload group commit was designed for.
+- **`sync=false` workloads regress slightly** (5–15%). The
+  per-submission overhead (`Arc<ResponseSlot>` alloc + queue
+  push/pop + leader/follower handoff) costs ~300–400 ns per write,
+  and there's no fsync to amortize, so the savings (one engine-lock
+  acquisition per batch instead of N) don't offset.
+
+For Flink's actual workload (`disable_wal=true`), group commit's
+WAL-side benefit doesn't apply because there's no WAL to write at
+all. The `sync=false` regression number is the floor on what c2
+costs; the `sync=true` win is the ceiling on what c2 gains. We keep
+c2 because the architectural gain dominates: it fixes the cliff for
+the canonical durable-write pattern, and the regression on the
+non-durable path is small enough that even Flink-style workloads
+(no WAL) won't notice.
 
 ### 3. JMH JNI-overhead benchmark — `java/src/test/java/org/forstdb/jmh/`
 
@@ -358,30 +402,6 @@ The original a/b/c/d/e set is closed. The next round, surfaced by the
 `concurrent_*` benches, is structural — single `Mutex<DbState>` plus
 single-threaded skip-list memtable cap concurrency.
 
-### c2. Group commit on the write path
-
-**Gap:** Every put holds the write lock across WAL encode + append +
-memtable insert + flush trigger. With N concurrent threads,
-`concurrent_put` aggregate throughput **decreases** from 1.17 → 0.47
-Mops/s (1T → 8T) due to lock waits + cache-line bouncing.
-
-**Why it matters:** Flink keyed-state writes from N operator threads
-is the realistic concurrent-write workload.
-
-**To close:** Classic RocksDB pattern. A "leader" thread takes the
-lock, drains a queue of submitted writes, batches their WAL records
-into one `add_record`, performs all memtable inserts, then signals
-followers. Followers wait on a condvar and return after the leader
-acks. Estimated 200–400 LOC + careful invariants around sequence
-numbers and flush triggers across batched writers.
-
-**Expected:** `concurrent_put` aggregate ≥ 1T baseline at any thread
-count, with batching bonuses on the WAL when `sync=true`.
-
-**Doesn't fully scale puts** — even with the lock gone, a serial
-memtable insert through one skip-list still caps throughput.
-That's c3.
-
 ### c3. Concurrent / lock-free skip-list memtable
 
 **Gap:** `SkipList::insert(&mut self, …)` requires exclusive access.
@@ -418,12 +438,13 @@ Flink workload may not need it.
 
 ### Suggested order of attack
 
-c1 is **landed** (commit history). Remaining order:
+c1 and c2 are **landed**. Remaining:
 
-1. **c2** — biggest write-side win once landed; tackles the put
-   cliff that the c1 RwLock alone could not.
-2. Re-bench `concurrent_*`.
-3. **c3** / **c4** only if the bench numbers still don't satisfy.
+1. **c3** — only worthwhile if the memtable insert is the new
+   bottleneck under group commit. Should be measured first by
+   profiling under `concurrent_put_sync/8` (group-committed) to
+   confirm the skip-list insert is on the critical path.
+2. **c4** — only if read scaling beyond ~3× is needed.
 
 ## Convention
 

@@ -38,7 +38,7 @@
 use codspeed_criterion_compat::{
     criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
-use st_rs::{DbImpl, DbOptions};
+use st_rs::{DbImpl, DbOptions, WriteOptions};
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,6 +51,10 @@ const VALUE_SIZE: usize = 100;
 /// spawn / join cost is amortized to <5% of measured time, small
 /// enough that a full bench run finishes in a few minutes.
 const OPS_PER_THREAD: u64 = 10_000;
+/// Per-thread work for the sync-WAL variant. Each fsync is millisecond-
+/// scale, so 1k ops × 1 ms = 1 s per sample without batching — already
+/// at the upper bound of what we want a single bench sample to take.
+const OPS_PER_THREAD_SYNC: u64 = 1_000;
 /// Pre-populated DB size for the concurrent_get bench.
 const POPULATED_ENTRIES: u64 = 50_000;
 
@@ -99,6 +103,34 @@ fn run_concurrent_put(db: &Arc<DbImpl>, n_threads: usize, ops_per_thread: u64) -
         handles.push(std::thread::spawn(move || {
             for i in 0..ops_per_thread {
                 db.put(&key_of(base + i), &v).expect("concurrent put");
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("thread panic");
+    }
+    start.elapsed()
+}
+
+/// Like [`run_concurrent_put`] but every put requests `sync=true`, so
+/// each one (or each batch, with c2 group commit) issues a real
+/// `fdatasync` on the WAL. This is the workload group commit was
+/// designed for: amortizing the millisecond-scale fsync cost across
+/// concurrent writers.
+fn run_concurrent_put_sync(db: &Arc<DbImpl>, n_threads: usize, ops_per_thread: u64) -> Duration {
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(n_threads);
+    for tid in 0..n_threads {
+        let db = Arc::clone(db);
+        let v = value();
+        let base = (tid as u64) * 1_000_000_000;
+        let wo = WriteOptions {
+            sync: true,
+            ..WriteOptions::default()
+        };
+        handles.push(std::thread::spawn(move || {
+            for i in 0..ops_per_thread {
+                db.put_opt(&key_of(base + i), &v, &wo).expect("sync put");
             }
         }));
     }
@@ -196,5 +228,42 @@ fn bench_concurrent_get(c: &mut Criterion) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-criterion_group!(benches, bench_concurrent_put, bench_concurrent_get);
+/// Concurrent puts with `sync=true` — every put waits on a real
+/// `fdatasync`. This is the workload group commit was designed for:
+/// each fsync is millisecond-scale, so batching N concurrent writers
+/// into one fsync should scale aggregate throughput close to linear.
+fn bench_concurrent_put_sync(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent_put_sync");
+    // Sample size kept low because each fsync is ms-scale and the
+    // bench wall time would otherwise blow past criterion's defaults.
+    group.sample_size(10);
+    for &threads in &[1usize, 2, 4, 8] {
+        group.throughput(Throughput::Elements(threads as u64 * OPS_PER_THREAD_SYNC));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(threads),
+            &threads,
+            |b, &n_threads| {
+                let dir = fresh_db_dir(&format!("put-sync-{n_threads}"));
+                let db = DbImpl::open(&opts(), &dir).expect("open");
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        total += run_concurrent_put_sync(&db, n_threads, OPS_PER_THREAD_SYNC);
+                    }
+                    total
+                });
+                let _ = db.close();
+                let _ = std::fs::remove_dir_all(&dir);
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_concurrent_put,
+    bench_concurrent_put_sync,
+    bench_concurrent_get,
+);
 criterion_main!(benches);

@@ -20,6 +20,12 @@ path = "src/lib.rs"
 [dependencies]
 snap = { version = "1", optional = true }
 lz4_flex = { version = "0.11", optional = true }
+# Faster synchronization primitives. Used for the group-commit
+# response slots and the write-coordinator queue. parking_lot's
+# park/unpark is ~10x faster than std's Mutex+Condvar on macOS,
+# which is the difference between group commit being a regression
+# (with std) and a win (with parking_lot) — see commit history.
+parking_lot = "0.12"
 
 [features]
 default = ["snappy", "lz4"]

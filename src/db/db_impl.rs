@@ -327,14 +327,84 @@ pub struct LiveFileMetaData {
     pub largest_key: Vec<u8>,
 }
 
+/// One queued write request for the group-commit leader to apply.
+struct WriteSubmission {
+    /// Owned batch — the caller cloned theirs into here so the
+    /// follower's stack frame can return as soon as the response
+    /// slot fires.
+    batch: WriteBatch,
+    /// Per-submission options. The leader honors `disable_wal` and
+    /// `sync` independently per submission (one fsync at the end of
+    /// the group, but only if some submission requested it).
+    opts: WriteOptions,
+    /// Where the leader writes the result. The submitter waits on
+    /// it after enqueueing.
+    response: Arc<ResponseSlot>,
+}
+
+/// One-shot result channel between the group-commit leader and one
+/// submitter. The leader fills `inner` and notifies; the submitter
+/// blocks until `inner.is_some()`.
+///
+/// Uses [`parking_lot`] primitives because std `Mutex` + `Condvar`
+/// park/unpark on macOS is ~1–5 µs per cycle — that overhead alone
+/// makes group commit a net loss for low-millisecond per-write
+/// workloads. parking_lot brings it down to ~100–200 ns, which is
+/// the difference between c2 being a regression and a win.
+struct ResponseSlot {
+    inner: parking_lot::Mutex<Option<Result<()>>>,
+    cv: parking_lot::Condvar,
+}
+
+impl ResponseSlot {
+    fn new() -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(None),
+            cv: parking_lot::Condvar::new(),
+        }
+    }
+
+    fn fill(&self, r: Result<()>) {
+        let mut g = self.inner.lock();
+        *g = Some(r);
+        self.cv.notify_one();
+    }
+
+    fn take(&self) -> Result<()> {
+        let mut g = self.inner.lock();
+        while g.is_none() {
+            self.cv.wait(&mut g);
+        }
+        g.take().unwrap()
+    }
+}
+
+/// Coordination state for the group-commit write path. The hot path
+/// holds [`Self::inner`] briefly to enqueue or drain submissions; the
+/// expensive WAL + memtable work happens with the engine's
+/// `state.write()` guard, never with this lock held.
+struct WriteCoord {
+    inner: parking_lot::Mutex<WriteCoordInner>,
+}
+
+#[derive(Default)]
+struct WriteCoordInner {
+    /// Set to `true` while one thread is the active leader (drains
+    /// the queue + applies the batch). New writers see this and
+    /// queue rather than racing for the engine write lock.
+    leader_active: bool,
+    /// Pending submissions, in arrival order. Drained in one shot
+    /// by the leader.
+    pending: Vec<WriteSubmission>,
+}
+
 /// The Layer 4c engine.
 ///
-/// All public methods take `&self` and acquire an internal mutex.
-/// The engine is safe for concurrent use from multiple threads:
-/// reads and writes run concurrently with **background flushes**
-/// thanks to the immutable-memtable + lock-releasing pattern. The
-/// big-mutex write thread (with leader-follower group commit) is
-/// still deferred to a future layer.
+/// All public methods take `&self`. The engine is safe for concurrent
+/// use from multiple threads: reads run in parallel via
+/// `RwLock<DbState>::read()`, writes serialize through a leader-
+/// follower group-commit queue ([`WriteCoord`]) so concurrent putters
+/// share one engine-lock acquisition + one WAL append window.
 pub struct DbImpl {
     /// On-disk path of the DB directory.
     path: PathBuf,
@@ -355,6 +425,10 @@ pub struct DbImpl {
     /// guarantee progress under any lost-wake scenario), re-acquire
     /// the state guard, re-check the predicate.
     flush_coord: Mutex<()>,
+    /// Group-commit coordinator. All `write_opt` and `put_opt` calls
+    /// enqueue a submission here; the first one becomes the leader
+    /// and applies everyone's work in one engine-lock acquisition.
+    write_coord: WriteCoord,
     /// Notified whenever the in-progress flush completes — used
     /// by [`Self::wait_for_pending_flush`] and `close()`. Always
     /// signaled while holding [`Self::flush_coord`] so the wakeup
@@ -711,6 +785,9 @@ impl DbImpl {
             }),
             flush_coord: Mutex::new(()),
             flush_done: Condvar::new(),
+            write_coord: WriteCoord {
+                inner: parking_lot::Mutex::new(WriteCoordInner::default()),
+            },
             lock: Mutex::new(Some(lock)),
             user_comparator,
             write_buffer_size: opts.db_write_buffer_size.max(1),
@@ -1593,60 +1670,25 @@ impl DbImpl {
         self.put_opt(key, value, &WriteOptions::default())
     }
 
-    /// Fast-path single-key insert that bypasses [`WriteBatch`].
+    /// Single-key insert. Builds a one-record [`WriteBatch`] and
+    /// routes it through the group-commit coordinator alongside any
+    /// concurrent writes — see [`Self::write_opt`] for the rationale.
     ///
-    /// The single-key path avoids two redundant `Vec<u8>` allocations
-    /// (one per key/value to populate the batch) plus the
-    /// `Vec<Record>` push and the dispatch through
-    /// [`encode_batch_record`]. Semantics are identical to building
-    /// a one-record `WriteBatch` and calling [`Self::write_opt`].
+    /// Pre-c2 this took its own `state.write()` and applied directly,
+    /// saving ~270 ns per single-thread call. After c2 the
+    /// group-commit win at higher thread counts dominates that
+    /// saving, and an out-of-band fast path would have to thread
+    /// itself through the leader-follower queue anyway to avoid
+    /// starving queued writers.
     pub fn put_opt(
         &self,
         key: &[u8],
         value: &[u8],
         opts: &WriteOptions,
     ) -> Result<()> {
-        let trigger = self.level0_stop_writes_trigger as usize;
-        let mut state = self.write_after_signal(|s| {
-            Ok(s.default_cf().l0.len() >= trigger)
-        })?;
-        let seq = state.last_sequence + 1;
-
-        if !opts.disable_wal {
-            // Encode a 1-record WAL entry inline.
-            let mut record_buf: Vec<u8> =
-                Vec::with_capacity(10 + 5 + 1 + 5 + key.len() + 5 + value.len());
-            put_varint64(&mut record_buf, seq);
-            put_varint32(&mut record_buf, 1); // count = 1
-            record_buf.push(0x1); // Put tag
-            put_varint32(&mut record_buf, key.len() as u32);
-            record_buf.extend_from_slice(key);
-            put_varint32(&mut record_buf, value.len() as u32);
-            record_buf.extend_from_slice(value);
-            let mut wal = state.wal.lock().unwrap();
-            wal.add_record(&record_buf)?;
-            if opts.sync {
-                wal.sync()?;
-            }
-        }
-
-        state
-            .default_cf_mut()
-            .memtable
-            .add(seq, ValueType::Value, key, value)?;
-        state.last_sequence = seq;
-
-        let needs_flush = {
-            let cf = state.default_cf();
-            let per_cf = cf.options.write_buffer_size;
-            let threshold = if per_cf > 0 { per_cf } else { self.write_buffer_size };
-            cf.memtable.approximate_memory_usage() >= threshold && cf.immutable.is_none()
-        };
-        drop(state);
-        if needs_flush {
-            self.schedule_flush()?;
-        }
-        Ok(())
+        let mut batch = WriteBatch::new();
+        batch.put(key.to_vec(), value.to_vec());
+        self.submit_write(batch, opts.clone())
     }
 
     /// Delete `key`.
@@ -1681,47 +1723,150 @@ impl DbImpl {
     /// leaves the WAL buffered. Without `sync`, recent writes are
     /// still durable across process crashes (kernel buffer cache),
     /// only kernel/power loss can drop them.
+    ///
+    /// Concurrent callers share a leader-follower group-commit
+    /// queue: the first writer to arrive becomes the leader, takes
+    /// the engine write lock once, and applies every queued
+    /// submission. Followers wait on a per-call response slot. This
+    /// turns N concurrent puts from N exclusive-lock acquisitions
+    /// into one, which is the difference between getting-worse-with-T
+    /// and scaling.
     pub fn write_opt(&self, batch: &WriteBatch, opts: &WriteOptions) -> Result<()> {
         if batch.count() == 0 {
             return Ok(()); // nothing to do
         }
+        self.submit_write(batch.clone(), opts.clone())
+    }
+
+    /// Submit a [`WriteBatch`] + [`WriteOptions`] pair to the
+    /// group-commit coordinator. Becomes the leader if no leader is
+    /// active, otherwise queues and waits on the response slot.
+    fn submit_write(&self, batch: WriteBatch, opts: WriteOptions) -> Result<()> {
+        let response = Arc::new(ResponseSlot::new());
+        let am_leader = {
+            let mut c = self.write_coord.inner.lock();
+            c.pending.push(WriteSubmission {
+                batch,
+                opts,
+                response: Arc::clone(&response),
+            });
+            if !c.leader_active {
+                c.leader_active = true;
+                true
+            } else {
+                false
+            }
+        };
+
+        if am_leader {
+            self.run_group_commit_leader();
+        }
+        response.take()
+    }
+
+    /// Drain pending submissions, apply them in one engine-lock
+    /// acquisition, repeat until the queue is empty. The thread
+    /// that called this is the active leader; new arrivals queue
+    /// while we're working and get picked up on the next iteration.
+    fn run_group_commit_leader(&self) {
+        loop {
+            // Drain whatever's pending right now.
+            let work = {
+                let mut c = self.write_coord.inner.lock();
+                std::mem::take(&mut c.pending)
+            };
+            if work.is_empty() {
+                // Nothing to do — clear the leader flag and bail.
+                // Re-check under the lock to avoid the race where a
+                // new submitter pushes between our drain and the
+                // leader-clear (otherwise their submission would sit
+                // forever with no leader processing it).
+                let mut c = self.write_coord.inner.lock();
+                if c.pending.is_empty() {
+                    c.leader_active = false;
+                    return;
+                }
+                continue;
+            }
+            self.apply_group_commit_batch(work);
+        }
+    }
+
+    /// Apply a drained batch of submissions under one
+    /// `state.write()` acquisition. Each submission gets its own
+    /// sequence range, its own WAL record (so replay still works
+    /// per-record), and its own response slot fill.
+    fn apply_group_commit_batch(&self, work: Vec<WriteSubmission>) {
         // Write stall: block while L0 count is at the stop threshold.
         let trigger = self.level0_stop_writes_trigger as usize;
-        let mut state = self.write_after_signal(|s| {
+        let mut state = match self.write_after_signal(|s| {
             Ok(s.default_cf().l0.len() >= trigger)
-        })?;
+        }) {
+            Ok(g) => g,
+            Err(e) => {
+                // Failed to acquire the guard / propagate to all.
+                for sub in work {
+                    sub.response.fill(Err(e.clone()));
+                }
+                return;
+            }
+        };
 
-        // Reserve a sequence range for this batch.
-        let first_seq = state.last_sequence + 1;
-
-        if !opts.disable_wal {
-            let mut record_buf = Vec::new();
-            encode_batch_record(batch, first_seq, &mut record_buf);
-
-            // 1. WAL append (+ optional fsync).
+        // 1. Assign sequence ranges, encode + append WAL records.
+        //    Each submission gets its own WAL record so recovery
+        //    parses them with the original `first_seq` baked in.
+        let mut next_seq = state.last_sequence + 1;
+        let mut seq_assignments: Vec<SequenceNumber> = Vec::with_capacity(work.len());
+        let mut any_sync = false;
+        let mut wal_err: Option<Status> = None;
+        {
             let mut wal = state.wal.lock().unwrap();
-            wal.add_record(&record_buf)?;
-            if opts.sync {
-                wal.sync()?;
+            for sub in &work {
+                seq_assignments.push(next_seq);
+                let count = sub.batch.count() as u64;
+                if !sub.opts.disable_wal {
+                    if sub.opts.sync {
+                        any_sync = true;
+                    }
+                    let mut record_buf = Vec::new();
+                    encode_batch_record(&sub.batch, next_seq, &mut record_buf);
+                    if let Err(e) = wal.add_record(&record_buf) {
+                        wal_err = Some(e);
+                        break;
+                    }
+                }
+                next_seq += count;
+            }
+            if wal_err.is_none() && any_sync {
+                if let Err(e) = wal.sync() {
+                    wal_err = Some(e);
+                }
             }
         }
-
-        // 2. Memtable insert.
-        {
-            let mut handler = MemTableInsertHandler {
-                column_families: &mut state.column_families,
-                seq: first_seq,
-            };
-            batch.iterate(&mut handler)?;
-
-            // 3. Bookkeeping.
-            state.last_sequence = handler.seq - 1;
+        if let Some(e) = wal_err {
+            drop(state);
+            for sub in work {
+                sub.response.fill(Err(e.clone()));
+            }
+            return;
         }
 
-        // 4. Maybe trigger flush. Each CF's threshold is its own
-        //    write_buffer_size if non-zero, otherwise falls back to
-        //    the global db_write_buffer_size.
-        let cfs_needing_flush: Vec<ColumnFamilyId> = state.column_families
+        // 2. Memtable insert per submission. Per-submission errors
+        //    propagate only to that submitter — others succeed.
+        let mut sub_results: Vec<Result<()>> = Vec::with_capacity(work.len());
+        for (i, sub) in work.iter().enumerate() {
+            let mut handler = MemTableInsertHandler {
+                column_families: &mut state.column_families,
+                seq: seq_assignments[i],
+            };
+            sub_results.push(sub.batch.iterate(&mut handler));
+        }
+        state.last_sequence = next_seq - 1;
+
+        // 3. Flush trigger check across all CFs (their memtables may
+        //    have grown above the threshold during this batch).
+        let cfs_needing_flush: Vec<ColumnFamilyId> = state
+            .column_families
             .values()
             .filter(|cf| {
                 let per_cf = cf.options.write_buffer_size;
@@ -1732,16 +1877,13 @@ impl DbImpl {
             .map(|cf| cf.id)
             .collect();
         drop(state);
+
+        // 4. Schedule flushes outside the lock, before notifying so
+        //    the new memtable is being prepared while followers wake.
         for cf_id in cfs_needing_flush {
-            // Background flush — put() returns as soon as the
-            // memtable freeze + WAL roll are done; the SST write
-            // happens on a worker thread.
             if cf_id == DEFAULT_CF_ID {
-                self.schedule_flush()?;
+                let _ = self.schedule_flush();
             } else {
-                // Synchronous flush for custom CFs (no scheduler hook
-                // exists for them yet); cheap because the memtable
-                // is small at this trigger point.
                 let cf_handle = ColumnFamilyHandleImpl {
                     id: cf_id,
                     name: String::new(),
@@ -1749,7 +1891,11 @@ impl DbImpl {
                 let _ = self.flush_cf(&cf_handle);
             }
         }
-        Ok(())
+
+        // 5. Fill every response slot. Followers wake and return.
+        for (sub, r) in work.into_iter().zip(sub_results) {
+            sub.response.fill(r);
+        }
     }
 
     /// Point-lookup. Returns:
