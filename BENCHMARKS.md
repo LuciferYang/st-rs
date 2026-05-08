@@ -62,10 +62,10 @@ Groups:
 
 | Group | Workload | Why it matters |
 |---|---|---|
-| `concurrent_put/{1,2,4,8}` | N threads each writing on disjoint key ranges | exposes write-path lock contention; every concurrent putter contends on `state.lock()` for the WAL append + memtable insert |
-| `concurrent_get/{1,2,4,8}` | N threads each doing random point lookups on a populated DB | reads release the lock fast (capture handles + SSTs, then unlock); should scale better than puts |
+| `concurrent_put/{1,2,4,8}` | N threads each writing on disjoint key ranges | exposes write-path lock contention; every concurrent putter contends on `state.write()` for the WAL append + memtable insert |
+| `concurrent_get/{1,2,4,8}` | N threads each doing random point lookups on a populated DB | reads take a `state.read()` guard, capture memtable/SST handles, release; should scale better than puts |
 
-**Recorded result (Apple Silicon, 20 samples, 10k ops/thread):**
+**Recorded result, Mutex baseline (Apple Silicon, 20 samples, 10k ops/thread):**
 
 | Threads | `concurrent_put` agg | put scaling | `concurrent_get` agg | get scaling |
 |---:|---:|---:|---:|---:|
@@ -74,31 +74,23 @@ Groups:
 | 4 | 0.55 Mops/s | 0.47× | 0.84 Mops/s | 1.02× |
 | 8 | 0.47 Mops/s | 0.40× | 1.12 Mops/s | 1.36× |
 
-Concurrent **puts get _worse_** with thread count: the single
-`Mutex<DbState>` held across the whole write path causes every
-extra thread to spend more wall time waiting on the lock + paying
-cache-line bouncing and scheduler overhead than it does doing
-useful work. **Gets** scale weakly (~1.45× peak at 2T then
-plateau) — most of the read path runs after `state.lock()` is
-released, but the lock is still acquired briefly per call to
-capture memtable/SST handles, capping read parallelism.
+**After c1 (RwLock<DbState> + inner Mutex on the !Sync WAL/manifest writers):**
 
-These are real engine bottlenecks the bench was designed to
-surface. Concrete follow-ups:
+| Threads | `concurrent_put` agg | put scaling | `concurrent_get` agg | get scaling |
+|---:|---:|---:|---:|---:|
+| 1 | 1.12 Mops/s | 1.0× | 1.18 Mops/s | 1.0× |
+| 2 | 0.92 Mops/s | 0.82× | 2.01 Mops/s | 1.70× |
+| 4 | 0.60 Mops/s | 0.54× | **2.65 Mops/s** | **2.24×** |
+| 8 | 0.59 Mops/s | 0.53× | 1.48 Mops/s | 1.25× |
 
-- **Sharded locking** (one mutex per CF, or RwLock around state)
-  would unblock `get` scaling and reduce write contention on
-  multi-CF workloads.
-- **Group commit** for the WAL append path (RocksDB's classic
-  approach: a leader thread serializes a window's writes, follower
-  threads queue and wait) would let aggregate write throughput
-  exceed single-thread.
-- **Lock-free read snapshotting** via `Arc<DbState>` swapping
-  would eliminate the read-side lock entirely.
+`concurrent_get/4` is the headline: 0.84 → 2.65 Mops/s (**3.15×**),
+because readers no longer serialize on the lock. `concurrent_put`
+also got better than expected (~26% at 8T) because background flush
+bookkeeping reads no longer block foreground writers.
 
-None of these are necessary for current Flink workloads (single
-operator thread per state backend instance), but they are the
-obvious next architectural moves for higher concurrency.
+The put cliff is mitigated but not gone — every put still takes
+the exclusive write guard for the entire WAL+memtable path. That's
+**c2 (group commit)** territory; see the gaps section.
 
 ### 3. JMH JNI-overhead benchmark — `java/src/test/java/org/forstdb/jmh/`
 
@@ -366,23 +358,6 @@ The original a/b/c/d/e set is closed. The next round, surfaced by the
 `concurrent_*` benches, is structural — single `Mutex<DbState>` plus
 single-threaded skip-list memtable cap concurrency.
 
-### c1. Read-side `RwLock<DbState>`
-
-**Gap:** Reads take `state.lock()` briefly to snapshot memtable + SST
-handles, then release. Even brief, this Mutex caps `concurrent_get`
-at ~1.45× peak (2T) before plateauing.
-
-**Why it matters:** Multi-slot Flink TMs and parallel scan operators
-issue concurrent reads as the realistic workload.
-
-**To close:** Replace the `Mutex` with `parking_lot::RwLock`. Audit
-every `state.lock()` call site (~30) and split into `read()` /
-`write()`. Reads take the read lock for handle snapshotting; writes
-keep exclusive access. ~50 LOC of mechanical change.
-
-**Expected:** near-linear scaling on `concurrent_get`. Does **not**
-fix the put cliff — writers still serialize on the write lock.
-
 ### c2. Group commit on the write path
 
 **Gap:** Every put holds the write lock across WAL encode + append +
@@ -443,10 +418,12 @@ Flink workload may not need it.
 
 ### Suggested order of attack
 
-1. **c1** first — smallest diff, proves the read-side wins.
-2. **c2** second — biggest write-side win once landed.
-3. Re-bench `concurrent_*` at each step.
-4. **c3** / **c4** only if the bench numbers still don't satisfy.
+c1 is **landed** (commit history). Remaining order:
+
+1. **c2** — biggest write-side win once landed; tackles the put
+   cliff that the c1 RwLock alone could not.
+2. Re-bench `concurrent_*`.
+3. **c3** / **c4** only if the bench numbers still don't satisfy.
 
 ## Convention
 

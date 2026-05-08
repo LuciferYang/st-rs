@@ -92,7 +92,8 @@ use crate::util::coding::{get_varint32, put_varint32, put_varint64};
 use crate::api::write_batch::{Record, WriteBatch, WriteBatchHandler};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
+use std::time::Duration;
 use crate::core::types::ColumnFamilyId;
 
 /// A range tombstone: `(start_key, end_key, sequence_number)`.
@@ -232,8 +233,14 @@ struct DbState {
     column_families: HashMap<ColumnFamilyId, CfState>,
     /// Next CF ID to assign when creating a new column family.
     next_cf_id: ColumnFamilyId,
-    /// Current WAL writer.
-    wal: LogWriter,
+    /// Current WAL writer. Wrapped in [`Mutex`] because [`LogWriter`]
+    /// holds a `Box<dyn FsWritableFile>` which is `Send` but not
+    /// `Sync` — the inner mutex makes [`DbState`] `Sync` so the
+    /// outer [`RwLock`] can hand out shared `&DbState` references
+    /// to readers. Writers already hold the outer `RwLock` write
+    /// guard exclusively, so this inner mutex is uncontended on
+    /// the hot path.
+    wal: Mutex<LogWriter>,
     /// Number of the WAL file currently being written.
     wal_number: u64,
     /// Number to assign to the next file (WAL or SST). Monotonic.
@@ -253,8 +260,10 @@ struct DbState {
     snapshots: std::collections::BTreeMap<SequenceNumber, usize>,
     /// MANIFEST-based version tracking. Persists per-CF file
     /// metadata so that reopen can reconstruct the SST layout
-    /// without scanning the directory.
-    version_set: VersionSet,
+    /// without scanning the directory. Wrapped in [`Mutex`] for
+    /// the same reason as `wal` — [`VersionSet::manifest_writer`]
+    /// is `!Sync`. Same uncontended-on-hot-path argument applies.
+    version_set: Mutex<VersionSet>,
     /// Reference count for `disable_file_deletions`. When > 0,
     /// obsolete SST files are NOT deleted — they're added to
     /// `pending_deletion` instead. Used by Flink's incremental
@@ -332,10 +341,24 @@ pub struct DbImpl {
     /// File-system instance. We hold an `Arc` so the engine can
     /// hand it to background tasks.
     fs: Arc<dyn FileSystem>,
-    /// Internal mutable state behind a single mutex.
-    state: Mutex<DbState>,
+    /// Internal mutable state behind a reader-writer lock. Most
+    /// reads (point lookups, snapshot creation) only need a read
+    /// guard, which lets multiple reader threads work in parallel.
+    /// Mutations (writes, flush bookkeeping, compaction) take the
+    /// write guard.
+    state: RwLock<DbState>,
+    /// Side mutex paired with [`Self::flush_done`] so writers can
+    /// `wait_timeout` for a flush completion. We can't put the
+    /// `Condvar` directly on `state` because `RwLockWriteGuard`
+    /// isn't compatible with `Condvar::wait`. Pattern: drop the
+    /// state guard, take this mutex, wait_timeout (50 ms cap to
+    /// guarantee progress under any lost-wake scenario), re-acquire
+    /// the state guard, re-check the predicate.
+    flush_coord: Mutex<()>,
     /// Notified whenever the in-progress flush completes — used
-    /// by [`Self::wait_for_pending_flush`] and `close()`.
+    /// by [`Self::wait_for_pending_flush`] and `close()`. Always
+    /// signaled while holding [`Self::flush_coord`] so the wakeup
+    /// is observed by any waiter that just took the side mutex.
     flush_done: Condvar,
     /// Held LOCK file handle. Released on `close`.
     lock: Mutex<Option<Box<dyn FileLock>>>,
@@ -673,19 +696,20 @@ impl DbImpl {
         let arc = Arc::new(Self {
             path: path.to_path_buf(),
             fs,
-            state: Mutex::new(DbState {
+            state: RwLock::new(DbState {
                 column_families: all_cfs,
                 next_cf_id,
-                wal: wal_writer,
+                wal: Mutex::new(wal_writer),
                 wal_number,
                 next_file_number,
                 last_sequence,
                 closing: false,
                 snapshots: std::collections::BTreeMap::new(),
-                version_set,
+                version_set: Mutex::new(version_set),
                 disable_file_deletions_count: 0,
                 pending_deletion: Vec::new(),
             }),
+            flush_coord: Mutex::new(()),
             flush_done: Condvar::new(),
             lock: Mutex::new(Some(lock)),
             user_comparator,
@@ -725,7 +749,7 @@ impl DbImpl {
     /// across all levels. Used by checkpoint to know which files
     /// to hard-link.
     pub fn snapshot_live_files(&self) -> (PathBuf, Vec<u64>) {
-        let state = self.state.lock().unwrap();
+        let state = self.state.read().unwrap();
         let mut numbers: Vec<u64> = Vec::new();
         for cf in state.column_families.values() {
             for e in &cf.l0 {
@@ -747,7 +771,7 @@ impl DbImpl {
     /// Flink calls this before `get_live_files` to freeze the SST
     /// list while uploading files to remote storage.
     pub fn disable_file_deletions(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.write().unwrap();
         state.disable_file_deletions_count += 1;
         Ok(())
     }
@@ -759,7 +783,7 @@ impl DbImpl {
     pub fn enable_file_deletions(&self) -> Result<()> {
         let pending: Vec<u64>;
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.write().unwrap();
             if state.disable_file_deletions_count == 0 {
                 return Err(Status::invalid_argument(
                     "enable_file_deletions called without matching disable",
@@ -799,7 +823,7 @@ impl DbImpl {
             self.flush()?;
             self.wait_for_pending_work()?;
         }
-        let state = self.state.lock().unwrap();
+        let state = self.state.read().unwrap();
         let mut files = Vec::new();
 
         // SST files from all CFs.
@@ -816,7 +840,7 @@ impl DbImpl {
         files.push(make_current_file_name(&self.path));
 
         // MANIFEST file.
-        let manifest_num = state.version_set.manifest_file_number();
+        let manifest_num = state.version_set.lock().unwrap().manifest_file_number();
         if manifest_num > 0 {
             files.push(make_descriptor_file_name(&self.path, manifest_num));
         }
@@ -829,7 +853,7 @@ impl DbImpl {
     pub fn get_live_files_metadata(&self) -> Vec<LiveFileMetaData> {
         // Collect metadata under the lock (no I/O).
         let mut meta: Vec<LiveFileMetaData> = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.read().unwrap();
             let mut out = Vec::new();
             for cf in state.column_families.values() {
                 for e in &cf.l0 {
@@ -878,15 +902,16 @@ impl DbImpl {
     /// MANIFEST has been created yet. Used by checkpoint to know
     /// which MANIFEST file to copy.
     pub fn manifest_file_number(&self) -> u64 {
-        let state = self.state.lock().unwrap();
-        state.version_set.manifest_file_number()
+        let state = self.state.read().unwrap();
+        let n = state.version_set.lock().unwrap().manifest_file_number();
+        n
     }
 
     /// Returns `true` if writes are currently stalled because the
     /// default CF's L0 file count has reached the stop threshold.
     /// Used by Flink's metrics (`is-write-stopped` property).
     pub fn is_write_stopped(&self) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.state.read().unwrap();
         state.default_cf().l0.len() >= self.level0_stop_writes_trigger as usize
     }
 
@@ -924,7 +949,7 @@ impl DbImpl {
         // Strip the "rocksdb." prefix if present (Flink uses it).
         let prop = name.strip_prefix("rocksdb.").unwrap_or(name);
 
-        let state = self.state.lock().unwrap();
+        let state = self.state.read().unwrap();
         let cf = state.column_families.get(&cf_id)?;
 
         match prop {
@@ -1032,7 +1057,7 @@ impl DbImpl {
         cf: &dyn crate::api::db::ColumnFamilyHandle,
         operator: Arc<dyn crate::ext::merge_operator::MergeOperator>,
     ) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.write().unwrap();
         let cf_state = state.cf_mut(cf.id())?;
         cf_state.merge_operator = Some(operator);
         Ok(())
@@ -1044,7 +1069,7 @@ impl DbImpl {
         &self,
         name: &str,
     ) -> Option<Arc<ColumnFamilyHandleImpl>> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.read().unwrap();
         for cf in state.column_families.values() {
             if cf.name == name {
                 return Some(Arc::new(ColumnFamilyHandleImpl {
@@ -1063,7 +1088,7 @@ impl DbImpl {
         name: &str,
         options: &crate::api::options::ColumnFamilyOptions,
     ) -> Result<Arc<ColumnFamilyHandleImpl>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.write().unwrap();
         // Check for duplicate name.
         for cf in state.column_families.values() {
             if cf.name == name {
@@ -1095,7 +1120,7 @@ impl DbImpl {
             is_column_family_add: Some(name.to_string()),
             ..Default::default()
         };
-        state.version_set.log_and_apply(&edit)?;
+        state.version_set.lock().unwrap().log_and_apply(&edit)?;
         drop(state);
         Ok(Arc::new(ColumnFamilyHandleImpl {
             id,
@@ -1116,17 +1141,13 @@ impl DbImpl {
             ));
         }
         // Wait for any pending work on this CF.
-        {
-            let mut state = self.state.lock().unwrap();
-            while state.column_families.get(&cf_id)
-                .is_some_and(|cf| cf.immutable.is_some() || cf.pending_compaction.is_some())
-            {
-                state = self.flush_done.wait(state).unwrap();
-            }
-        }
+        drop(self.write_after_signal(|s| {
+            Ok(s.column_families.get(&cf_id)
+                .is_some_and(|cf| cf.immutable.is_some() || cf.pending_compaction.is_some()))
+        })?);
         let sst_numbers: Vec<u64>;
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.write().unwrap();
             let cf = state.column_families.remove(&cf_id)
                 .ok_or_else(|| Status::invalid_argument(format!("column family {cf_id} not found")))?;
             sst_numbers = cf.l0.iter().chain(cf.l1.iter()).map(|e| e.number).collect();
@@ -1140,13 +1161,13 @@ impl DbImpl {
                 deleted_files,
                 ..Default::default()
             };
-            state.version_set.log_and_apply(&edit)?;
+            state.version_set.lock().unwrap().log_and_apply(&edit)?;
             drop(state);
         }
         // Delete SST files belonging to the dropped CF, respecting
         // the file-deletion-disable flag.
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.write().unwrap();
             if state.disable_file_deletions_count > 0 {
                 state.pending_deletion.extend(&sst_numbers);
             } else {
@@ -1170,7 +1191,7 @@ impl DbImpl {
         cf: &dyn crate::api::db::ColumnFamilyHandle,
         factory: Arc<dyn crate::ext::compaction_filter::CompactionFilterFactory>,
     ) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.write().unwrap();
         let cf_state = state.cf_mut(cf.id())?;
         cf_state.compaction_filter_factory = Some(factory);
         Ok(())
@@ -1244,7 +1265,7 @@ impl DbImpl {
             return Ok(());
         }
         let cf_id = cf.id();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.write().unwrap();
         let cf_state = state.cf_mut(cf_id)?;
 
         // Collect SST numbers whose key range is fully covered by
@@ -1287,7 +1308,7 @@ impl DbImpl {
             next_file_number: Some(state.next_file_number),
             ..Default::default()
         };
-        state.version_set.log_and_apply(&edit)?;
+        state.version_set.lock().unwrap().log_and_apply(&edit)?;
 
         // Delete the physical files.
         for (number, _) in &to_delete {
@@ -1305,7 +1326,7 @@ impl DbImpl {
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         let read_seq = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.read().unwrap();
             state.last_sequence
         };
         self.get_cf_at_seq(cf.id(), key, read_seq)
@@ -1324,7 +1345,7 @@ impl DbImpl {
         read_seq: SequenceNumber,
     ) -> Result<Option<Vec<u8>>> {
         let (lookup, merge_op, l0_ssts, l1_ssts, merge_state, range_tombstones) = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.read().unwrap();
             let cf = state.cf(cf_id)?;
             let merge_op = cf.merge_operator.as_ref().map(Arc::clone);
             let lookup = LookupKey::new(key, read_seq);
@@ -1554,7 +1575,7 @@ impl DbImpl {
         // Snapshot the set of CF ids under the lock, then drop it to
         // avoid holding across each per-CF flush (which re-takes the lock).
         let cf_ids: Vec<ColumnFamilyId> = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.read().unwrap();
             state.column_families.keys().copied().collect()
         };
         for cf_id in cf_ids {
@@ -1585,10 +1606,10 @@ impl DbImpl {
         value: &[u8],
         opts: &WriteOptions,
     ) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        while state.default_cf().l0.len() >= self.level0_stop_writes_trigger as usize {
-            state = self.flush_done.wait(state).unwrap();
-        }
+        let trigger = self.level0_stop_writes_trigger as usize;
+        let mut state = self.write_after_signal(|s| {
+            Ok(s.default_cf().l0.len() >= trigger)
+        })?;
         let seq = state.last_sequence + 1;
 
         if !opts.disable_wal {
@@ -1602,9 +1623,10 @@ impl DbImpl {
             record_buf.extend_from_slice(key);
             put_varint32(&mut record_buf, value.len() as u32);
             record_buf.extend_from_slice(value);
-            state.wal.add_record(&record_buf)?;
+            let mut wal = state.wal.lock().unwrap();
+            wal.add_record(&record_buf)?;
             if opts.sync {
-                state.wal.sync()?;
+                wal.sync()?;
             }
         }
 
@@ -1663,12 +1685,11 @@ impl DbImpl {
         if batch.count() == 0 {
             return Ok(()); // nothing to do
         }
-        let mut state = self.state.lock().unwrap();
-
         // Write stall: block while L0 count is at the stop threshold.
-        while state.default_cf().l0.len() >= self.level0_stop_writes_trigger as usize {
-            state = self.flush_done.wait(state).unwrap();
-        }
+        let trigger = self.level0_stop_writes_trigger as usize;
+        let mut state = self.write_after_signal(|s| {
+            Ok(s.default_cf().l0.len() >= trigger)
+        })?;
 
         // Reserve a sequence range for this batch.
         let first_seq = state.last_sequence + 1;
@@ -1678,9 +1699,10 @@ impl DbImpl {
             encode_batch_record(batch, first_seq, &mut record_buf);
 
             // 1. WAL append (+ optional fsync).
-            state.wal.add_record(&record_buf)?;
+            let mut wal = state.wal.lock().unwrap();
+            wal.add_record(&record_buf)?;
             if opts.sync {
-                state.wal.sync()?;
+                wal.sync()?;
             }
         }
 
@@ -1736,7 +1758,7 @@ impl DbImpl {
     /// - `Err` for I/O / corruption errors
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let read_seq = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.read().unwrap();
             state.last_sequence
         };
         self.get_at_seq(key, read_seq)
@@ -1835,7 +1857,7 @@ impl DbImpl {
         //    read_seq is captured here and used for ALL lookups (memtable
         //    and SST) to guarantee a consistent snapshot.
         let (read_seq, l0_ssts, l1_ssts) = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.read().unwrap();
             let cf = state.default_cf();
             let read_seq = state.last_sequence;
 
@@ -2000,7 +2022,7 @@ impl DbImpl {
     /// tombstones, which grows the LSM over time.
     pub fn snapshot(&self) -> Arc<DbSnapshot> {
         let seq = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.write().unwrap();
             let seq = state.last_sequence;
             *state.snapshots.entry(seq).or_insert(0) += 1;
             seq
@@ -2023,7 +2045,7 @@ impl DbImpl {
         &self,
         read_seq: SequenceNumber,
     ) -> Result<crate::db::db_iter::DbIterator> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.read().unwrap();
         let cf = state.default_cf();
         let ssts = Self::collect_all_ssts(&state);
         // Use the chunked streaming iterator so multi-GB state on
@@ -2060,7 +2082,7 @@ impl DbImpl {
     /// Internal: release a snapshot's hold on its pinned sequence.
     /// Called by [`DbSnapshot::drop`] after the last Arc is dropped.
     fn release_snapshot_internal(&self, seq: SequenceNumber) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.write().unwrap();
         if let Some(count) = state.snapshots.get_mut(&seq) {
             *count -= 1;
             if *count == 0 {
@@ -2073,7 +2095,7 @@ impl DbImpl {
     /// sequences currently tracked by the engine.
     #[cfg(test)]
     fn live_snapshot_count(&self) -> usize {
-        self.state.lock().unwrap().snapshots.len()
+        self.state.write().unwrap().snapshots.len()
     }
 
     /// Open a forward + backward iterator over the engine. Eagerly
@@ -2082,7 +2104,7 @@ impl DbImpl {
     /// iterator is detached from the engine and survives
     /// concurrent writes and background flushes.
     pub fn iter(&self) -> Result<crate::db::db_iter::DbIterator> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.read().unwrap();
         let cf = state.default_cf();
         let ssts = Self::collect_all_ssts(&state);
         let it = crate::db::db_iter::DbIterator::from_arcs(
@@ -2119,7 +2141,7 @@ impl DbImpl {
         &self,
         cf: &dyn crate::api::db::ColumnFamilyHandle,
     ) -> Result<crate::db::db_iter::DbIterator> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.read().unwrap();
         let cf_state = state.cf(cf.id())?;
         let ssts = Self::collect_cf_ssts(cf_state);
         let it = crate::db::db_iter::DbIterator::from_arcs(
@@ -2197,7 +2219,7 @@ impl DbImpl {
 
             // 2. Assign a new file number and build the destination path.
             let (file_number, dst_path) = {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.write().unwrap();
                 let num = state.next_file_number;
                 state.next_file_number += 1;
                 (num, make_table_file_name(&self.path, num))
@@ -2250,7 +2272,7 @@ impl DbImpl {
             let reader_arc = Arc::new(table);
 
             // 5. Insert into CF's L0 (newest-first) and write VersionEdit.
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.write().unwrap();
             // Bump last_sequence so reads can see the ingested data.
             if max_seq > state.last_sequence {
                 state.last_sequence = max_seq;
@@ -2280,7 +2302,7 @@ impl DbImpl {
                 next_file_number: Some(state.next_file_number),
                 ..Default::default()
             };
-            state.version_set.log_and_apply(&edit)?;
+            state.version_set.lock().unwrap().log_and_apply(&edit)?;
         }
 
         Ok(())
@@ -2314,12 +2336,10 @@ impl DbImpl {
     /// Tests use it to drain the pool to a known quiescent
     /// state before asserting on the SST list.
     pub fn wait_for_pending_work(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        while state.column_families.values().any(|cf| cf.immutable.is_some())
-            || state.column_families.values().any(|cf| cf.pending_compaction.is_some())
-        {
-            state = self.flush_done.wait(state).unwrap();
-        }
+        drop(self.write_after_signal(|s| {
+            Ok(s.column_families.values().any(|cf| cf.immutable.is_some())
+                || s.column_families.values().any(|cf| cf.pending_compaction.is_some()))
+        })?);
         Ok(())
     }
 
@@ -2361,6 +2381,41 @@ impl DbImpl {
         Ok(())
     }
 
+    /// Acquire the write guard, then wait while `predicate` is true.
+    /// Drops the guard while waiting on [`Self::flush_done`] (which
+    /// pairs with [`Self::flush_coord`]) and re-acquires it before
+    /// re-checking. Uses a 50 ms `wait_timeout` so any lost notify
+    /// only stalls progress for that bound rather than forever — the
+    /// predicate's correctness still rests on the loop, not the wake.
+    fn write_after_signal<F>(
+        &self,
+        mut predicate: F,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, DbState>>
+    where
+        F: FnMut(&DbState) -> Result<bool>,
+    {
+        let mut state = self.state.write().unwrap();
+        while predicate(&state)? {
+            drop(state);
+            let coord = self.flush_coord.lock().unwrap();
+            let _ = self
+                .flush_done
+                .wait_timeout(coord, Duration::from_millis(50))
+                .unwrap();
+            state = self.state.write().unwrap();
+        }
+        Ok(state)
+    }
+
+    /// Notify any threads waiting in [`Self::write_after_signal`]
+    /// that a flush or compaction has completed. Briefly takes
+    /// [`Self::flush_coord`] so we don't race a waiter that's about
+    /// to call `wait_timeout`.
+    fn signal_flush_done(&self) {
+        let _coord = self.flush_coord.lock().unwrap();
+        self.flush_done.notify_all();
+    }
+
     /// Schedule a flush on the background thread pool. Returns
     /// immediately. To wait for the flush to complete, call
     /// [`Self::wait_for_pending_flush`].
@@ -2399,12 +2454,11 @@ impl DbImpl {
     /// **Blocks** if a flush is already in progress — the
     /// immutable slot can hold at most one memtable at a time.
     fn start_flush_locked(&self) -> Result<Option<FlushSetup>> {
-        let mut state = self.state.lock().unwrap();
         // Wait for any in-progress flush to complete first. This
         // bounds the immutable slot to at most one memtable.
-        while state.default_cf().immutable.is_some() {
-            state = self.flush_done.wait(state).unwrap();
-        }
+        let mut state = self.write_after_signal(|s| {
+            Ok(s.default_cf().immutable.is_some())
+        })?;
         if state.default_cf().memtable.num_entries() == 0 {
             return Ok(None);
         }
@@ -2437,7 +2491,7 @@ impl DbImpl {
             .fs
             .new_writable_file(&new_wal_path, &Default::default())?;
         let new_wal = LogWriter::new(WritableFileWriter::new(new_wal_file));
-        let old_wal = std::mem::replace(&mut state.wal, new_wal);
+        let old_wal = std::mem::replace(&mut *state.wal.lock().unwrap(), new_wal);
         // Close the old WAL writer; the file stays on disk until
         // the flush completes (so a crash mid-flush still leaves
         // the old WAL behind for replay).
@@ -2461,11 +2515,10 @@ impl DbImpl {
     /// be deleted when the default CF's flush completes (which does
     /// roll the WAL).
     fn start_flush_cf_locked(&self, cf_id: ColumnFamilyId) -> Result<Option<FlushSetup>> {
-        let mut state = self.state.lock().unwrap();
         // Wait for any in-progress flush on this CF.
-        while state.cf(cf_id)?.immutable.is_some() {
-            state = self.flush_done.wait(state).unwrap();
-        }
+        let mut state = self.write_after_signal(|s| {
+            Ok(s.cf(cf_id)?.immutable.is_some())
+        })?;
         if state.cf(cf_id)?.memtable.num_entries() == 0 {
             return Ok(None);
         }
@@ -2560,7 +2613,7 @@ impl DbImpl {
         write_result: Result<(Arc<BlockBasedTableReader>, u64)>,
     ) -> Result<()> {
         let cf_id = setup.cf_id;
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.write().unwrap();
         // Always clear the immutable slot and pending fields,
         // even on error — otherwise we deadlock on the next
         // start_flush_locked.
@@ -2604,7 +2657,7 @@ impl DbImpl {
                     next_file_number: Some(state.next_file_number),
                     ..Default::default()
                 };
-                let r = state.version_set.log_and_apply(&edit);
+                let r = state.version_set.lock().unwrap().log_and_apply(&edit);
 
                 if r.is_ok() && cf_id == DEFAULT_CF_ID {
                     // Only delete the old WAL when the default CF
@@ -2623,7 +2676,7 @@ impl DbImpl {
             Err(e) => Err(e),
         };
 
-        self.flush_done.notify_all();
+        self.signal_flush_done();
         result
     }
 
@@ -2893,7 +2946,7 @@ impl DbImpl {
     /// same orphan-file pattern used for flush.
     fn schedule_compaction(&self, plan: CompactionPlan) {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.write().unwrap();
             // Mark the CF the plan came from as pending — was hard-coded
             // to default before M2.5.
             if let Ok(cf) = state.cf_mut(plan.cf_id) {
@@ -2924,12 +2977,12 @@ impl DbImpl {
         let cf_id = plan.cf_id;
         let result = self.run_compaction_inner(plan);
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.write().unwrap();
             if let Ok(cf) = state.cf_mut(cf_id) {
                 cf.pending_compaction = None;
             }
         }
-        self.flush_done.notify_all();
+        self.signal_flush_done();
         result
     }
 
@@ -2970,7 +3023,7 @@ impl DbImpl {
         let written = job.run()?;
 
         // Swap inputs for the output under the lock.
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.write().unwrap();
         {
             let cf = state.cf_mut(cf_id)?;
             cf.l0.retain(|e| !input_numbers.contains(&e.number));
@@ -3023,7 +3076,7 @@ impl DbImpl {
         }
         edit.next_file_number = Some(state.next_file_number);
         // Persist the updated level layout to the MANIFEST.
-        state.version_set.log_and_apply(&edit)?;
+        state.version_set.lock().unwrap().log_and_apply(&edit)?;
 
         // Collect files to delete.
         let mut to_delete: Vec<u64> = input_numbers.clone();
@@ -3065,7 +3118,7 @@ impl DbImpl {
         //    quickly. Held under the lock so we don't race with
         //    a worker that's about to call complete_flush.
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.write().unwrap();
             state.closing = true;
         }
         // 4. Drain pool workers so no task is mid-flight when
@@ -3074,7 +3127,7 @@ impl DbImpl {
         // 4b. Process any deferred SST deletions (from
         //     disable_file_deletions that was never re-enabled).
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.write().unwrap();
             let pending = std::mem::take(&mut state.pending_deletion);
             state.disable_file_deletions_count = 0;
             drop(state);
@@ -3510,9 +3563,9 @@ impl crate::api::db::Db for DbImpl {
     }
 
     fn flush_wal(&self, _sync: bool) -> Result<()> {
-        // WAL sync is done on every write; this is a no-op.
-        let mut state = self.state.lock().unwrap();
-        state.wal.sync()
+        let state = self.state.read().unwrap();
+        let r = state.wal.lock().unwrap().sync();
+        r
     }
 
     fn close(&self) -> Result<()> {
@@ -3577,7 +3630,7 @@ mod tests {
         // to at least one L0 SST; `large` should have everything still
         // in its memtable (no L0).
         let (tiny_l0, large_l0, large_mem) = {
-            let state = db.state.lock().unwrap();
+            let state = db.state.read().unwrap();
             let t = state.cf(tiny.id()).unwrap();
             let l = state.cf(large.id()).unwrap();
             (t.l0.len(), l.l0.len(), l.memtable.num_entries())
@@ -3868,7 +3921,7 @@ mod tests {
         // and (b) every key is still readable (already checked
         // above).
         let (l0, l1) = {
-            let state = db.state.lock().unwrap();
+            let state = db.state.read().unwrap();
             let cf = state.default_cf();
             (cf.l0.len(), cf.l1.len())
         };
@@ -3964,7 +4017,7 @@ mod tests {
         // After 4 flushes + compaction, L0 should be empty (all
         // moved to L1) and L1 should have at least 1 file.
         let (l0, l1) = {
-            let state = db.state.lock().unwrap();
+            let state = db.state.read().unwrap();
             let cf = state.default_cf();
             (cf.l0.len(), cf.l1.len())
         };
@@ -4097,7 +4150,7 @@ mod tests {
         // After the compaction, pending_compaction should be
         // None and every key should still be readable.
         {
-            let state = db.state.lock().unwrap();
+            let state = db.state.read().unwrap();
             assert!(
                 state.default_cf().pending_compaction.is_none(),
                 "pending_compaction should have cleared after wait"
@@ -4135,7 +4188,7 @@ mod tests {
         // if the trigger wasn't hit, but the wait must still
         // return cleanly.)
         {
-            let state = db.state.lock().unwrap();
+            let state = db.state.read().unwrap();
             assert!(state.default_cf().immutable.is_none());
             assert!(state.default_cf().pending_compaction.is_none());
         }
@@ -4174,7 +4227,7 @@ mod tests {
         // Now claim a pending compaction and verify the picker
         // returns None.
         let pick = {
-            let mut state = db.state.lock().unwrap();
+            let mut state = db.state.write().unwrap();
             state.default_cf_mut().pending_compaction = Some(9999);
             db.maybe_pick_compaction(&mut state)
         };
@@ -4184,7 +4237,7 @@ mod tests {
         );
         // Clean up the forced flag so close() doesn't hang.
         {
-            let mut state = db.state.lock().unwrap();
+            let mut state = db.state.write().unwrap();
             state.default_cf_mut().pending_compaction = None;
         }
 
@@ -6408,7 +6461,7 @@ mod tests {
 
         db.put(b"k", b"v").unwrap();
         let seq_before = {
-            let state = db.state.lock().unwrap();
+            let state = db.state.read().unwrap();
             state.last_sequence
         };
 
@@ -6416,7 +6469,7 @@ mod tests {
         db.write(&WriteBatch::new()).unwrap();
 
         let seq_after = {
-            let state = db.state.lock().unwrap();
+            let state = db.state.read().unwrap();
             state.last_sequence
         };
 
