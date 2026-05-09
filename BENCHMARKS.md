@@ -351,6 +351,32 @@ Linux runner. CI runs (GHA shared runners) routinely swing ±20–30%
 on iteration-throughput benches because the underlying VM is
 shared — see "CI regression gate" below for how we work around it.
 
+## Why the engine uses std + parking_lot mixed
+
+The codebase deliberately uses `std::sync::RwLock` for `DbState`
+and `parking_lot::{Mutex, Condvar}` for the c2 group-commit
+coordinator and response slots. That looks inconsistent — surely
+one or the other is "faster"? — but each choice is workload-driven:
+
+- **`std::sync::RwLock` for `DbState`.** parking_lot's `RwLock` was
+  benched as a drop-in replacement and *regressed* `get_random/hit`
+  ~3× (931 ns → 2.7 µs). parking_lot favors writer fairness:
+  readers check a writer-pending counter on every acquisition. std
+  just does an atomic reader-count increment. For workloads where
+  reads dominate and writers are rare + brief (ours), std's
+  optimistic-read fast path wins; parking_lot's fairness guarantee
+  only pays off when writers are being starved (not our case).
+- **`parking_lot::{Mutex, Condvar}` for c2.** std's park/unpark on
+  macOS is ~1–5 µs per cycle. With per-write group-commit handoffs,
+  that overhead alone makes c2 a regression on every workload.
+  parking_lot brings it down to ~100–200 ns, which is the
+  difference between c2 being a net loss and a 2.61× win on
+  `concurrent_put_sync/8`. (See the c2 commit for the data.)
+
+Heuristic to remember: `std` is great at uncontended fast paths,
+`parking_lot` is great at contended handoffs. Don't replace one
+with the other globally without benching both.
+
 ## CI regression gate
 
 The criterion benches are wired to [CodSpeed](https://codspeed.io)
