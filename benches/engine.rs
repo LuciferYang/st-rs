@@ -25,7 +25,9 @@
 use codspeed_criterion_compat::{
     criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
-use st_rs::{DbImpl, DbOptions, WriteBatch};
+use st_rs::{
+    api::db::ColumnFamilyHandle, ColumnFamilyOptions, DbImpl, DbOptions, WriteBatch,
+};
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -255,6 +257,91 @@ fn bench_read_modes(c: &mut Criterion) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Read-amplification bench: how does `get_hit` / `get_miss` latency
+/// scale with the number of L0 SSTs? Every L0 SST must be consulted
+/// (newest-first, stopping on the first hit). Bloom filters keep the
+/// `get_miss` path bounded by N × (bloom-check) instead of N ×
+/// (full block read), so a regression in bloom-filter false-positive
+/// rate or block-cache wiring would show up here as `miss` latency
+/// growing super-linearly with SST count.
+///
+/// Uses a custom CF with `level0_file_num_compaction_trigger = 999`
+/// to prevent the auto-compaction from collapsing the L0 stack while
+/// the bench is building it. Compaction would otherwise kick in at
+/// 4 L0 files and flatten the tree to L1, which is a different
+/// measurement (binary-search by key range, O(log N) instead of O(N)).
+fn bench_read_amp(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_amp");
+    group.throughput(Throughput::Elements(1));
+
+    for &num_ssts in &[1usize, 4, 16, 64] {
+        let entries_per_sst = 1_000u64;
+        let total_entries: u64 = num_ssts as u64 * entries_per_sst;
+
+        // Each bench parameter gets a fresh dir + DB so the L0 stack
+        // is built deterministically.
+        let dir = fresh_db_dir();
+        let db = DbImpl::open(&opts(), &dir).expect("open");
+        let cf: std::sync::Arc<dyn ColumnFamilyHandle> = db
+            .create_column_family(
+                "read_amp_cf",
+                &ColumnFamilyOptions {
+                    level0_file_num_compaction_trigger: 999,
+                    ..ColumnFamilyOptions::default()
+                },
+            )
+            .expect("create_cf");
+
+        let v = value();
+        for sst_idx in 0..num_ssts {
+            for i in 0..entries_per_sst {
+                let k = sst_idx as u64 * entries_per_sst + i;
+                db.put_cf(&*cf, &key_of(k), &v).expect("populate");
+            }
+            db.flush_cf(&*cf).expect("flush");
+            db.wait_for_pending_work().expect("wait");
+        }
+
+        group.bench_with_input(
+            BenchmarkId::new("hit", num_ssts),
+            &num_ssts,
+            |b, _| {
+                let mut state: u64 = 0x9E3779B97F4A7C15;
+                b.iter(|| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let i = state % total_entries;
+                    let v = db.get_cf(&*cf, &key_of(i)).expect("get");
+                    black_box(v);
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("miss", num_ssts),
+            &num_ssts,
+            |b, _| {
+                let mut state: u64 = 0xDEADBEEFCAFEBABE;
+                b.iter(|| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    // Keys outside the populated range — bloom-miss path.
+                    let i = total_entries + (state % total_entries);
+                    let v = db.get_cf(&*cf, &key_of(i)).expect("get");
+                    black_box(v);
+                });
+            },
+        );
+
+        drop(cf);
+        let _ = db.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_put_sequential,
@@ -263,5 +350,6 @@ criterion_group!(
     bench_scan_forward,
     bench_next_chunk,
     bench_read_modes,
+    bench_read_amp,
 );
 criterion_main!(benches);

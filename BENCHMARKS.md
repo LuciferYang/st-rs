@@ -28,6 +28,7 @@ Groups:
 | `scan_forward/full_db` | `seek_to_first` + walk every key with `next()`, just count | k-way merging-iterator throughput; bench loop never reads key/value, so it isolates iterator bookkeeping cost |
 | `next_chunk/{64,256,1024}` | M5b vectorized chunked iterator, materializes pairs | the path Flink's `nextBatch` takes; parameterized by chunk size |
 | `read_modes/{scalar_collect,chunked_collect_1024}` | scalar `next()` + `to_vec()` vs `next_chunk(1024)` on the same DB, both producing `Vec<(Vec<u8>, Vec<u8>)>` | apples-to-apples: shows the per-call-overhead amortization the chunked path was designed for |
+| `read_amp/{hit,miss}/{1,4,16,64}` | get on a populated DB with N L0 SSTs (auto-compaction disabled via `level0_file_num_compaction_trigger=999`) | how does read latency scale with L0 depth? A regression in bloom-filter false-positive rate or per-SST traversal would show up here as `miss` approaching `hit` or `hit` growing super-linearly |
 
 CI runs `cargo bench --no-run` so the benches stay buildable, but we
 do **not** gate merges on bench numbers (no regression baseline yet —
@@ -45,6 +46,27 @@ materialize the `(key, value)` pairs — the JNI/Velox consumer's
 workload. This is the win the M5b vectorization was designed for; the
 older `scan_forward` baseline hid it because the scalar bench loop
 never reads key/value at all (it just counts).
+
+**Recorded result — `read_amp` (Apple Silicon, 20 samples, 1k entries
+per L0 SST, auto-compaction disabled):**
+
+| # L0 SSTs | `hit` | `miss` |
+|---:|---:|---:|
+| 1 | 667 ns | 257 ns |
+| 4 | 1.18 µs | 755 ns |
+| 16 | 3.10 µs | 2.65 µs |
+| 64 | 10.87 µs | 9.27 µs |
+
+Both `hit` and `miss` scale ~linearly with L0 depth: at 64 SSTs they
+take ~16× and ~36× the 1-SST latency respectively. This is the
+characteristic O(N) per-SST traversal — bloom is doing its job
+(`miss` < `hit` at every depth, so the bloom-miss path skips the
+data-block read), but you can't escape the bloom-check itself
+without compaction collapsing the L0 stack into L1. **Compaction
+is the fix**, not a bench-side optimization. A regression here
+that wouldn't show in `get_random/hit` (which uses ≤4 L0 SSTs):
+a worse bloom hash rate, a slower per-SST seek path, or a
+broken block cache that re-reads the same block N times.
 
 ### 2. Concurrency throughput benches — `benches/concurrent.rs`
 
