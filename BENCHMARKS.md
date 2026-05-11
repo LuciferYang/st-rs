@@ -469,15 +469,56 @@ vs. need their own atomic.
 **Defer** until c1 has been measured and proven insufficient. The
 Flink workload may not need it.
 
+### c5. Per-CF concurrency (multi-CF writers)
+
+**Gap:** Concurrent writes to *different* column families serialize
+on the single global `WriteCoord` + `state.write()`. The
+`concurrent_put_multi_cf/{1,2,4,8}` bench in `benches/concurrent.rs`
+makes this visible — aggregate throughput gets *worse* with thread
+count (1T 624 → 8T 466 Kops/s), exactly like `concurrent_put` with
+a shared CF.
+
+**Why it matters:** Velox/Gluten or any future multi-thread C ABI
+consumer would benefit. Real Flink hits this only in unusual
+configurations because each operator subtask typically owns its
+own state-backend instance with one writer thread.
+
+**To close (estimated 400–600 LOC, non-trivial review):**
+
+1. `CfState.memtable: MemTable` → `Arc<RwLock<MemTable>>` so each
+   CF's memtable can be written under `state.read()` instead of
+   `state.write()`. (~150 LOC of access-site updates across 17
+   sites + iterator constructors.)
+2. `CfState.immutable: Option<Arc<MemTable>>` →
+   `Option<Arc<RwLock<MemTable>>>` so the freeze path can swap the
+   active arc into immutable without needing unique-`Arc`
+   ownership. (~80 LOC of access-site updates.)
+3. `DbImpl.cf_write_coords: HashMap<ColumnFamilyId, Arc<WriteCoord>>`
+   keyed lookups. (~100 LOC for routing + per-CF leader.)
+4. `submit_write` routes single-CF batches to that CF's coord;
+   multi-CF batches fall back to the global coord (or acquire
+   memtable locks in CF order to avoid deadlock). (~80 LOC.)
+5. `state.last_sequence: SequenceNumber` → `AtomicU64` so per-CF
+   leaders can advance it without contending. (~30 LOC.)
+
+**Defer** until there's a measured workload that exercises it —
+the bench is in place to track progress when the time comes.
+A naïve subset (just routing, no memtable refactor) doesn't win,
+because per-CF leaders still serialize on `state.write()`. Both
+halves are required for the win.
+
 ### Suggested order of attack
 
 c1 and c2 are **landed**. Remaining:
 
-1. **c3** — only worthwhile if the memtable insert is the new
+1. **c5** — most directly measurable via `concurrent_put_multi_cf`,
+   but only worth the LOC investment when a multi-writer workload
+   exists (likely after the Stage-2 C ABI lands).
+2. **c3** — only worthwhile if the memtable insert is the new
    bottleneck under group commit. Should be measured first by
    profiling under `concurrent_put_sync/8` (group-committed) to
    confirm the skip-list insert is on the critical path.
-2. **c4** — only if read scaling beyond ~3× is needed.
+3. **c4** — only if read scaling beyond ~3× is needed.
 
 ## Convention
 
