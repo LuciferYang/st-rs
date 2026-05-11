@@ -38,7 +38,9 @@
 use codspeed_criterion_compat::{
     criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
-use st_rs::{DbImpl, DbOptions, WriteOptions};
+use st_rs::{
+    api::db::ColumnFamilyHandle, ColumnFamilyOptions, DbImpl, DbOptions, WriteOptions,
+};
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,6 +133,38 @@ fn run_concurrent_put_sync(db: &Arc<DbImpl>, n_threads: usize, ops_per_thread: u
         handles.push(std::thread::spawn(move || {
             for i in 0..ops_per_thread {
                 db.put_opt(&key_of(base + i), &v, &wo).expect("sync put");
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("thread panic");
+    }
+    start.elapsed()
+}
+
+/// Like [`run_concurrent_put`] but each thread writes to its **own
+/// column family**, disjoint from every other thread's. This is the
+/// workload that multi-CF concurrency targets: if the engine
+/// serializes writers on a single `state.write()` guard or a single
+/// group-commit coordinator, throughput is flat (no parallelism
+/// across CFs). Per-CF coords + per-CF memtable locks should let
+/// aggregate throughput scale roughly linearly with thread count.
+fn run_concurrent_put_multi_cf(
+    db: &Arc<DbImpl>,
+    cf_handles: &[Arc<dyn ColumnFamilyHandle>],
+    ops_per_thread: u64,
+) -> Duration {
+    let n_threads = cf_handles.len();
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(n_threads);
+    for (tid, cf) in cf_handles.iter().enumerate() {
+        let db = Arc::clone(db);
+        let cf = Arc::clone(cf);
+        let v = value();
+        let base = (tid as u64) * 1_000_000;
+        handles.push(std::thread::spawn(move || {
+            for i in 0..ops_per_thread {
+                db.put_cf(&*cf, &key_of(base + i), &v).expect("multi-cf put");
             }
         }));
     }
@@ -260,10 +294,59 @@ fn bench_concurrent_put_sync(c: &mut Criterion) {
     group.finish();
 }
 
+/// Concurrent writes where each thread targets its own CF. Surfaces
+/// whether per-CF concurrency actually scales — if all writers share
+/// one engine-write lock or one group-commit coord, throughput is
+/// flat at single-thread; with per-CF coords + per-CF memtable locks
+/// it should scale ~linearly with thread count.
+fn bench_concurrent_put_multi_cf(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent_put_multi_cf");
+    for &threads in &[1usize, 2, 4, 8] {
+        group.throughput(Throughput::Elements(threads as u64 * OPS_PER_THREAD));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(threads),
+            &threads,
+            |b, &n_threads| {
+                let dir = fresh_db_dir(&format!("put-multi-cf-{n_threads}"));
+                let db = DbImpl::open(&opts(), &dir).expect("open");
+                // One CF per thread, so writers can't collide. CF 0 is
+                // the implicit default; we skip it and create N more.
+                let cf_handles: Vec<Arc<dyn ColumnFamilyHandle>> = (0..n_threads)
+                    .map(|i| {
+                        let h = db
+                            .create_column_family(
+                                &format!("cf-{i}"),
+                                &ColumnFamilyOptions::default(),
+                            )
+                            .expect("create_cf");
+                        h as Arc<dyn ColumnFamilyHandle>
+                    })
+                    .collect();
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        total += run_concurrent_put_multi_cf(
+                            &db,
+                            &cf_handles,
+                            OPS_PER_THREAD,
+                        );
+                    }
+                    total
+                });
+                drop(cf_handles);
+                let _ = db.close();
+                let _ = std::fs::remove_dir_all(&dir);
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_concurrent_put,
     bench_concurrent_put_sync,
+    bench_concurrent_put_multi_cf,
     bench_concurrent_get,
 );
 criterion_main!(benches);
