@@ -110,37 +110,36 @@ class ForStBackendCheckpointRestoreIT {
         final JobClient client1 = env1.executeAsync("phase 1 - build state");
         System.out.println("[IT] phase=1 jobId=" + client1.getJobID());
 
-        // Let some elements flow + at least one checkpoint complete.
-        Thread.sleep(2000);
+        // Let the source emit enough records for each key to be hit at
+        // least once (3 sec × 20 r/s ÷ 3 keys ≈ 20 records per key).
+        Thread.sleep(3000);
 
-        // Trigger a savepoint to a fresh dir; result is the fully-qualified
-        // savepoint path that phase 2 will restore from.
-        System.out.println("[IT] phase=1 step=triggerSavepoint");
+        // Use stopWithSavepoint, NOT triggerSavepoint + cancel. The
+        // older flow had a race: triggerSavepoint emits the savepoint
+        // barrier at whatever moment the call dispatches, so a counter
+        // operator instance whose first record for some key hadn't yet
+        // arrived would snapshot empty state for that key — causing a
+        // null restore in phase 2 (~1-in-10 flake on CI).
+        //
+        // stopWithSavepoint signals the source to emit no more records,
+        // lets every in-flight record drain through the operator graph,
+        // then snapshots at the natural EOS. After it returns the job
+        // is in FINISHED state, so no separate cancel + wait dance.
+        //
+        // ForSt-backed jobs only support NATIVE savepoints; the
+        // CANONICAL format errors with "does not support CANONICAL
+        // savepoints" because the native backend's snapshot writer
+        // can't produce the portable format.
+        System.out.println("[IT] phase=1 step=stopWithSavepoint");
         final String savepointPath = client1
-                // ForSt-backed jobs only support NATIVE savepoints; the
-                // CANONICAL format errors with "does not support CANONICAL
-                // savepoints" because the native backend's snapshot writer
-                // can't produce the portable format.
-                .triggerSavepoint(savepointDir.toUri().toString(),
+                .stopWithSavepoint(
+                        /* advanceToEndOfTime = */ false,
+                        savepointDir.toUri().toString(),
                         SavepointFormatType.NATIVE)
                 .get(60, TimeUnit.SECONDS);
         System.out.println("[IT] phase=1 savepoint=" + savepointPath);
-
-        client1.cancel().get(30, TimeUnit.SECONDS);
-        // Wait for terminal status before moving on.
-        long deadline = System.currentTimeMillis() + 30_000;
-        JobStatus last = null;
-        while (System.currentTimeMillis() < deadline) {
-            final JobStatus s = client1.getJobStatus().get(5, TimeUnit.SECONDS);
-            if (s != last) {
-                System.out.println("[IT] phase=1 jobStatus=" + s);
-                last = s;
-            }
-            if (s.isGloballyTerminalState() || s == JobStatus.CANCELED) {
-                break;
-            }
-            Thread.sleep(200);
-        }
+        System.out.println("[IT] phase=1 jobStatus="
+                + client1.getJobStatus().get(5, TimeUnit.SECONDS));
 
         // ---------- Phase 2: start from savepoint, verify continuity ----
         final Configuration cfg2 = baseConfig(checkpointDir);
