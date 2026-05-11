@@ -39,7 +39,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <flink.version>2.2.0</flink.version>
         <junit.version>5.10.2</junit.version>
-        <st-rs-jni.version>0.0.1-SNAPSHOT</st-rs-jni.version>
+        <st-rs-jni.version>0.1.0-SNAPSHOT</st-rs-jni.version>
     </properties>
 
     <dependencies>
