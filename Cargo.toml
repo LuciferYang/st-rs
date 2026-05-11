@@ -3,7 +3,7 @@ members = [".", "st-rs-jni"]
 
 [package]
 name = "st-rs"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.94"
 description = "Rust port of ForSt — a RocksDB-compatible LSM engine with WAL, memtable, SST, compaction, snapshots, column families, and Flink state-backend integration"

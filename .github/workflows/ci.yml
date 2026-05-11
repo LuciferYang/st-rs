@@ -188,4 +188,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: st-rs-jni-fat-jar
-          path: java/target/st-rs-jni-0.0.1-SNAPSHOT.jar
+          path: java/target/st-rs-jni-0.1.0-SNAPSHOT.jar

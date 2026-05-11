@@ -170,13 +170,20 @@ exists to track — a 10× regression here would cost Flink workloads
 real money.
 
 **Recorded result — packed vs unpacked vectorized read (50k entries,
-`-wi 1 -i 2 -f 1`):**
+`-wi 1 -i 2 -f 1`, post-c1 + c2):**
 
 | chunk | `next_batch` (`byte[][]`) | `next_batch_packed` (`byte[]`) | Speedup |
 |---|---:|---:|---:|
-| 64 | 23.47 ms | 8.05 ms | 2.9× |
-| 256 | 25.63 ms | 7.74 ms | 3.3× |
-| 1024 | 28.35 ms | 6.93 ms | 4.1× |
+| 64 | 67.14 ms | 17.90 ms | 3.75× |
+| 256 | 63.65 ms | 10.04 ms | 6.34× |
+| 1024 | 62.37 ms | **7.01 ms** | **8.90×** |
+
+(The original commit reported 2.9–4.1× pre-c1; the gap widened to
+3.75–8.90× because the unpacked path's per-entry JNI crossing now
+also pays the post-c1 `RwLock::read()` per-call overhead, while
+the packed path makes only one JNI crossing for the whole chunk
+and pays the lock once. The architecture shift made packed even
+more decisively better.)
 
 The unpacked variant pays one `byte_array_from_slice` JNI crossing
 per key *and* per value — for 50k entries that's 100k JVM allocations

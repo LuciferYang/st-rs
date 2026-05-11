@@ -5,7 +5,7 @@
 #   ./build-fat-jar.sh           # debug build
 #   ./build-fat-jar.sh --release # release build
 #
-# Output: java/target/st-rs-jni-0.0.1-SNAPSHOT.jar
+# Output: java/target/st-rs-jni-0.1.0-SNAPSHOT.jar
 #
 # The JAR contains the native library at:
 #   org/forstdb/native/<os>-<arch>/libst_rs_jni.{so,dylib}
@@ -64,5 +64,5 @@ echo "==> Copied ${SRC} → ${RESOURCE_DIR}/${LIB_NAME}"
 echo "==> Building JAR..."
 cd java
 mvn package -DskipTests -q
-echo "==> Done: java/target/st-rs-jni-0.0.1-SNAPSHOT.jar"
+echo "==> Done: java/target/st-rs-jni-0.1.0-SNAPSHOT.jar"
 echo "    Native library bundled for: ${PLATFORM}"

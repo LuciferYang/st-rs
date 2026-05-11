@@ -582,7 +582,7 @@ checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 
 [[package]]
 name = "st-rs"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "codspeed-criterion-compat",
  "lz4_flex",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "st-rs-jni"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "jni",
  "st-rs",

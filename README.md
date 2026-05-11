@@ -36,12 +36,23 @@ engine properties (`rocksdb.*` metrics),
 `FlinkStateBackend` facade, `FlinkFileSystem` for remote storage.
 
 **Performance:**
-block cache (shared LRU), Snappy + LZ4 compression (feature-gated, pure Rust),
-batch APIs (`multi_get` / `multi_put` / `multi_delete` / `prefix_scan`).
+block cache (shared LRU, default 32 MiB), Snappy + LZ4 compression (feature-gated, pure Rust),
+batch APIs (`multi_get` / `multi_put` / `multi_delete` / `prefix_scan`),
+single-key `put_opt` fast path that bypasses `WriteBatch`,
+parallel readers via `RwLock<DbState>` (~3× scaling on `concurrent_get/4`),
+leader-follower group commit on the write path (~2.6× scaling on `concurrent_put_sync/8`),
+packed `nextBatchPacked` JNI iterator (~3.7–8.9× faster than `byte[][]` `nextBatch` at chunk≥64),
+`WriteOptions.sync=false` is the honored default (matches RocksDB).
+See [BENCHMARKS.md](BENCHMARKS.md) for the full bench harness, recorded numbers,
+the side-by-side comparison vs upstream `rocksdbjni` (st-rs is faster on every measured workload),
+and the documented architectural follow-ups (c3 concurrent skip-list, c4 lock-free read snapshot).
 
 **JNI:**
-`org.forstdb.RocksDB`, `WriteBatch`, `ColumnFamilyHandle`, `WriteOptions`,
-`ReadOptions`, `DBOptions`, `Snapshot` — matching ForSt's Java API surface.
+`org.forstdb.RocksDB`, `WriteBatch`, `ColumnFamilyHandle`, `WriteOptions`
+(now with `setSync(boolean)`), `ReadOptions`, `DBOptions`, `Snapshot`,
+`RocksIterator` (with `nextBatch(int) → byte[][]` and the new
+`nextBatchPacked(int) → byte[]` for amortizing per-pair JVM allocations) —
+matching ForSt's Java API surface plus a couple of additive extensions.
 
 ## Building
 
@@ -58,7 +69,7 @@ cargo build --release -p st-rs-jni
 
 # Java JAR
 cd java && mvn package -DskipTests
-# → java/target/st-rs-jni-0.0.1-SNAPSHOT.jar
+# → java/target/st-rs-jni-0.1.0-SNAPSHOT.jar
 ```
 
 ## Using with Flink
@@ -75,7 +86,7 @@ native calls go to the Rust engine instead of C++.
 
 2. Copy the st-rs artifacts in its place:
    ```bash
-   cp java/target/st-rs-jni-0.0.1-SNAPSHOT.jar $FLINK_HOME/lib/
+   cp java/target/st-rs-jni-0.1.0-SNAPSHOT.jar $FLINK_HOME/lib/
    cp target/release/libst_rs_jni.so $FLINK_HOME/lib/   # Linux
    # or libst_rs_jni.dylib on macOS
    ```
@@ -134,8 +145,8 @@ try (DBOptions opts = new DBOptions().setCreateIfMissing(true);
 ## Design Constraints
 
 - `#![deny(unsafe_code)]` on the core engine — `unsafe` confined to `st-rs-jni`
-- No C/C++ dependencies — compression uses pure-Rust crates (`snap`, `lz4_flex`)
-- 529 Rust + 23 Java tests, clippy clean, end-to-end Flink MiniCluster IT (checkpoint + savepoint/restore)
+- No C/C++ dependencies — compression uses pure-Rust crates (`snap`, `lz4_flex`); concurrency via `parking_lot` for contended handoffs, `std::sync` for uncontended fast paths (see [BENCHMARKS.md](BENCHMARKS.md) for why both)
+- 529 Rust + 24 Java tests, clippy clean, end-to-end Flink MiniCluster IT (checkpoint + savepoint/restore via `stopWithSavepoint`, deterministic)
 
 ## License
 
