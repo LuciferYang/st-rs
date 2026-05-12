@@ -297,24 +297,44 @@ pub struct ReadOptions {
     /// sequence number; `None` means "current".
     pub snapshot: Option<u64>,
 
-    /// If `false`, block reads will not populate the block cache. Default: `true`.
+    /// If `false`, block reads will not populate the block cache.
+    /// Default: `true`.
+    ///
+    /// **Note:** currently ignored by `Db::new_iterator{,_cf}`. The
+    /// block cache is always populated on miss regardless of this flag.
     pub fill_cache: bool,
 
     /// Verify checksums on every block read. Default: `true`.
+    ///
+    /// **Note:** currently ignored by `Db::new_iterator{,_cf}`. Block
+    /// checksums are always verified on read.
     pub verify_checksums: bool,
 
     /// Do not read past this upper bound during iteration. Half-open.
+    ///
+    /// **Note:** currently ignored by `Db::new_iterator{,_cf}`. The
+    /// returned iterator walks past the bound — callers must filter
+    /// at the application level until this is wired through to the
+    /// concrete iterator.
     pub iterate_upper_bound: Option<Vec<u8>>,
 
     /// Do not read before this lower bound during iteration.
+    ///
+    /// **Note:** currently ignored by `Db::new_iterator{,_cf}`. Same
+    /// caveat as [`Self::iterate_upper_bound`].
     pub iterate_lower_bound: Option<Vec<u8>>,
 
     /// If `true`, the iterator's returned keys stay pinned for the
     /// lifetime of the iterator (never invalidated by `next`/`prev`).
+    ///
+    /// **Note:** currently ignored by `Db::new_iterator{,_cf}`.
     pub pin_data: bool,
 
-    /// If `true`, return immediately with `Incomplete` rather than blocking
-    /// on I/O.
+    /// If `true`, return immediately with `Incomplete` rather than
+    /// blocking on I/O.
+    ///
+    /// **Note:** currently ignored by `Db::new_iterator{,_cf}` and the
+    /// `get`-family.
     pub read_tier_memtable_only: bool,
 }
 

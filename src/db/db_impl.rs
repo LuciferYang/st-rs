@@ -3557,6 +3557,19 @@ impl<'a> WriteBatchHandler for MemTableInsertHandler<'a> {
 // Db trait implementation
 // ---------------------------------------------------------------------------
 
+/// Lift `Result<DbIterator, Status>` to a trait-object box, surfacing
+/// the error through [`crate::api::iterator::ErrorIterator`] so the
+/// trait method's `Box<dyn DbIterator>` return type stays uniform.
+/// Used by `Db::new_iterator` and `Db::new_iterator_cf`.
+fn boxed_iter_or_error(
+    r: Result<crate::db::db_iter::DbIterator>,
+) -> Box<dyn crate::api::iterator::DbIterator> {
+    match r {
+        Ok(it) => Box::new(it),
+        Err(e) => Box::new(crate::api::iterator::ErrorIterator::new(e)),
+    }
+}
+
 impl crate::api::db::Db for DbImpl {
     fn create_column_family(
         &self,
@@ -3699,13 +3712,9 @@ impl crate::api::db::Db for DbImpl {
         // plumbed through to the concrete iterator and are silently
         // ignored — see the note in `db_iter::DbIterator`'s trait
         // impl doc comment.
-        let result = match opts.snapshot {
-            Some(seq) => DbImpl::iter_at_seq(self, seq),
-            None => DbImpl::iter(self),
-        };
-        match result {
-            Ok(it) => Box::new(it),
-            Err(e) => Box::new(crate::api::iterator::ErrorIterator::new(e)),
+        match opts.snapshot {
+            Some(seq) => boxed_iter_or_error(DbImpl::iter_at_seq(self, seq)),
+            None => boxed_iter_or_error(DbImpl::iter(self)),
         }
     }
 
@@ -3723,10 +3732,7 @@ impl crate::api::db::Db for DbImpl {
         // through the working code.
         if let Some(seq) = opts.snapshot {
             if cf.id() == DEFAULT_CF_ID {
-                return match DbImpl::iter_at_seq(self, seq) {
-                    Ok(it) => Box::new(it),
-                    Err(e) => Box::new(crate::api::iterator::ErrorIterator::new(e)),
-                };
+                return boxed_iter_or_error(DbImpl::iter_at_seq(self, seq));
             }
             return Box::new(crate::api::iterator::ErrorIterator::new(
                 Status::not_supported(
@@ -3734,10 +3740,7 @@ impl crate::api::db::Db for DbImpl {
                 ),
             ));
         }
-        match DbImpl::iter_cf(self, cf) {
-            Ok(it) => Box::new(it),
-            Err(e) => Box::new(crate::api::iterator::ErrorIterator::new(e)),
-        }
+        boxed_iter_or_error(DbImpl::iter_cf(self, cf))
     }
 
     fn snapshot(&self) -> Arc<dyn crate::api::snapshot::Snapshot> {
