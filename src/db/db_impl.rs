@@ -2180,6 +2180,15 @@ impl DbImpl {
     }
 
     /// Iterator at a specific snapshot. See [`Self::snapshot`].
+    ///
+    /// Routes through [`Self::iter_at_seq`], which is the single
+    /// validation chokepoint for snapshot-bound iteration: the
+    /// supplied sequence must not exceed the engine's high-water
+    /// mark. For snapshots minted by [`Self::snapshot`] this is a
+    /// trivial pass-through (the sequence is by construction
+    /// `<= last_sequence`), but the validation is kept here as
+    /// belt-and-suspenders so a user-implemented `Snapshot` trait
+    /// object with a fabricated sequence is caught uniformly.
     pub fn iter_at(
         &self,
         snapshot: &dyn crate::api::snapshot::Snapshot,
@@ -2203,7 +2212,8 @@ impl DbImpl {
         if read_seq > state.last_sequence {
             return Err(Status::invalid_argument(format!(
                 "snapshot sequence number {read_seq} is in the future \
-                 (database has not advanced that far)"
+                 (database has only advanced to {last})",
+                last = state.last_sequence
             )));
         }
         let cf = state.default_cf();
@@ -7035,10 +7045,16 @@ mod tests {
             .create_column_family("user", &ColumnFamilyOptions::default())
             .unwrap();
 
+        // Use snapshot: Some(0), which is always <= last_sequence,
+        // so the only error path that can fire is the early-return
+        // NotSupported branch in new_iterator_cf. (Some(1) on a
+        // fresh DB with last_sequence == 0 would also trigger the
+        // InvalidArgument bound check in iter_at_seq — conflating
+        // the two error sources.)
         let db_trait: &dyn Db = &*db;
         let cf_handle: &dyn ColumnFamilyHandle = &*cf;
         let ro = ReadOptions {
-            snapshot: Some(1),
+            snapshot: Some(0),
             ..ReadOptions::default()
         };
         let it: Box<dyn IterTrait> = db_trait.new_iterator_cf(&ro, cf_handle);
@@ -7057,10 +7073,9 @@ mod tests {
 
     #[test]
     fn db_trait_new_iterator_rejects_future_snapshot_seq() {
-        // Exercises the seq > last_sequence validation added in
-        // round-4: a fabricated "future" seq must surface as an
-        // InvalidArgument through status(), not silently devolve
-        // into a read-at-latest iterator.
+        // Exercises the seq > last_sequence validation in iter_at_seq:
+        // a fabricated "future" seq must surface as InvalidArgument
+        // through status(), not silently devolve into read-at-latest.
         use crate::api::db::Db;
         use crate::api::iterator::DbIterator as IterTrait;
         use crate::api::options::ReadOptions;
@@ -7079,6 +7094,38 @@ mod tests {
         assert!(it.status().is_err(), "status() must surface the validation error");
 
         drop(it);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn iter_at_rejects_fabricated_future_seq() {
+        // Locks in the "validation applies to every entry point"
+        // claim from iter_at_seq's doc comment by exercising the
+        // direct inherent path `DbImpl::iter_at(&dyn Snapshot)`
+        // with a hand-rolled Snapshot stub whose sequence_number()
+        // is u64::MAX. The validation must still fire — not via
+        // the trait dispatch path.
+        struct FutureSnap;
+        impl crate::api::snapshot::Snapshot for FutureSnap {
+            fn sequence_number(&self) -> SequenceNumber {
+                u64::MAX
+            }
+        }
+
+        let dir = temp_dir("iter-at-future-seq");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.put(b"k", b"v").unwrap();
+        // `unwrap_err` would require `DbIterator: Debug` for the Ok
+        // variant — match against the Result instead.
+        match db.iter_at(&FutureSnap) {
+            Err(err) => assert!(
+                err.is_invalid_argument(),
+                "expected InvalidArgument, got {err:?}"
+            ),
+            Ok(_) => panic!("iter_at must reject future seq via the iter_at_seq guard"),
+        }
+
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
