@@ -3659,19 +3659,26 @@ impl crate::api::db::Db for DbImpl {
         &self,
         _opts: &crate::api::options::ReadOptions,
     ) -> Box<dyn crate::api::iterator::DbIterator> {
-        // The concrete DbIterator (db_iter::DbIterator) doesn't
-        // implement the trait DbIterator (api::iterator::DbIterator).
-        // For now, return an empty iterator. Full trait wiring is
-        // deferred to a future layer.
-        Box::new(crate::api::iterator::EmptyIterator)
+        // The concrete `db_iter::DbIterator` implements
+        // `api::iterator::DbIterator` (added with A-2), so we can box
+        // it directly. On open failure we fall back to an empty
+        // iterator — the trait method has no error channel, but in
+        // practice `iter()` only fails if the engine is closed.
+        match DbImpl::iter(self) {
+            Ok(it) => Box::new(it),
+            Err(_) => Box::new(crate::api::iterator::EmptyIterator),
+        }
     }
 
     fn new_iterator_cf(
         &self,
         _opts: &crate::api::options::ReadOptions,
-        _cf: &dyn crate::api::db::ColumnFamilyHandle,
+        cf: &dyn crate::api::db::ColumnFamilyHandle,
     ) -> Box<dyn crate::api::iterator::DbIterator> {
-        Box::new(crate::api::iterator::EmptyIterator)
+        match DbImpl::iter_cf(self, cf) {
+            Ok(it) => Box::new(it),
+            Err(_) => Box::new(crate::api::iterator::EmptyIterator),
+        }
     }
 
     fn snapshot(&self) -> Arc<dyn crate::api::snapshot::Snapshot> {
@@ -6780,6 +6787,72 @@ mod tests {
         db.put(b"k", b"v").unwrap();
         db.close().unwrap();
         // Second close should succeed without panic.
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- A-2 regression: Db::new_iterator must walk real data ----
+
+    #[test]
+    fn db_trait_new_iterator_walks_populated_db() {
+        // Pre-A-2 the trait impl returned EmptyIterator regardless of
+        // database contents, so this test would have failed at the
+        // very first valid() check. Guards against regression of
+        // that specific bug.
+        use crate::api::db::Db;
+        use crate::api::iterator::DbIterator as IterTrait;
+        use crate::api::options::ReadOptions;
+
+        let dir = temp_dir("trait-iter");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        for i in 0..10u32 {
+            db.put(format!("k{i:02}").as_bytes(), b"v").unwrap();
+        }
+
+        let db_trait: &dyn Db = &*db;
+        let mut it: Box<dyn IterTrait> = db_trait.new_iterator(&ReadOptions::default());
+        it.seek_to_first();
+        let mut n = 0usize;
+        while it.valid() {
+            n += 1;
+            it.next();
+        }
+        assert_eq!(n, 10, "trait iterator must see every populated entry");
+        it.status().unwrap();
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_trait_new_iterator_cf_walks_populated_cf() {
+        use crate::api::db::{ColumnFamilyHandle, Db};
+        use crate::api::iterator::DbIterator as IterTrait;
+        use crate::api::options::{ColumnFamilyOptions, ReadOptions};
+
+        let dir = temp_dir("trait-iter-cf");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        let cf = db
+            .create_column_family("user", &ColumnFamilyOptions::default())
+            .unwrap();
+        for i in 0..5u32 {
+            db.put_cf(&*cf, format!("k{i:02}").as_bytes(), b"v").unwrap();
+        }
+
+        let db_trait: &dyn Db = &*db;
+        let cf_handle: &dyn ColumnFamilyHandle = &*cf;
+        let mut it: Box<dyn IterTrait> =
+            db_trait.new_iterator_cf(&ReadOptions::default(), cf_handle);
+        it.seek_to_first();
+        let mut n = 0usize;
+        while it.valid() {
+            n += 1;
+            it.next();
+        }
+        assert_eq!(n, 5, "trait cf-iterator must see every populated entry");
+
+        drop(it);
+        drop(cf);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

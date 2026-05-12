@@ -865,6 +865,58 @@ impl DbIterator {
     }
 }
 
+/// Bridge the concrete [`DbIterator`] to the public trait
+/// [`crate::api::iterator::DbIterator`]. This is what `Db::new_iterator`
+/// and `Db::new_iterator_cf` return — pre-A-2 the trait impls returned
+/// an `EmptyIterator` placeholder, so every trait-object caller saw an
+/// empty database regardless of actual contents.
+///
+/// The concrete iterator doesn't track an error channel (all I/O errors
+/// surface as `Result` at construction or `refill()` time), so
+/// `status()` is always `Ok(())`. `refresh()` is intentionally not
+/// supported — callers should drop and re-open the iterator instead.
+impl crate::api::iterator::DbIterator for DbIterator {
+    fn valid(&self) -> bool {
+        DbIterator::valid(self)
+    }
+
+    fn seek_to_first(&mut self) {
+        DbIterator::seek_to_first(self);
+    }
+
+    fn seek_to_last(&mut self) {
+        DbIterator::seek_to_last(self);
+    }
+
+    fn seek(&mut self, target: &[u8]) {
+        DbIterator::seek(self, target);
+    }
+
+    fn seek_for_prev(&mut self, target: &[u8]) {
+        DbIterator::seek_for_prev(self, target);
+    }
+
+    fn next(&mut self) {
+        DbIterator::next(self);
+    }
+
+    fn prev(&mut self) {
+        DbIterator::prev(self);
+    }
+
+    fn key(&self) -> &[u8] {
+        DbIterator::key(self)
+    }
+
+    fn value(&self) -> &[u8] {
+        DbIterator::value(self)
+    }
+
+    fn status(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Streaming-mode helpers
 // ---------------------------------------------------------------------------
