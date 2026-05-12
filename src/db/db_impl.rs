@@ -3660,13 +3660,14 @@ impl crate::api::db::Db for DbImpl {
         _opts: &crate::api::options::ReadOptions,
     ) -> Box<dyn crate::api::iterator::DbIterator> {
         // The concrete `db_iter::DbIterator` implements
-        // `api::iterator::DbIterator` (added with A-2), so we can box
-        // it directly. On open failure we fall back to an empty
-        // iterator — the trait method has no error channel, but in
-        // practice `iter()` only fails if the engine is closed.
+        // `api::iterator::DbIterator` (added with A-2). On open
+        // failure we return an `ErrorIterator` rather than the
+        // success-shaped `EmptyIterator` so the error surfaces
+        // through the trait's `status()` channel — callers can
+        // distinguish "engine closed" from "empty database."
         match DbImpl::iter(self) {
             Ok(it) => Box::new(it),
-            Err(_) => Box::new(crate::api::iterator::EmptyIterator),
+            Err(e) => Box::new(crate::api::iterator::ErrorIterator::new(e)),
         }
     }
 
@@ -3677,7 +3678,7 @@ impl crate::api::db::Db for DbImpl {
     ) -> Box<dyn crate::api::iterator::DbIterator> {
         match DbImpl::iter_cf(self, cf) {
             Ok(it) => Box::new(it),
-            Err(_) => Box::new(crate::api::iterator::EmptyIterator),
+            Err(e) => Box::new(crate::api::iterator::ErrorIterator::new(e)),
         }
     }
 
@@ -6798,7 +6799,9 @@ mod tests {
         // Pre-A-2 the trait impl returned EmptyIterator regardless of
         // database contents, so this test would have failed at the
         // very first valid() check. Guards against regression of
-        // that specific bug.
+        // that specific bug, plus exercises every delegated method
+        // on the trait impl (seek_to_first / seek_to_last / seek /
+        // seek_for_prev / next / prev / key / value / status).
         use crate::api::db::Db;
         use crate::api::iterator::DbIterator as IterTrait;
         use crate::api::options::ReadOptions;
@@ -6811,6 +6814,8 @@ mod tests {
 
         let db_trait: &dyn Db = &*db;
         let mut it: Box<dyn IterTrait> = db_trait.new_iterator(&ReadOptions::default());
+
+        // Forward walk via seek_to_first + next.
         it.seek_to_first();
         let mut n = 0usize;
         while it.valid() {
@@ -6818,6 +6823,26 @@ mod tests {
             it.next();
         }
         assert_eq!(n, 10, "trait iterator must see every populated entry");
+        it.status().unwrap();
+
+        // seek_to_last + prev — exercise the backward delegation paths.
+        it.seek_to_last();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"k09");
+        it.prev();
+        assert!(it.valid());
+        assert_eq!(it.key(), b"k08");
+
+        // seek to a mid-range key — exercise the seek delegation path.
+        it.seek(b"k05");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"k05");
+        assert_eq!(it.value(), b"v");
+
+        // seek_for_prev — exercise the seek_for_prev delegation path.
+        it.seek_for_prev(b"k05a");
+        assert!(it.valid());
+        assert_eq!(it.key(), b"k05");
         it.status().unwrap();
 
         db.close().unwrap();
@@ -6850,6 +6875,7 @@ mod tests {
             it.next();
         }
         assert_eq!(n, 5, "trait cf-iterator must see every populated entry");
+        it.status().unwrap();
 
         drop(it);
         drop(cf);

@@ -871,10 +871,14 @@ impl DbIterator {
 /// an `EmptyIterator` placeholder, so every trait-object caller saw an
 /// empty database regardless of actual contents.
 ///
-/// The concrete iterator doesn't track an error channel (all I/O errors
-/// surface as `Result` at construction or `refill()` time), so
-/// `status()` is always `Ok(())`. `refresh()` is intentionally not
-/// supported — callers should drop and re-open the iterator instead.
+/// `status()` returns `Ok(())` because this concrete iterator does not
+/// yet carry an error field: all I/O errors are surfaced as `Result`
+/// at construction time (open / `iter_cf` failure goes through the
+/// `Err` arm in the trait impls and produces an `ErrorIterator`). A
+/// future change that lets `refill()` propagate mid-scan errors will
+/// need to add an `Option<Status>` field on the concrete struct and
+/// read it from `status()` here. `refresh()` falls through to the
+/// trait's default (`Status::not_supported`).
 impl crate::api::iterator::DbIterator for DbIterator {
     fn valid(&self) -> bool {
         DbIterator::valid(self)
