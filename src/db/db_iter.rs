@@ -879,6 +879,17 @@ impl DbIterator {
 /// need to add an `Option<Status>` field on the concrete struct and
 /// read it from `status()` here. `refresh()` falls through to the
 /// trait's default (`Status::not_supported`).
+///
+/// The trait impls of `Db::new_iterator{,_cf}` honor
+/// `ReadOptions.snapshot` (via `iter_at_seq`); the remaining
+/// `ReadOptions` fields — `fill_cache`, `verify_checksums`,
+/// `iterate_upper_bound`, `iterate_lower_bound`, `tailing`,
+/// `prefix_same_as_start`, `total_order_seek`,
+/// `read_tier_memtable_only`, `pin_data` — are currently silently
+/// ignored. Plumbing each through requires either a wider
+/// constructor signature on this struct or a configurable
+/// `from_arcs` variant; both are deferred until a caller surfaces
+/// concrete demand.
 impl crate::api::iterator::DbIterator for DbIterator {
     fn valid(&self) -> bool {
         DbIterator::valid(self)

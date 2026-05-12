@@ -2181,8 +2181,8 @@ impl DbImpl {
 
     /// Iterator at a specific snapshot. See [`Self::snapshot`].
     ///
-    /// Routes through [`Self::iter_at_seq`], which is the single
-    /// validation chokepoint for snapshot-bound iteration: the
+    /// Routes through the private `iter_at_seq` helper, which is the
+    /// single validation chokepoint for snapshot-bound iteration: the
     /// supplied sequence must not exceed the engine's high-water
     /// mark. For snapshots minted by [`Self::snapshot`] this is a
     /// trivial pass-through (the sequence is by construction
@@ -2196,10 +2196,7 @@ impl DbImpl {
         self.iter_at_seq(snapshot.sequence_number())
     }
 
-    fn iter_at_seq(
-        &self,
-        read_seq: SequenceNumber,
-    ) -> Result<crate::db::db_iter::DbIterator> {
+    fn iter_at_seq(&self, read_seq: SequenceNumber) -> Result<crate::db::db_iter::DbIterator> {
         let state = self.state.read().unwrap();
         // Reject fabricated "future" sequence numbers: a seq above
         // the current high-water mark would silently devolve into
@@ -3717,12 +3714,20 @@ impl crate::api::db::Db for DbImpl {
         opts: &crate::api::options::ReadOptions,
         cf: &dyn crate::api::db::ColumnFamilyHandle,
     ) -> Box<dyn crate::api::iterator::DbIterator> {
-        // No `iter_cf_at_seq` helper exists yet (snapshot-pinned
-        // iteration on a non-default CF is unimplemented), so we
-        // surface that explicitly via `ErrorIterator` when the caller
-        // requests a snapshot. The default-CF + current-state path
-        // works normally.
-        if opts.snapshot.is_some() {
+        // Snapshot-bound iteration on a non-default CF has no
+        // dedicated helper yet (no `iter_cf_at_seq`), but a caller
+        // who happens to pass the default-CF handle with a snapshot
+        // *can* be served via the same `iter_at_seq` chokepoint that
+        // `new_iterator` uses. So we narrow the `NotSupported` path
+        // to genuinely-non-default CFs and route default + snapshot
+        // through the working code.
+        if let Some(seq) = opts.snapshot {
+            if cf.id() == DEFAULT_CF_ID {
+                return match DbImpl::iter_at_seq(self, seq) {
+                    Ok(it) => Box::new(it),
+                    Err(e) => Box::new(crate::api::iterator::ErrorIterator::new(e)),
+                };
+            }
             return Box::new(crate::api::iterator::ErrorIterator::new(
                 Status::not_supported(
                     "snapshot-bound iteration on non-default CF is not implemented",
@@ -7094,6 +7099,54 @@ mod tests {
         assert!(it.status().is_err(), "status() must surface the validation error");
 
         drop(it);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_trait_new_iterator_cf_default_cf_honors_snapshot() {
+        // Round-8 fix: `new_iterator_cf` previously returned
+        // NotSupported for any CF when opts.snapshot was set, even
+        // the default CF (which iter_at_seq can already serve). Now
+        // the default-CF path routes through iter_at_seq normally.
+        use crate::api::db::{ColumnFamilyHandle, Db};
+        use crate::api::iterator::DbIterator as IterTrait;
+        use crate::api::options::ReadOptions;
+
+        let dir = temp_dir("trait-iter-cf-default-snap");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.put(b"a", b"old").unwrap();
+
+        let db_trait: &dyn Db = &*db;
+        let snap = db_trait.snapshot();
+        db.put(b"b", b"new").unwrap();
+
+        // Construct a handle pointing at the default CF id (0).
+        let default_cf = ColumnFamilyHandleImpl {
+            id: DEFAULT_CF_ID,
+            name: "default".to_string(),
+        };
+        let cf_handle: &dyn ColumnFamilyHandle = &default_cf;
+        let ro = ReadOptions {
+            snapshot: Some(snap.sequence_number()),
+            ..ReadOptions::default()
+        };
+        let mut it: Box<dyn IterTrait> = db_trait.new_iterator_cf(&ro, cf_handle);
+        it.seek_to_first();
+        let mut keys = Vec::new();
+        while it.valid() {
+            keys.push(it.key().to_vec());
+            it.next();
+        }
+        assert_eq!(
+            keys,
+            vec![b"a".to_vec()],
+            "default-CF + snapshot via new_iterator_cf must respect the snapshot"
+        );
+        it.status().unwrap();
+
+        drop(it);
+        drop(snap);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
