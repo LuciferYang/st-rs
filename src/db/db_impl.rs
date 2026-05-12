@@ -2187,7 +2187,7 @@ impl DbImpl {
         self.iter_at_seq(snapshot.sequence_number())
     }
 
-    pub(crate) fn iter_at_seq(
+    fn iter_at_seq(
         &self,
         read_seq: SequenceNumber,
     ) -> Result<crate::db::db_iter::DbIterator> {
@@ -3667,12 +3667,27 @@ impl crate::api::db::Db for DbImpl {
         //
         // Honors `opts.snapshot` (sequence-number-pinned read) when
         // set; falls back to a current-state iterator otherwise.
-        // Other `ReadOptions` fields (`fill_cache`, `verify_checksums`,
-        // `iterate_upper_bound`, …) are not yet plumbed through to
-        // the concrete iterator and are silently ignored — see the
-        // note in `db_iter::DbIterator`'s trait impl doc comment.
+        // Validates that `seq <= last_sequence` to reject fabricated
+        // "future" sequence numbers that would silently devolve into
+        // a read-at-latest. Note we do *not* require `seq` to be a
+        // currently-registered snapshot — the caller is responsible
+        // for keeping their `DbSnapshot` alive (which pins the seq
+        // against compaction GC). Other `ReadOptions` fields
+        // (`fill_cache`, `verify_checksums`, `iterate_upper_bound`,
+        // …) are not yet plumbed through to the concrete iterator
+        // and are silently ignored — see the note in
+        // `db_iter::DbIterator`'s trait impl doc comment.
         let result = match opts.snapshot {
-            Some(seq) => DbImpl::iter_at_seq(self, seq),
+            Some(seq) => {
+                let last = self.state.read().unwrap().last_sequence;
+                if seq > last {
+                    Err(Status::invalid_argument(format!(
+                        "ReadOptions.snapshot seq {seq} exceeds last_sequence {last}"
+                    )))
+                } else {
+                    DbImpl::iter_at_seq(self, seq)
+                }
+            }
             None => DbImpl::iter(self),
         };
         match result {
@@ -3694,7 +3709,7 @@ impl crate::api::db::Db for DbImpl {
         if opts.snapshot.is_some() {
             return Box::new(crate::api::iterator::ErrorIterator::new(
                 Status::not_supported(
-                    "snapshot-bound iteration on non-default CF not yet supported",
+                    "snapshot-bound iteration on non-default CF is not implemented",
                 ),
             ));
         }
@@ -6908,13 +6923,14 @@ mod tests {
     #[test]
     fn db_trait_new_iterator_cf_error_path_surfaces_via_status() {
         // Exercises the `Err(_) => ErrorIterator::new(e)` fallback
-        // path in `Db::new_iterator_cf`. Drop the CF, then try to
-        // iterate through a stale handle — `iter_cf` returns
-        // `Err(invalid_argument)` and the trait impl must surface
-        // that through `status()` rather than reporting empty success.
+        // path in `Db::new_iterator_cf`. Drop the CF (both from the
+        // engine's `column_families` map AND release the local Arc
+        // before constructing the iterator) so `iter_cf` reliably
+        // returns `Err(invalid_argument)` on the CF-id lookup.
         use crate::api::db::{ColumnFamilyHandle, Db};
         use crate::api::iterator::DbIterator as IterTrait;
         use crate::api::options::{ColumnFamilyOptions, ReadOptions};
+        use std::sync::Arc;
 
         let dir = temp_dir("trait-iter-cf-err");
         let db = DbImpl::open(&opts(), &dir).unwrap();
@@ -6922,17 +6938,31 @@ mod tests {
             .create_column_family("scratch", &ColumnFamilyOptions::default())
             .unwrap();
         db.put_cf(&*cf, b"k", b"v").unwrap();
+        // Snapshot the CF id into a free-standing handle so we can
+        // drop the Arc before calling `new_iterator_cf`.
+        struct StaleCfHandle {
+            id: ColumnFamilyId,
+        }
+        impl ColumnFamilyHandle for StaleCfHandle {
+            fn id(&self) -> ColumnFamilyId {
+                self.id
+            }
+            fn name(&self) -> &str {
+                "scratch"
+            }
+        }
+        let stale = Arc::new(StaleCfHandle { id: cf.id() });
         db.drop_column_family(&*cf).unwrap();
+        drop(cf);
 
         let db_trait: &dyn Db = &*db;
-        let cf_handle: &dyn ColumnFamilyHandle = &*cf;
         let it: Box<dyn IterTrait> =
-            db_trait.new_iterator_cf(&ReadOptions::default(), cf_handle);
+            db_trait.new_iterator_cf(&ReadOptions::default(), &*stale);
         assert!(!it.valid(), "error iterator must report invalid");
         assert!(it.status().is_err(), "status() must surface the iter_cf error");
 
         drop(it);
-        drop(cf);
+        drop(stale);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6942,7 +6972,9 @@ mod tests {
         // Exercises the `opts.snapshot == Some(seq)` path: writes one
         // entry, takes a snapshot, writes another, then iterates at
         // the snapshot. The trait iterator must see the first entry
-        // only — proving the snapshot sequence was threaded through.
+        // only. Drives both `db.snapshot()` and `new_iterator` through
+        // the &dyn Db trait surface so the wiring is covered end-to-end
+        // through the trait, not the inherent `DbImpl` impl.
         use crate::api::db::Db;
         use crate::api::iterator::DbIterator as IterTrait;
         use crate::api::options::ReadOptions;
@@ -6950,12 +6982,13 @@ mod tests {
         let dir = temp_dir("trait-iter-snap");
         let db = DbImpl::open(&opts(), &dir).unwrap();
         db.put(b"a", b"old").unwrap();
-        let snap = db.snapshot();
-        db.put(b"b", b"new").unwrap();
 
         let db_trait: &dyn Db = &*db;
+        let snap = db_trait.snapshot();
+        db.put(b"b", b"new").unwrap();
+
         let ro = ReadOptions {
-            snapshot: Some(snap.sequence()),
+            snapshot: Some(snap.sequence_number()),
             ..ReadOptions::default()
         };
         let mut it: Box<dyn IterTrait> = db_trait.new_iterator(&ro);
@@ -6974,6 +7007,34 @@ mod tests {
 
         drop(it);
         drop(snap);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_trait_new_iterator_rejects_future_snapshot_seq() {
+        // Exercises the seq > last_sequence validation added in
+        // round-4: a fabricated "future" seq must surface as an
+        // InvalidArgument through status(), not silently devolve
+        // into a read-at-latest iterator.
+        use crate::api::db::Db;
+        use crate::api::iterator::DbIterator as IterTrait;
+        use crate::api::options::ReadOptions;
+
+        let dir = temp_dir("trait-iter-bad-snap");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.put(b"k", b"v").unwrap();
+
+        let db_trait: &dyn Db = &*db;
+        let ro = ReadOptions {
+            snapshot: Some(u64::MAX),
+            ..ReadOptions::default()
+        };
+        let it: Box<dyn IterTrait> = db_trait.new_iterator(&ro);
+        assert!(!it.valid(), "future-seq iterator must report invalid");
+        assert!(it.status().is_err(), "status() must surface the validation error");
+
+        drop(it);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
