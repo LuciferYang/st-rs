@@ -2187,7 +2187,7 @@ impl DbImpl {
         self.iter_at_seq(snapshot.sequence_number())
     }
 
-    fn iter_at_seq(
+    pub(crate) fn iter_at_seq(
         &self,
         read_seq: SequenceNumber,
     ) -> Result<crate::db::db_iter::DbIterator> {
@@ -3657,15 +3657,25 @@ impl crate::api::db::Db for DbImpl {
 
     fn new_iterator(
         &self,
-        _opts: &crate::api::options::ReadOptions,
+        opts: &crate::api::options::ReadOptions,
     ) -> Box<dyn crate::api::iterator::DbIterator> {
         // The concrete `db_iter::DbIterator` implements
         // `api::iterator::DbIterator` (added with A-2). On open
         // failure we return an `ErrorIterator` rather than the
         // success-shaped `EmptyIterator` so the error surfaces
-        // through the trait's `status()` channel — callers can
-        // distinguish "engine closed" from "empty database."
-        match DbImpl::iter(self) {
+        // through the trait's `status()` channel.
+        //
+        // Honors `opts.snapshot` (sequence-number-pinned read) when
+        // set; falls back to a current-state iterator otherwise.
+        // Other `ReadOptions` fields (`fill_cache`, `verify_checksums`,
+        // `iterate_upper_bound`, …) are not yet plumbed through to
+        // the concrete iterator and are silently ignored — see the
+        // note in `db_iter::DbIterator`'s trait impl doc comment.
+        let result = match opts.snapshot {
+            Some(seq) => DbImpl::iter_at_seq(self, seq),
+            None => DbImpl::iter(self),
+        };
+        match result {
             Ok(it) => Box::new(it),
             Err(e) => Box::new(crate::api::iterator::ErrorIterator::new(e)),
         }
@@ -3673,9 +3683,21 @@ impl crate::api::db::Db for DbImpl {
 
     fn new_iterator_cf(
         &self,
-        _opts: &crate::api::options::ReadOptions,
+        opts: &crate::api::options::ReadOptions,
         cf: &dyn crate::api::db::ColumnFamilyHandle,
     ) -> Box<dyn crate::api::iterator::DbIterator> {
+        // No `iter_cf_at_seq` helper exists yet (snapshot-pinned
+        // iteration on a non-default CF is unimplemented), so we
+        // surface that explicitly via `ErrorIterator` when the caller
+        // requests a snapshot. The default-CF + current-state path
+        // works normally.
+        if opts.snapshot.is_some() {
+            return Box::new(crate::api::iterator::ErrorIterator::new(
+                Status::not_supported(
+                    "snapshot-bound iteration on non-default CF not yet supported",
+                ),
+            ));
+        }
         match DbImpl::iter_cf(self, cf) {
             Ok(it) => Box::new(it),
             Err(e) => Box::new(crate::api::iterator::ErrorIterator::new(e)),
@@ -6879,6 +6901,79 @@ mod tests {
 
         drop(it);
         drop(cf);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_trait_new_iterator_cf_error_path_surfaces_via_status() {
+        // Exercises the `Err(_) => ErrorIterator::new(e)` fallback
+        // path in `Db::new_iterator_cf`. Drop the CF, then try to
+        // iterate through a stale handle — `iter_cf` returns
+        // `Err(invalid_argument)` and the trait impl must surface
+        // that through `status()` rather than reporting empty success.
+        use crate::api::db::{ColumnFamilyHandle, Db};
+        use crate::api::iterator::DbIterator as IterTrait;
+        use crate::api::options::{ColumnFamilyOptions, ReadOptions};
+
+        let dir = temp_dir("trait-iter-cf-err");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        let cf = db
+            .create_column_family("scratch", &ColumnFamilyOptions::default())
+            .unwrap();
+        db.put_cf(&*cf, b"k", b"v").unwrap();
+        db.drop_column_family(&*cf).unwrap();
+
+        let db_trait: &dyn Db = &*db;
+        let cf_handle: &dyn ColumnFamilyHandle = &*cf;
+        let it: Box<dyn IterTrait> =
+            db_trait.new_iterator_cf(&ReadOptions::default(), cf_handle);
+        assert!(!it.valid(), "error iterator must report invalid");
+        assert!(it.status().is_err(), "status() must surface the iter_cf error");
+
+        drop(it);
+        drop(cf);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_trait_new_iterator_honors_snapshot_seq() {
+        // Exercises the `opts.snapshot == Some(seq)` path: writes one
+        // entry, takes a snapshot, writes another, then iterates at
+        // the snapshot. The trait iterator must see the first entry
+        // only — proving the snapshot sequence was threaded through.
+        use crate::api::db::Db;
+        use crate::api::iterator::DbIterator as IterTrait;
+        use crate::api::options::ReadOptions;
+
+        let dir = temp_dir("trait-iter-snap");
+        let db = DbImpl::open(&opts(), &dir).unwrap();
+        db.put(b"a", b"old").unwrap();
+        let snap = db.snapshot();
+        db.put(b"b", b"new").unwrap();
+
+        let db_trait: &dyn Db = &*db;
+        let ro = ReadOptions {
+            snapshot: Some(snap.sequence()),
+            ..ReadOptions::default()
+        };
+        let mut it: Box<dyn IterTrait> = db_trait.new_iterator(&ro);
+        it.seek_to_first();
+        let mut keys = Vec::new();
+        while it.valid() {
+            keys.push(it.key().to_vec());
+            it.next();
+        }
+        assert_eq!(
+            keys,
+            vec![b"a".to_vec()],
+            "snapshot iterator must see only pre-snapshot entries"
+        );
+        it.status().unwrap();
+
+        drop(it);
+        drop(snap);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
